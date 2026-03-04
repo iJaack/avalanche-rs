@@ -1028,6 +1028,7 @@ async fn connect_and_handshake(
     let mut bootstrap_timer = Box::pin(tokio::time::sleep(Duration::from_secs(10)));
     let mut bootstrap_timer_fired = false;
     let mut p_chain_tip: Option<[u8; 32]> = None;
+    let mut p_chain_ancestors_target: Option<[u8; 32]> = None; // block ID sent in GetAncestors
 
     // C-Chain bootstrap state
     let mut cchain_bootstrap_state = CChainBootstrapState::Idle;
@@ -1258,6 +1259,7 @@ async fn connect_and_handshake(
                                                                 tid[28], tid[29], tid[30], tid[31]
                                                             );
                                                             p_chain_tip = Some(container_id.0);
+                                                            p_chain_ancestors_target = Some(container_id.0);
                                                             let new_req = req + 1;
                                                             let get_accepted = NetworkMessage::GetAccepted {
                                                                 chain_id: ChainId([0u8; 32]),
@@ -1312,6 +1314,7 @@ async fn connect_and_handshake(
                                                         if !container_ids.is_empty() {
                                                             let new_req = req + 1;
                                                             let target = container_ids.into_iter().next().unwrap();
+                                                            p_chain_ancestors_target = Some(target.0);
                                                             let get_ancestors = NetworkMessage::GetAncestors {
                                                                 chain_id: ChainId([0u8; 32]),
                                                                 request_id: new_req,
@@ -1475,54 +1478,35 @@ async fn connect_and_handshake(
                                                         if request_id == req {
                                                             let mut stored = 0u32;
                                                             let mut oldest_container: Option<Vec<u8>> = None;
-                                                            let mut first_hash: Option<[u8; 32]> = None;
+                                                            // Parent-chain linking: container[0] ID = GetAncestors target,
+                                                            // container[N+1] ID = container[N].parent_id
+                                                            let mut current_id: Option<[u8; 32]> = p_chain_ancestors_target;
 
                                                             for container in &containers {
-                                                                let mut hasher = Sha256::new();
-                                                                hasher.update(container);
-                                                                let hash: [u8; 32] = hasher.finalize().into();
+                                                                let block_id = current_id.unwrap_or_else(|| {
+                                                                    let mut hasher = Sha256::new();
+                                                                    hasher.update(container);
+                                                                    hasher.finalize().into()
+                                                                });
 
-                                                                if first_hash.is_none() {
-                                                                    first_hash = Some(hash);
-                                                                }
-
-                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &hash, container) {
-                                                                    warn!("Failed to store block {:02x?}: {}", &hash[..4], e);
+                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &block_id, container) {
+                                                                    warn!("Failed to store block {:02x}{:02x}{:02x}{:02x}: {}", block_id[0], block_id[1], block_id[2], block_id[3], e);
                                                                 } else {
                                                                     stored += 1;
-                                                                    if let Ok(meta) = BlockMetadata::from_raw(container, Chain::PChain) {
-                                                                        debug!(
-                                                                            "P-Chain block: height={}, parent={:02x}{:02x}…, type={:?}, {} txs, {} bytes",
-                                                                            meta.height,
-                                                                            meta.parent_id[0], meta.parent_id[1],
-                                                                            meta.block_type,
-                                                                            meta.tx_count,
-                                                                            meta.size_bytes
-                                                                        );
-                                                                    }
                                                                 }
+
+                                                                // Extract parent_id — this is the block ID of the NEXT container
+                                                                let parent = avalanche_rs::block::BlockHeader::extract_parent_id(container);
+                                                                current_id = parent;
                                                                 oldest_container = Some(container.clone());
                                                             }
 
-                                                            // Debug: on first batch, compare first container hash to p_chain_tip
                                                             if depth == 0 {
-                                                                if let Some(fh) = first_hash {
+                                                                if let Some(target) = p_chain_ancestors_target {
                                                                     info!(
-                                                                        "Ancestors[0] SHA256 = {:02x}{:02x}{:02x}{:02x}…{:02x}{:02x}{:02x}{:02x} ({} containers)",
-                                                                        fh[0], fh[1], fh[2], fh[3],
-                                                                        fh[28], fh[29], fh[30], fh[31],
-                                                                        containers.len()
+                                                                        "Stored {} blocks via parent-chain linking (tip={:02x}{:02x}{:02x}{:02x}…, {} containers)",
+                                                                        stored, target[0], target[1], target[2], target[3], containers.len()
                                                                     );
-                                                                    if let Some(tip) = p_chain_tip {
-                                                                        if fh == tip {
-                                                                            info!("Ancestors[0] matches p_chain_tip — chain walk will succeed");
-                                                                        } else {
-                                                                            info!(
-                                                                                "Ancestors[0] DOES NOT match p_chain_tip {:02x}{:02x}{:02x}{:02x}… — chain walk starts at wrong block!",
-                                                                                tip[0], tip[1], tip[2], tip[3]
-                                                                            );
-                                                                        }
-                                                                    }
                                                                 }
                                                             }
 
@@ -1544,17 +1528,16 @@ async fn connect_and_handshake(
                                                                 });
 
                                                             if should_recurse {
-                                                                let oldest = oldest_container.unwrap();
-                                                                let mut hasher = Sha256::new();
-                                                                hasher.update(&oldest);
-                                                                let oldest_id: [u8; 32] = hasher.finalize().into();
+                                                                // Use parent_id of oldest block (= current_id after loop)
+                                                                let oldest_parent = current_id.unwrap_or([0u8; 32]);
+                                                                p_chain_ancestors_target = Some(oldest_parent);
                                                                 let new_req = req + 1;
                                                                 let new_depth = depth + 1;
                                                                 let get_ancestors = NetworkMessage::GetAncestors {
                                                                     chain_id: ChainId([0u8; 32]),
                                                                     request_id: new_req,
                                                                     deadline: 5_000_000_000u64,
-                                                                    container_id: BlockId(oldest_id),
+                                                                    container_id: BlockId(oldest_parent),
                                                                     max_containers_size: 2_000_000,
                                                                 };
                                                                 if let Ok(encoded) = get_ancestors.encode_proto() {
