@@ -655,6 +655,27 @@ async fn connect_and_handshake(
                     peer.version = Some(my_version.clone());
                     peer.state = PeerState::Connected;
                 }
+                drop(pm);
+
+                // Send empty PeerList back — AvalancheGo requires this to mark
+                // the handshake as finished (finishedHandshake = true).
+                // Without it, the peer drops all chain messages.
+                let peerlist = pb::Message {
+                    message: Some(pb::message::Message::PeerList(pb::PeerList {
+                        claimed_ip_ports: vec![],
+                    })),
+                };
+                let raw = prost::Message::encode_to_vec(&peerlist);
+                let len = (raw.len() as u32).to_be_bytes();
+                let mut peerlist_encoded = Vec::with_capacity(4 + raw.len());
+                peerlist_encoded.extend_from_slice(&len);
+                peerlist_encoded.extend_from_slice(&raw);
+                if let Err(e) = tls_stream.write_all(&peerlist_encoded).await {
+                    warn!("Failed to send PeerList to {}: {}", addr, e);
+                } else {
+                    let _ = tls_stream.flush().await;
+                    info!("Sent empty PeerList to {} (handshake completion)", addr);
+                }
             }
             NetworkMessage::PeerList { peers } => {
                 peerlist_received = true;
