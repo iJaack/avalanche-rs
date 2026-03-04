@@ -93,6 +93,19 @@ const FUJI_BOOTSTRAP_IPS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Bootstrap state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum BootstrapState {
+    Idle,
+    WaitingFrontier(u32),
+    WaitingAccepted(u32),
+    WaitingAncestors(u32),
+    Done,
+}
+
+// ---------------------------------------------------------------------------
 // Node state
 // ---------------------------------------------------------------------------
 
@@ -646,10 +659,13 @@ async fn connect_and_handshake(
             NetworkMessage::PeerList { peers } => {
                 peerlist_received = true;
                 info!("Got PeerList with {} peers from {}", peers.len(), addr);
-                let mut pm = node.peer_manager.write().await;
-                let new = pm.process_peer_list(peers);
+                let new = {
+                    let mut pm = node.peer_manager.write().await;
+                    pm.process_peer_list(peers)
+                };
                 if !new.is_empty() {
                     info!("Discovered {} new peers via {}", new.len(), addr);
+                    dial_new_peers(new, node.clone());
                 }
             }
             NetworkMessage::Ping { uptime } => {
@@ -680,11 +696,6 @@ async fn connect_and_handshake(
         info!("Peer {} registered (NodeID: {})", addr, peer_node_id);
     }
 
-    // 5b. Attempt P-Chain bootstrap
-    // Use a fixed request_id base; in production this should be from a global counter.
-    let bootstrap_request_base: u32 = rand::thread_rng().gen::<u16>() as u32 * 10;
-    bootstrap_p_chain(&mut tls_stream, addr, bootstrap_request_base).await;
-
     // 6. Keep connection alive — read messages in a loop
     info!("Entering message loop with {}", addr);
 
@@ -694,6 +705,12 @@ async fn connect_and_handshake(
     ping_timer.tick().await; // consume the immediate first tick
     let mut last_ping_sent: Option<Instant> = None;
     let mut pong_received_since_last_ping = true; // start true so first ping isn't rejected
+
+    // Bootstrap state machine: send GetAcceptedFrontier after 10s delay
+    let bootstrap_request_base: u32 = rand::thread_rng().gen::<u16>() as u32 * 10;
+    let mut bootstrap_state = BootstrapState::Idle;
+    let mut bootstrap_timer = Box::pin(tokio::time::sleep(Duration::from_secs(10)));
+    let mut bootstrap_timer_fired = false;
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -724,6 +741,25 @@ async fn connect_and_handshake(
                 }
             }
 
+            // Arm 3: bootstrap timer — send GetAcceptedFrontier after 10s
+            _ = &mut bootstrap_timer, if !bootstrap_timer_fired => {
+                bootstrap_timer_fired = true;
+                let req = NetworkMessage::GetAcceptedFrontier {
+                    chain_id: ChainId([0u8; 32]),
+                    request_id: bootstrap_request_base,
+                    deadline: 5_000_000_000u64,
+                };
+                if let Ok(encoded) = req.encode_proto() {
+                    if tls_stream.write_all(&encoded).await.is_ok() {
+                        let _ = tls_stream.flush().await;
+                        info!("Bootstrap: sent GetAcceptedFrontier (req={}) to {}", bootstrap_request_base, addr);
+                        bootstrap_state = BootstrapState::WaitingFrontier(bootstrap_request_base);
+                    } else {
+                        warn!("Bootstrap: failed to send GetAcceptedFrontier to {}", addr);
+                    }
+                }
+            }
+
             // Arm 2: incoming message
             result = tls_stream.read_exact(&mut len_buf) => {
                 match result {
@@ -742,9 +778,9 @@ async fn connect_and_handshake(
                                 match NetworkMessage::decode_proto(&full) {
                                     Ok(msg) => {
                                         debug!("Received {} from {} ({} bytes)", msg.name(), addr, msg_len);
-                                        match &msg {
+                                        match msg {
                                             NetworkMessage::Ping { uptime } => {
-                                                let pong = NetworkMessage::Pong { uptime: *uptime };
+                                                let pong = NetworkMessage::Pong { uptime };
                                                 if let Ok(encoded) = pong.encode_proto() {
                                                     let _ = tls_stream.write_all(&encoded).await;
                                                     let _ = tls_stream.flush().await;
@@ -758,28 +794,122 @@ async fn connect_and_handshake(
                                             NetworkMessage::PeerList { peers } => {
                                                 let new_peers = {
                                                     let mut pm = node.peer_manager.write().await;
-                                                    pm.process_peer_list(peers)
+                                                    pm.process_peer_list(&peers)
                                                 };
                                                 if !new_peers.is_empty() {
                                                     info!("Discovered {} new peers via {}", new_peers.len(), addr);
-                                                    // Dial up to 10 new peers concurrently
                                                     dial_new_peers(new_peers, node.clone());
                                                 }
                                             }
                                             NetworkMessage::GetAcceptedFrontier { chain_id, request_id, .. } => {
                                                 // Respond with empty frontier (we have nothing yet)
                                                 let response = NetworkMessage::AcceptedFrontier {
-                                                    chain_id: chain_id.clone(),
-                                                    request_id: *request_id,
+                                                    chain_id,
+                                                    request_id,
                                                     container_id: BlockId::zero(),
                                                 };
                                                 if let Ok(encoded) = response.encode_proto() {
                                                     let _ = tls_stream.write_all(&encoded).await;
                                                     let _ = tls_stream.flush().await;
+                                                    debug!("Responded to GetAcceptedFrontier from {}", addr);
                                                 }
                                             }
-                                            _ => {
-                                                debug!("Unhandled message {} from {}", msg.name(), addr);
+                                            NetworkMessage::AcceptedFrontier { request_id, container_id, .. } => {
+                                                info!("AcceptedFrontier from {} — tip={}", addr, container_id);
+                                                if let BootstrapState::WaitingFrontier(req) = bootstrap_state {
+                                                    if request_id == req {
+                                                        if container_id.0 != [0u8; 32] {
+                                                            let new_req = req + 1;
+                                                            let get_accepted = NetworkMessage::GetAccepted {
+                                                                chain_id: ChainId([0u8; 32]),
+                                                                request_id: new_req,
+                                                                deadline: 5_000_000_000u64,
+                                                                container_ids: vec![container_id],
+                                                            };
+                                                            if let Ok(encoded) = get_accepted.encode_proto() {
+                                                                if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                    let _ = tls_stream.flush().await;
+                                                                    info!("Bootstrap: sent GetAccepted (req={}) to {}", new_req, addr);
+                                                                    bootstrap_state = BootstrapState::WaitingAccepted(new_req);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            info!("Bootstrap: peer {} has empty frontier", addr);
+                                                            bootstrap_state = BootstrapState::Done;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            NetworkMessage::Accepted { request_id, container_ids, .. } => {
+                                                info!("Accepted from {} — {} block IDs", addr, container_ids.len());
+                                                if let BootstrapState::WaitingAccepted(req) = bootstrap_state {
+                                                    if request_id == req {
+                                                        if !container_ids.is_empty() {
+                                                            let new_req = req + 1;
+                                                            let target = container_ids.into_iter().next().unwrap();
+                                                            let get_ancestors = NetworkMessage::GetAncestors {
+                                                                chain_id: ChainId([0u8; 32]),
+                                                                request_id: new_req,
+                                                                deadline: 5_000_000_000u64,
+                                                                container_id: target,
+                                                                max_containers_size: 2_000_000,
+                                                            };
+                                                            if let Ok(encoded) = get_ancestors.encode_proto() {
+                                                                if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                    let _ = tls_stream.flush().await;
+                                                                    info!("Bootstrap: sent GetAncestors (req={}) to {}", new_req, addr);
+                                                                    bootstrap_state = BootstrapState::WaitingAncestors(new_req);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            info!("Bootstrap: peer {} accepted no blocks", addr);
+                                                            bootstrap_state = BootstrapState::Done;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            NetworkMessage::Ancestors { request_id, containers, .. } => {
+                                                info!(
+                                                    "Ancestors from {} — {} containers, {} bytes total",
+                                                    addr,
+                                                    containers.len(),
+                                                    containers.iter().map(|c| c.len()).sum::<usize>()
+                                                );
+                                                if let BootstrapState::WaitingAncestors(req) = bootstrap_state {
+                                                    if request_id == req {
+                                                        bootstrap_state = BootstrapState::Done;
+                                                        info!("Bootstrap: complete with {}", addr);
+                                                    }
+                                                }
+                                            }
+                                            NetworkMessage::GetAccepted { chain_id, request_id, .. } => {
+                                                // Respond with empty accepted list
+                                                let response = NetworkMessage::Accepted {
+                                                    chain_id,
+                                                    request_id,
+                                                    container_ids: vec![],
+                                                };
+                                                if let Ok(encoded) = response.encode_proto() {
+                                                    let _ = tls_stream.write_all(&encoded).await;
+                                                    let _ = tls_stream.flush().await;
+                                                    debug!("Responded to GetAccepted from {}", addr);
+                                                }
+                                            }
+                                            NetworkMessage::GetAncestors { chain_id, request_id, .. } => {
+                                                // Respond with empty ancestors
+                                                let response = NetworkMessage::Ancestors {
+                                                    chain_id,
+                                                    request_id,
+                                                    containers: vec![],
+                                                };
+                                                if let Ok(encoded) = response.encode_proto() {
+                                                    let _ = tls_stream.write_all(&encoded).await;
+                                                    let _ = tls_stream.flush().await;
+                                                    debug!("Responded to GetAncestors from {}", addr);
+                                                }
+                                            }
+                                            other => {
+                                                debug!("Unhandled message {} from {}", other.name(), addr);
                                             }
                                         }
                                     }
@@ -811,9 +941,9 @@ async fn connect_and_handshake(
     Ok(())
 }
 
-/// Bootstrap P-Chain state from a connected peer.
-/// Implements: GetAcceptedFrontier → AcceptedFrontier → GetAccepted → Accepted → GetAncestors → Ancestors.
-/// Logs what we receive; does not yet validate or apply blocks.
+// bootstrap_p_chain removed — bootstrap logic now lives inside the message loop as a state machine.
+// Keeping this dead code block here as a tombstone to avoid merge confusion.
+#[allow(dead_code)]
 async fn bootstrap_p_chain<S>(
     stream: &mut S,
     addr: std::net::SocketAddr,
