@@ -36,11 +36,12 @@ avalanche-rs completes full P-Chain + C-Chain bootstrap in ~28 seconds. Avalanch
 ✅ JSON-RPC server (eth_chainId, eth_blockNumber, avax_getNodeID, etc.)
 ✅ RocksDB storage (7 column families)
 ✅ EVM execution via revm
-✅ 306 tests passing
+✅ 316 tests passing
 ✅ P-Chain bootstrap (3,200+ blocks via recursive GetAncestors)
 ✅ C-Chain bootstrap (500+ blocks via recursive GetAncestors)
 ✅ P-Chain chain verification (tip-to-genesis walk, height matches API)
 ✅ Validator set tracking (pre-populated with known Fuji validators)
+✅ MEV engine (mempool scanning, V2/V4 arbitrage, sandwich simulation, hook risk analysis)
 ```
 
 ## Quick Start
@@ -102,7 +103,7 @@ src/
 ├── types/           # Core types (blocks, headers, vertices)
 ├── consensus/       # Snowman consensus stubs
 ├── mempool/         # Transaction mempool
-├── mev/             # MEV extraction analysis
+├── mev/             # MEV engine (mempool monitor, AMM math, sandwich/arb, V4 hooks)
 └── codec/           # Serialization helpers
 ```
 
@@ -139,6 +140,7 @@ src/
 - [ ] Validator set updates from AddValidator/AddDelegator txs
 - [ ] State sync (EVM state root, account trie)
 - [ ] C-Chain block parsing (RLP decode from wire format)
+- [x] ~~MEV engine integration~~ ✅ (V2/V4 AMM math, sandwich sim, hook risk, mempool scan)
 
 ## The Bloom Filter Bug 🐛
 
