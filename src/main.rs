@@ -82,13 +82,13 @@ struct Cli {
 // Bootstrap nodes (Avalanche mainnet)
 // ---------------------------------------------------------------------------
 
+// Mainnet bootstrap nodes — use `--network-id 1` to activate
 const MAINNET_BOOTSTRAP_IPS: &[&str] = &[
-    "54.94.43.49:9651",
-    "52.33.47.4:9651",
-    "18.203.129.230:9651",
-    "3.34.29.75:9651",
-    "52.199.17.2:9651",
-    "13.244.44.148:9651",
+    "52.200.5.241:9651",
+    "54.218.65.226:9651",
+    "34.216.203.114:9651",
+    "34.213.203.233:9651",
+    "35.165.246.125:9651",
 ];
 
 const FUJI_BOOTSTRAP_IPS: &[&str] = &[
@@ -125,6 +125,31 @@ enum CChainBootstrapState {
 }
 
 // ---------------------------------------------------------------------------
+// Chain metrics
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct ChainMetrics {
+    pub blocks_synced: u64,
+    pub genesis_height: u64,
+    pub tip_height: u64,
+    pub chain_length: u64,
+    pub last_sync_time: Instant,
+}
+
+impl Default for ChainMetrics {
+    fn default() -> Self {
+        ChainMetrics {
+            blocks_synced: 0,
+            genesis_height: 0,
+            tip_height: 0,
+            chain_length: 0,
+            last_sync_time: Instant::now(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validator tracking
 // ---------------------------------------------------------------------------
 
@@ -146,13 +171,59 @@ struct ValidatorInfo {
 ///   - Banff (typeID 29): bytes [18..50]
 ///   - Banff (typeID 30-32): bytes [14..46]
 ///   - Apricot (typeID 0-4): bytes [6..38]
-fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> u64 {
+/// Walk the P-Chain from tip_id toward genesis.
+/// Returns (chain_length, tip_height, genesis_height).
+fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
+    info!(
+        "Chain walk: starting from tip {:02x}{:02x}{:02x}{:02x}…{:02x}{:02x}{:02x}{:02x}",
+        tip_id[0], tip_id[1], tip_id[2], tip_id[3],
+        tip_id[28], tip_id[29], tip_id[30], tip_id[31]
+    );
+
+    // Check immediately whether the tip is in the DB at all.
+    match db.get_cf(CF_BLOCKS, &tip_id) {
+        Ok(None) => {
+            info!(
+                "TIP ID NOT IN STORED BLOCKS: {:02x}{:02x}{:02x}{:02x}…{:02x}{:02x}{:02x}{:02x}",
+                tip_id[0], tip_id[1], tip_id[2], tip_id[3],
+                tip_id[28], tip_id[29], tip_id[30], tip_id[31]
+            );
+            return (0, 0, 0);
+        }
+        Err(e) => {
+            warn!("Chain walk: DB error looking up tip: {}", e);
+            return (0, 0, 0);
+        }
+        Ok(Some(_)) => {
+            info!("Found tip in DB: {:02x}{:02x}{:02x}{:02x}…", tip_id[0], tip_id[1], tip_id[2], tip_id[3]);
+        }
+    }
+
     let mut current = tip_id;
     let mut count = 0u64;
+    let mut tip_height = 0u64;
+    let mut genesis_height = 0u64;
+
     loop {
         match db.get_cf(CF_BLOCKS, &current) {
             Ok(Some(block_data)) => {
                 count += 1;
+
+                // Parse the full block to extract height (for tip and genesis reporting).
+                if let Ok(hdr) = avalanche_rs::block::BlockHeader::parse(&block_data, avalanche_rs::block::Chain::PChain) {
+                    if count == 1 {
+                        tip_height = hdr.height;
+                        info!("Chain walk tip block: height={}, type={:?}", tip_height, hdr.block_type);
+                    }
+                    if hdr.is_genesis() {
+                        genesis_height = hdr.height;
+                        info!(
+                            "Genesis block height: {} (type={:?}, {} bytes)",
+                            genesis_height, hdr.block_type, block_data.len()
+                        );
+                    }
+                }
+
                 match avalanche_rs::block::BlockHeader::extract_parent_id(&block_data) {
                     Some(parent) => {
                         if parent == [0u8; 32] {
@@ -180,7 +251,7 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> u64 {
             }
         }
     }
-    count
+    (count, tip_height, genesis_height)
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +272,9 @@ struct NodeState {
     validators_seen: Arc<RwLock<std::collections::HashSet<String>>>,
     /// Accumulated stake weight from PeerList info (best-effort, 0 if unavailable).
     total_stake_weight: Arc<RwLock<u64>>,
+    /// Per-chain sync metrics updated by bootstrap and verified via chain walk.
+    p_chain_metrics: Arc<RwLock<ChainMetrics>>,
+    c_chain_metrics: Arc<RwLock<ChainMetrics>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +388,8 @@ async fn main() {
         validators,
         validators_seen: Arc::new(RwLock::new(std::collections::HashSet::new())),
         total_stake_weight: Arc::new(RwLock::new(0u64)),
+        p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+        c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
     });
 
     // 6. Start P2P listener
@@ -333,6 +409,26 @@ async fn main() {
 
     // 9. Start sync / consensus loop
     let consensus_handle = tokio::spawn(run_consensus_loop(node.clone()));
+
+    // 10. Start metrics logging (every 10s)
+    let metrics_node = node.clone();
+    let metrics_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            let p = metrics_node.p_chain_metrics.read().await;
+            let c = metrics_node.c_chain_metrics.read().await;
+            info!(
+                "P-Chain: {} blocks synced, height {}→{}, chain length {}",
+                p.blocks_synced, p.genesis_height, p.tip_height, p.chain_length
+            );
+            info!(
+                "C-Chain: {} blocks synced, EVM analysis pending",
+                c.blocks_synced
+            );
+        }
+    });
 
     info!(
         "Node started: p2p=:{}, http=:{}, node_id={}",
@@ -360,6 +456,7 @@ async fn main() {
     bootstrap_handle.abort();
     rpc_handle.abort();
     consensus_handle.abort();
+    metrics_handle.abort();
 
     info!("avalanche-rs stopped.");
 }
@@ -1064,6 +1161,12 @@ async fn connect_and_handshake(
                                                 if let BootstrapState::WaitingFrontier(req) = bootstrap_state {
                                                     if request_id == req {
                                                         if container_id.0 != [0u8; 32] {
+                                                            let tid = container_id.0;
+                                                            info!(
+                                                                "Bootstrap: P-Chain tip from AcceptedFrontier = {:02x}{:02x}{:02x}{:02x}…{:02x}{:02x}{:02x}{:02x}",
+                                                                tid[0], tid[1], tid[2], tid[3],
+                                                                tid[28], tid[29], tid[30], tid[31]
+                                                            );
                                                             p_chain_tip = Some(container_id.0);
                                                             let new_req = req + 1;
                                                             let get_accepted = NetworkMessage::GetAccepted {
@@ -1206,6 +1309,11 @@ async fn connect_and_handshake(
                                                                 b"c_chain_blocks_downloaded",
                                                                 &new_total.to_le_bytes(),
                                                             );
+                                                            {
+                                                                let mut m = node.c_chain_metrics.write().await;
+                                                                m.blocks_synced = new_total as u64;
+                                                                m.last_sync_time = Instant::now();
+                                                            }
 
                                                             // Use block parser to determine if oldest block is genesis
                                                             // (handles both raw RLP and Avalanche-wrapped format)
@@ -1271,11 +1379,16 @@ async fn connect_and_handshake(
                                                         if request_id == req {
                                                             let mut stored = 0u32;
                                                             let mut oldest_container: Option<Vec<u8>> = None;
+                                                            let mut first_hash: Option<[u8; 32]> = None;
 
                                                             for container in &containers {
                                                                 let mut hasher = Sha256::new();
                                                                 hasher.update(container);
                                                                 let hash: [u8; 32] = hasher.finalize().into();
+
+                                                                if first_hash.is_none() {
+                                                                    first_hash = Some(hash);
+                                                                }
 
                                                                 if let Err(e) = node.db.put_cf(CF_BLOCKS, &hash, container) {
                                                                     warn!("Failed to store block {:02x?}: {}", &hash[..4], e);
@@ -1283,6 +1396,28 @@ async fn connect_and_handshake(
                                                                     stored += 1;
                                                                 }
                                                                 oldest_container = Some(container.clone());
+                                                            }
+
+                                                            // Debug: on first batch, compare first container hash to p_chain_tip
+                                                            if depth == 0 {
+                                                                if let Some(fh) = first_hash {
+                                                                    info!(
+                                                                        "Ancestors[0] SHA256 = {:02x}{:02x}{:02x}{:02x}…{:02x}{:02x}{:02x}{:02x} ({} containers)",
+                                                                        fh[0], fh[1], fh[2], fh[3],
+                                                                        fh[28], fh[29], fh[30], fh[31],
+                                                                        containers.len()
+                                                                    );
+                                                                    if let Some(tip) = p_chain_tip {
+                                                                        if fh == tip {
+                                                                            info!("Ancestors[0] matches p_chain_tip — chain walk will succeed");
+                                                                        } else {
+                                                                            info!(
+                                                                                "Ancestors[0] DOES NOT match p_chain_tip {:02x}{:02x}{:02x}{:02x}… — chain walk starts at wrong block!",
+                                                                                tip[0], tip[1], tip[2], tip[3]
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
 
                                                             let new_total = prev_total + stored;
@@ -1342,10 +1477,16 @@ async fn connect_and_handshake(
                                                                 bootstrap_state = BootstrapState::Done;
                                                                 info!("Bootstrap P-Chain complete with {} — {} total blocks stored", addr, new_total);
 
-                                                                // Verify the stored chain
+                                                                // Verify the stored chain and update metrics
                                                                 if let Some(tip) = p_chain_tip {
-                                                                    let chain_len = verify_block_chain(&node.db, tip);
+                                                                    let (chain_len, tip_height, genesis_height) = verify_block_chain(&node.db, tip);
                                                                     info!("P-Chain chain walk: {} blocks linked from tip", chain_len);
+                                                                    let mut m = node.p_chain_metrics.write().await;
+                                                                    m.blocks_synced = new_total as u64;
+                                                                    m.chain_length = chain_len;
+                                                                    m.tip_height = tip_height;
+                                                                    m.genesis_height = genesis_height;
+                                                                    m.last_sync_time = Instant::now();
                                                                 }
 
                                                                 // Start C-Chain bootstrap if we have the frontier
