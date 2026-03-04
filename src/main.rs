@@ -227,7 +227,7 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
                 match avalanche_rs::block::BlockHeader::extract_parent_id(&block_data) {
                     Some(parent) => {
                         if parent == [0u8; 32] {
-                            info!("Verified chain of {} blocks from tip to genesis", count);
+                            info!("✅ Verified chain of {} blocks from tip (height {}) to genesis (height {})", count, tip_height, genesis_height);
                             break;
                         }
                         current = parent;
@@ -239,10 +239,14 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
                 }
             }
             Ok(None) => {
-                info!(
-                    "Chain walk: block not in DB after {} blocks (may need more fetch rounds)",
-                    count
-                );
+                if count > 0 {
+                    info!(
+                        "Chain walk: parent not in DB after {} blocks (chain may be incomplete, may need more fetch rounds)",
+                        count
+                    );
+                } else {
+                    warn!("Chain walk: tip block not found in DB");
+                }
                 break;
             }
             Err(e) => {
