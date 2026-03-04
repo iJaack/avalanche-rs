@@ -90,12 +90,13 @@ The node performs a full Snowman bootstrap sequence:
 ```
 src/
 ├── main.rs          # Node daemon, P2P connect, handshake, message loop
+├── block/           # Block header parsing (Apricot + Banff), chain graph, Snowman
 ├── identity/        # TLS cert generation, IP signing, BLS keys
 ├── proto/           # Protobuf codec (p2p.proto from AvalancheGo)
 ├── network/         # P2P networking, peer management
 ├── sync/            # Bootstrap state sync (GetAcceptedFrontier, GetAncestors)
 ├── evm/             # C-Chain EVM execution via revm
-├── db/              # RocksDB storage layer (7 column families)
+├── db/              # RocksDB storage layer (8 column families)
 ├── rpc/             # JSON-RPC server
 ├── tx/              # Transaction types and validation
 ├── types/           # Core types (blocks, headers, vertices)
@@ -105,7 +106,7 @@ src/
 └── codec/           # Serialization helpers
 ```
 
-~14K lines of Rust. Zero unsafe code.
+~16K lines of Rust.
 
 ## Protocol Compatibility
 

@@ -6,7 +6,7 @@
 - **Hardware:** Mac Mini M4, Apple Silicon
 - **Bootstrap IP:** 52.29.72.46:9651 (Berlin beacon)
 - **AvalancheGo version:** 1.14.1
-- **avalanche-rs:** commit fb1946a+
+- **avalanche-rs:** commit a92a0cd (latest)
 
 ## Results — Run 3 (Final, with all fixes)
 
@@ -18,7 +18,7 @@
 | **P-Chain bootstrap start** | ~10s | ~4s | similar |
 | **P-Chain blocks synced** | 3,204 | 0 (still fetching) | **avalanche-rs wins** |
 | **P-Chain tip height** | 266,981 ✅ | 0 (not reached) | — |
-| **C-Chain blocks synced** | 499 | 0 | — |
+| **C-Chain blocks synced** | 518 | 0 | — |
 | **Chain walk verified** | 3,204 linked | N/A | — |
 | **Peers connected** | 11 | network OK (30s in) | — |
 
@@ -44,7 +44,7 @@
 - Completes TLS handshake, version exchange, peer list
 - Fetches 3,204 P-Chain blocks across multiple Ancestors rounds
 - Verifies full chain walk from tip to genesis
-- Fetches 499 C-Chain blocks
+- Fetches 518 C-Chain blocks
 - Reports correct tip height 266,981 (matches API)
 
 ---
@@ -56,6 +56,15 @@
 
 ### Run 2 (Height fix)
 - Height fixed to 266,978 ✅, memory: 20MB (later 71MB with more peers)
+
+### Methodology Notes
+
+This benchmark compares cold-start behavior: both nodes started from scratch with no prior state. The comparison is informative but not strictly apples-to-apples:
+
+- **avalanche-rs** skips subsystem initialization (no X-Chain VM, no full consensus engine, no metrics/health infrastructure) and connects directly to the bootstrap peer. This is a lightweight bootstrap client, not a full consensus participant yet.
+- **AvalancheGo** initializes the full node stack (P-Chain VM, C-Chain VM, X-Chain VM, health checks, metrics, throttling, multiple database layers) before beginning bootstrap. This overhead is necessary for a production validator.
+
+The benchmark demonstrates that a focused Rust implementation can achieve significantly faster bootstrap and lower resource usage for the specific task of syncing block data.
 
 ### Fixes Applied
 1. Height extraction: wire format is parent(32) + timestamp(8) + height(8), not parent(32) + height(8)
