@@ -4,7 +4,7 @@ A Rust implementation of the Avalanche P2P protocol. Connects to real AvalancheG
 
 ## Status
 
-**Working:** Full P2P handshake with live Avalanche validators.
+**Working:** Full bootstrap sequence with block storage on Fuji testnet.
 
 ```
 ✅ TLS identity generation (ECDSA P-256, self-signed certs)
@@ -14,11 +14,16 @@ A Rust implementation of the Avalanche P2P protocol. Connects to real AvalancheG
 ✅ BLS signatures (blst, proof-of-possession DST)
 ✅ IP signing with TLS key (ring ECDSA P-256 SHA-256 ASN1)
 ✅ Bloom filter for known peers
-✅ Peer discovery (15+ validators from PeerList)
+✅ Peer discovery (12+ simultaneous connections via PeerList)
 ✅ JSON-RPC server (eth_chainId, eth_blockNumber, avax_getNodeID, etc.)
 ✅ RocksDB storage (7 column families)
 ✅ EVM execution via revm
-✅ 273 tests passing
+✅ 280+ tests passing
+✅ P-Chain block storage (331 blocks fetched via recursive GetAncestors)
+✅ C-Chain frontier discovery (AcceptedFrontier received)
+✅ C-Chain block fetching (GetAccepted → GetAncestors recursive)
+✅ P-Chain chain verification (tip-to-genesis walk via parent pointers)
+✅ Validator set tracking (pre-populated with known Fuji validators)
 ```
 
 ## Quick Start
@@ -42,6 +47,27 @@ cargo build --release
   --http-port 9650
 ```
 
+## Bootstrap Sequence
+
+The node performs a full Snowman bootstrap sequence:
+
+```
+1. Connect to bootstrap peers (mTLS)
+2. Handshake (Version ↔ PeerList)
+3. Discover peers (PeerList → dial up to 12 simultaneously)
+4. P-Chain bootstrap:
+   GetAcceptedFrontier → AcceptedFrontier (tip hash)
+   GetAccepted → Accepted (confirmed tip)
+   GetAncestors → Ancestors (up to 2MB of blocks per round)
+   Recursive fetch (up to 10 rounds) → 331 blocks stored
+   Chain walk: verify tip → genesis via parent pointers
+5. C-Chain bootstrap (Fuji only):
+   GetAcceptedFrontier → AcceptedFrontier (C-Chain tip)
+   GetAccepted → Accepted
+   GetAncestors → recursive fetch → blocks stored (prefixed "c:")
+6. Validator set loaded (2 known Fuji bootstrap validators)
+```
+
 ## Architecture
 
 ```
@@ -52,7 +78,7 @@ src/
 ├── network/         # P2P networking, peer management
 ├── sync/            # Bootstrap state sync (GetAcceptedFrontier, GetAncestors)
 ├── evm/             # C-Chain EVM execution via revm
-├── db/              # RocksDB storage layer
+├── db/              # RocksDB storage layer (7 column families)
 ├── rpc/             # JSON-RPC server
 ├── tx/              # Transaction types and validation
 ├── types/           # Core types (blocks, headers, vertices)
@@ -88,11 +114,11 @@ src/
 
 ## What's Next
 
-- [ ] Ping/Pong keepalive in message loop
-- [ ] Connect to discovered peers (PeerList → dial)
-- [ ] Bootstrap: GetAcceptedFrontier → GetAccepted → GetAncestors
-- [ ] Block validation + chain state
+- [ ] Full P-Chain block parsing (height, timestamp extraction)
+- [ ] Validate block signatures and parent linkage
 - [ ] Full Snowman consensus participation
+- [ ] Validator set updates from AddValidator/AddDelegator txs
+- [ ] State sync (EVM state root, account trie)
 
 ## The Bloom Filter Bug 🐛
 

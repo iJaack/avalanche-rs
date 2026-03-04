@@ -110,6 +110,73 @@ enum BootstrapState {
 }
 
 // ---------------------------------------------------------------------------
+// C-Chain bootstrap state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum CChainBootstrapState {
+    Idle,
+    WaitingAccepted(u32),
+    WaitingAncestors(u32),
+    FetchingAncestors { req: u32, depth: u32, total_blocks: u32 },
+    Done,
+}
+
+// ---------------------------------------------------------------------------
+// Validator tracking
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct ValidatorInfo {
+    node_id: String,
+    weight: u64,
+    start_time: u64,
+    end_time: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Block chain verification
+// ---------------------------------------------------------------------------
+
+/// Walk the P-Chain block tree from tip toward genesis, verifying the stored chain.
+/// Blocks are stored by SHA-256(raw_bytes) in CF_BLOCKS.
+/// Parent block ID is embedded at bytes [6..38] of each raw block (after 2-byte codec
+/// version and 4-byte type ID).
+fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> u64 {
+    let mut current = tip_id;
+    let mut count = 0u64;
+    loop {
+        match db.get_cf(CF_BLOCKS, &current) {
+            Ok(Some(block_data)) => {
+                count += 1;
+                if block_data.len() < 38 {
+                    info!("Chain walk: block too short ({} bytes) at depth {}", block_data.len(), count);
+                    break;
+                }
+                let parent: [u8; 32] = block_data[6..38].try_into().unwrap_or([0u8; 32]);
+                if parent == [0u8; 32] {
+                    info!("Verified chain of {} blocks from tip to genesis", count);
+                    break;
+                }
+                current = parent;
+            }
+            Ok(None) => {
+                info!(
+                    "Chain walk: block not in DB after {} blocks (may need more fetch rounds)",
+                    count
+                );
+                break;
+            }
+            Err(e) => {
+                warn!("Chain walk DB error after {} blocks: {}", count, e);
+                break;
+            }
+        }
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
 // Node state
 // ---------------------------------------------------------------------------
 
@@ -122,6 +189,7 @@ struct NodeState {
     peer_manager: Arc<RwLock<PeerManager>>,
     config: Cli,
     start_time: Instant,
+    validators: std::collections::HashMap<String, ValidatorInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +270,28 @@ async fn main() {
     };
     let sync_engine = Arc::new(SyncEngine::new(sync_config));
 
+    // 6. Initialize validator set (pre-populated with known Fuji bootstrap validators)
+    let mut validators = std::collections::HashMap::new();
+    validators.insert(
+        "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg".to_string(),
+        ValidatorInfo {
+            node_id: "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg".to_string(),
+            weight: 2_000_000_000_000,
+            start_time: 0,
+            end_time: u64::MAX,
+        },
+    );
+    validators.insert(
+        "NodeID-MFrZFg3yDfKz2dE8bR5qitG58rN3FH1DX".to_string(),
+        ValidatorInfo {
+            node_id: "NodeID-MFrZFg3yDfKz2dE8bR5qitG58rN3FH1DX".to_string(),
+            weight: 2_000_000_000_000,
+            start_time: 0,
+            end_time: u64::MAX,
+        },
+    );
+    info!("Validator set initialized with {} known Fuji validators", validators.len());
+
     let node = Arc::new(NodeState {
         identity,
         db,
@@ -210,6 +300,7 @@ async fn main() {
         peer_manager,
         config: cli,
         start_time: Instant::now(),
+        validators,
     });
 
     // 6. Start P2P listener
@@ -736,6 +827,11 @@ async fn connect_and_handshake(
     let mut bootstrap_state = BootstrapState::Idle;
     let mut bootstrap_timer = Box::pin(tokio::time::sleep(Duration::from_secs(10)));
     let mut bootstrap_timer_fired = false;
+    let mut p_chain_tip: Option<[u8; 32]> = None;
+
+    // C-Chain bootstrap state
+    let mut cchain_bootstrap_state = CChainBootstrapState::Idle;
+    let mut cchain_frontier: Option<[u8; 32]> = None;
 
     // Decode C-Chain Fuji ID from CB58
     let cchain_id: [u8; 32] = {
@@ -869,13 +965,17 @@ async fn connect_and_handshake(
                                             }
                                             NetworkMessage::AcceptedFrontier { request_id, container_id, .. } => {
                                                 info!("AcceptedFrontier from {} — tip={}", addr, container_id);
-                                                // Log C-Chain frontier if it comes back
+                                                // Store C-Chain frontier for later use
                                                 if request_id == bootstrap_request_base + 1000 {
                                                     info!("C-Chain AcceptedFrontier from {} — tip={}", addr, container_id);
+                                                    if container_id.0 != [0u8; 32] {
+                                                        cchain_frontier = Some(container_id.0);
+                                                    }
                                                 }
                                                 if let BootstrapState::WaitingFrontier(req) = bootstrap_state {
                                                     if request_id == req {
                                                         if container_id.0 != [0u8; 32] {
+                                                            p_chain_tip = Some(container_id.0);
                                                             let new_req = req + 1;
                                                             let get_accepted = NetworkMessage::GetAccepted {
                                                                 chain_id: ChainId([0u8; 32]),
@@ -897,9 +997,35 @@ async fn connect_and_handshake(
                                                     }
                                                 }
                                             }
-                                            NetworkMessage::Accepted { request_id, container_ids, .. } => {
+                                            NetworkMessage::Accepted { request_id, container_ids, chain_id } => {
                                                 info!("Accepted from {} — {} block IDs", addr, container_ids.len());
-                                                if let BootstrapState::WaitingAccepted(req) = bootstrap_state {
+                                                // C-Chain Accepted
+                                                if let CChainBootstrapState::WaitingAccepted(req) = cchain_bootstrap_state {
+                                                    if request_id == req {
+                                                        if !container_ids.is_empty() {
+                                                            let new_req = req + 1;
+                                                            let target = container_ids.into_iter().next().unwrap();
+                                                            let get_ancestors = NetworkMessage::GetAncestors {
+                                                                chain_id: ChainId(cchain_id),
+                                                                request_id: new_req,
+                                                                deadline: 5_000_000_000u64,
+                                                                container_id: target,
+                                                                max_containers_size: 2_000_000,
+                                                            };
+                                                            if let Ok(encoded) = get_ancestors.encode_proto() {
+                                                                if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                    let _ = tls_stream.flush().await;
+                                                                    info!("C-Chain Bootstrap: sent GetAncestors (req={}) to {}", new_req, addr);
+                                                                    cchain_bootstrap_state = CChainBootstrapState::WaitingAncestors(new_req);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            info!("C-Chain Bootstrap: peer {} accepted no blocks", addr);
+                                                            cchain_bootstrap_state = CChainBootstrapState::Done;
+                                                        }
+                                                    }
+                                                // P-Chain Accepted
+                                                } else if let BootstrapState::WaitingAccepted(req) = bootstrap_state {
                                                     if request_id == req {
                                                         if !container_ids.is_empty() {
                                                             let new_req = req + 1;
@@ -924,105 +1050,218 @@ async fn connect_and_handshake(
                                                         }
                                                     }
                                                 }
+                                                let _ = chain_id;
                                             }
                                             NetworkMessage::Ancestors { request_id, containers, chain_id } => {
                                                 let total_bytes: usize = containers.iter().map(|c| c.len()).sum();
+                                                let is_cchain = chain_id.0 == cchain_id && node.config.network_id == 5;
                                                 info!(
-                                                    "Ancestors from {} — {} containers, {} bytes total",
+                                                    "{} Ancestors from {} — {} containers, {} bytes total",
+                                                    if is_cchain { "C-Chain" } else { "P-Chain" },
                                                     addr, containers.len(), total_bytes
                                                 );
 
-                                                let expected_req = match bootstrap_state {
-                                                    BootstrapState::WaitingAncestors(req) => Some((req, 0u32, 0u32)),
-                                                    BootstrapState::FetchingAncestors { req, depth, total_blocks } => Some((req, depth, total_blocks)),
-                                                    _ => None,
-                                                };
+                                                if is_cchain {
+                                                    // ── C-Chain block fetching ────────────────────────────────────────
+                                                    let expected_req = match cchain_bootstrap_state {
+                                                        CChainBootstrapState::WaitingAncestors(req) => Some((req, 0u32, 0u32)),
+                                                        CChainBootstrapState::FetchingAncestors { req, depth, total_blocks } => Some((req, depth, total_blocks)),
+                                                        _ => None,
+                                                    };
 
-                                                if let Some((req, depth, prev_total)) = expected_req {
-                                                    if request_id == req {
-                                                        // ── Store all containers ─────────────────────────────────────────
-                                                        let mut stored = 0u32;
-                                                        let mut oldest_container: Option<Vec<u8>> = None;
+                                                    if let Some((req, depth, prev_total)) = expected_req {
+                                                        if request_id == req {
+                                                            let mut stored = 0u32;
+                                                            let mut oldest_container: Option<Vec<u8>> = None;
 
-                                                        for container in &containers {
-                                                            let mut hasher = Sha256::new();
-                                                            hasher.update(container);
-                                                            let hash: [u8; 32] = hasher.finalize().into();
-
-                                                            if let Err(e) = node.db.put_cf(CF_BLOCKS, &hash, container) {
-                                                                warn!("Failed to store block {:02x?}: {}", &hash[..4], e);
-                                                            } else {
-                                                                stored += 1;
+                                                            for container in &containers {
+                                                                let mut hasher = Sha256::new();
+                                                                hasher.update(container);
+                                                                let hash: [u8; 32] = hasher.finalize().into();
+                                                                // Prefix C-Chain keys with "c:" to distinguish from P-Chain
+                                                                let mut key = Vec::with_capacity(34);
+                                                                key.extend_from_slice(b"c:");
+                                                                key.extend_from_slice(&hash);
+                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, container) {
+                                                                    warn!("C-Chain: failed to store block {:02x?}: {}", &hash[..4], e);
+                                                                } else {
+                                                                    stored += 1;
+                                                                }
+                                                                oldest_container = Some(container.clone());
                                                             }
-                                                            oldest_container = Some(container.clone());
+
+                                                            let new_total = prev_total + stored;
+                                                            info!("C-Chain Bootstrap: stored {} blocks (total: {})", stored, new_total);
+                                                            let _ = node.db.put_metadata(
+                                                                b"c_chain_blocks_downloaded",
+                                                                &new_total.to_le_bytes(),
+                                                            );
+
+                                                            let should_recurse = depth < 10
+                                                                && oldest_container.as_ref().map_or(false, |c| {
+                                                                    if c.len() >= 38 {
+                                                                        let parent: [u8; 32] = c[6..38].try_into().unwrap_or([0u8; 32]);
+                                                                        parent != [0u8; 32]
+                                                                    } else {
+                                                                        false
+                                                                    }
+                                                                });
+
+                                                            if should_recurse {
+                                                                let oldest = oldest_container.unwrap();
+                                                                let mut hasher = Sha256::new();
+                                                                hasher.update(&oldest);
+                                                                let oldest_id: [u8; 32] = hasher.finalize().into();
+                                                                let new_req = req + 1;
+                                                                let new_depth = depth + 1;
+                                                                let get_ancestors = NetworkMessage::GetAncestors {
+                                                                    chain_id: ChainId(cchain_id),
+                                                                    request_id: new_req,
+                                                                    deadline: 5_000_000_000u64,
+                                                                    container_id: BlockId(oldest_id),
+                                                                    max_containers_size: 2_000_000,
+                                                                };
+                                                                if let Ok(encoded) = get_ancestors.encode_proto() {
+                                                                    if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                        let _ = tls_stream.flush().await;
+                                                                        info!(
+                                                                            "C-Chain Bootstrap: recursive GetAncestors depth={} req={} (total: {})",
+                                                                            new_depth, new_req, new_total
+                                                                        );
+                                                                        cchain_bootstrap_state = CChainBootstrapState::FetchingAncestors {
+                                                                            req: new_req,
+                                                                            depth: new_depth,
+                                                                            total_blocks: new_total,
+                                                                        };
+                                                                    } else {
+                                                                        warn!("C-Chain Bootstrap: failed to send recursive GetAncestors");
+                                                                        cchain_bootstrap_state = CChainBootstrapState::Done;
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                if depth >= 10 {
+                                                                    info!("C-Chain Bootstrap: reached max depth (10 rounds, {} blocks)", new_total);
+                                                                } else {
+                                                                    info!("C-Chain Bootstrap: reached genesis, {} blocks total", new_total);
+                                                                }
+                                                                cchain_bootstrap_state = CChainBootstrapState::Done;
+                                                                info!("Bootstrap C-Chain complete with {} — {} total blocks stored", addr, new_total);
+                                                            }
                                                         }
+                                                    }
+                                                } else {
+                                                    // ── P-Chain block fetching ────────────────────────────────────────
+                                                    let expected_req = match bootstrap_state {
+                                                        BootstrapState::WaitingAncestors(req) => Some((req, 0u32, 0u32)),
+                                                        BootstrapState::FetchingAncestors { req, depth, total_blocks } => Some((req, depth, total_blocks)),
+                                                        _ => None,
+                                                    };
 
-                                                        let new_total = prev_total + stored;
-                                                        info!("Bootstrap: stored {} blocks (total: {})", stored, new_total);
+                                                    if let Some((req, depth, prev_total)) = expected_req {
+                                                        if request_id == req {
+                                                            let mut stored = 0u32;
+                                                            let mut oldest_container: Option<Vec<u8>> = None;
 
-                                                        // Update metadata with total stored count
-                                                        let _ = node.db.put_metadata(
-                                                            b"p_chain_blocks_downloaded",
-                                                            &new_total.to_le_bytes(),
-                                                        );
+                                                            for container in &containers {
+                                                                let mut hasher = Sha256::new();
+                                                                hasher.update(container);
+                                                                let hash: [u8; 32] = hasher.finalize().into();
 
-                                                        // ── Decide: recurse or finish ────────────────────────────────────
-                                                        let should_recurse = depth < 10
-                                                            && oldest_container.as_ref().map_or(false, |c| {
-                                                                // Extract parent ID: bytes [2..34] after 2-byte codec version
-                                                                if c.len() >= 34 {
-                                                                    let parent: [u8; 32] = c[2..34].try_into().unwrap_or([0u8; 32]);
-                                                                    parent != [0u8; 32]
+                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &hash, container) {
+                                                                    warn!("Failed to store block {:02x?}: {}", &hash[..4], e);
                                                                 } else {
-                                                                    false
+                                                                    stored += 1;
                                                                 }
-                                                            });
-
-                                                        if should_recurse {
-                                                            let oldest = oldest_container.unwrap();
-                                                            // The "block ID" to request ancestors of = SHA-256 of the oldest container
-                                                            let mut hasher = Sha256::new();
-                                                            hasher.update(&oldest);
-                                                            let oldest_id: [u8; 32] = hasher.finalize().into();
-
-                                                            let new_req = req + 1;
-                                                            let new_depth = depth + 1;
-                                                            let get_ancestors = NetworkMessage::GetAncestors {
-                                                                chain_id: ChainId([0u8; 32]),
-                                                                request_id: new_req,
-                                                                deadline: 5_000_000_000u64,
-                                                                container_id: BlockId(oldest_id),
-                                                                max_containers_size: 2_000_000,
-                                                            };
-                                                            if let Ok(encoded) = get_ancestors.encode_proto() {
-                                                                if tls_stream.write_all(&encoded).await.is_ok() {
-                                                                    let _ = tls_stream.flush().await;
-                                                                    info!(
-                                                                        "Bootstrap: recursive GetAncestors depth={} req={} (total blocks so far: {})",
-                                                                        new_depth, new_req, new_total
-                                                                    );
-                                                                    bootstrap_state = BootstrapState::FetchingAncestors {
-                                                                        req: new_req,
-                                                                        depth: new_depth,
-                                                                        total_blocks: new_total,
-                                                                    };
-                                                                } else {
-                                                                    warn!("Bootstrap: failed to send recursive GetAncestors, stopping");
-                                                                    bootstrap_state = BootstrapState::Done;
-                                                                }
+                                                                oldest_container = Some(container.clone());
                                                             }
-                                                        } else {
-                                                            if depth >= 10 {
-                                                                info!("Bootstrap: reached max depth (10 rounds, {} blocks), stopping fetch", new_total);
+
+                                                            let new_total = prev_total + stored;
+                                                            info!("Bootstrap: stored {} blocks (total: {})", stored, new_total);
+
+                                                            let _ = node.db.put_metadata(
+                                                                b"p_chain_blocks_downloaded",
+                                                                &new_total.to_le_bytes(),
+                                                            );
+
+                                                            let should_recurse = depth < 10
+                                                                && oldest_container.as_ref().map_or(false, |c| {
+                                                                    if c.len() >= 34 {
+                                                                        let parent: [u8; 32] = c[2..34].try_into().unwrap_or([0u8; 32]);
+                                                                        parent != [0u8; 32]
+                                                                    } else {
+                                                                        false
+                                                                    }
+                                                                });
+
+                                                            if should_recurse {
+                                                                let oldest = oldest_container.unwrap();
+                                                                let mut hasher = Sha256::new();
+                                                                hasher.update(&oldest);
+                                                                let oldest_id: [u8; 32] = hasher.finalize().into();
+                                                                let new_req = req + 1;
+                                                                let new_depth = depth + 1;
+                                                                let get_ancestors = NetworkMessage::GetAncestors {
+                                                                    chain_id: ChainId([0u8; 32]),
+                                                                    request_id: new_req,
+                                                                    deadline: 5_000_000_000u64,
+                                                                    container_id: BlockId(oldest_id),
+                                                                    max_containers_size: 2_000_000,
+                                                                };
+                                                                if let Ok(encoded) = get_ancestors.encode_proto() {
+                                                                    if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                        let _ = tls_stream.flush().await;
+                                                                        info!(
+                                                                            "Bootstrap: recursive GetAncestors depth={} req={} (total blocks so far: {})",
+                                                                            new_depth, new_req, new_total
+                                                                        );
+                                                                        bootstrap_state = BootstrapState::FetchingAncestors {
+                                                                            req: new_req,
+                                                                            depth: new_depth,
+                                                                            total_blocks: new_total,
+                                                                        };
+                                                                    } else {
+                                                                        warn!("Bootstrap: failed to send recursive GetAncestors, stopping");
+                                                                        bootstrap_state = BootstrapState::Done;
+                                                                    }
+                                                                }
                                                             } else {
-                                                                info!("Bootstrap: reached genesis (or short block), {} blocks total", new_total);
+                                                                if depth >= 10 {
+                                                                    info!("Bootstrap: reached max depth (10 rounds, {} blocks), stopping fetch", new_total);
+                                                                } else {
+                                                                    info!("Bootstrap: reached genesis (or short block), {} blocks total", new_total);
+                                                                }
+                                                                bootstrap_state = BootstrapState::Done;
+                                                                info!("Bootstrap P-Chain complete with {} — {} total blocks stored", addr, new_total);
+
+                                                                // Verify the stored chain
+                                                                if let Some(tip) = p_chain_tip {
+                                                                    let chain_len = verify_block_chain(&node.db, tip);
+                                                                    info!("P-Chain chain walk: {} blocks linked from tip", chain_len);
+                                                                }
+
+                                                                // Start C-Chain bootstrap if we have the frontier
+                                                                if let Some(tip) = cchain_frontier {
+                                                                    if cchain_bootstrap_state == CChainBootstrapState::Idle {
+                                                                        let cchain_req = bootstrap_request_base + 2000;
+                                                                        let get_accepted = NetworkMessage::GetAccepted {
+                                                                            chain_id: ChainId(cchain_id),
+                                                                            request_id: cchain_req,
+                                                                            deadline: 5_000_000_000u64,
+                                                                            container_ids: vec![BlockId(tip)],
+                                                                        };
+                                                                        if let Ok(encoded) = get_accepted.encode_proto() {
+                                                                            if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                                let _ = tls_stream.flush().await;
+                                                                                info!("C-Chain Bootstrap: sent GetAccepted (req={}) to {}", cchain_req, addr);
+                                                                                cchain_bootstrap_state = CChainBootstrapState::WaitingAccepted(cchain_req);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
-                                                            bootstrap_state = BootstrapState::Done;
-                                                            info!("Bootstrap P-Chain complete with {} — {} total blocks stored", addr, new_total);
                                                         }
                                                     }
                                                 }
-                                                let _ = chain_id; // suppress unused warning
                                             }
                                             NetworkMessage::GetAccepted { chain_id, request_id, .. } => {
                                                 // Respond with empty accepted list
