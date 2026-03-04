@@ -551,7 +551,7 @@ impl PeerManager {
     }
 
     /// Ingest discovered peers from a PeerList message.
-    pub fn process_peer_list(&mut self, peers: &[PeerInfo]) -> Vec<NodeId> {
+    pub fn process_peer_list(&mut self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
         let mut new_peers = Vec::new();
         for info in peers {
             if info.node_id == self.local_node_id {
@@ -563,7 +563,7 @@ impl PeerManager {
             // Parse IP from bytes
             if let Some(addr) = parse_peer_addr(&info.ip_addr, info.ip_port) {
                 self.discovered.push_back((info.node_id.clone(), addr));
-                new_peers.push(info.node_id.clone());
+                new_peers.push(info.clone());
             }
         }
         new_peers
@@ -1021,7 +1021,7 @@ impl NetworkManager {
     }
 
     /// Handle a PeerList message for gossip-based discovery.
-    pub fn handle_peer_list(&mut self, peers: &[PeerInfo]) -> Vec<NodeId> {
+    pub fn handle_peer_list(&mut self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
         self.peer_manager.process_peer_list(peers)
     }
 
@@ -2838,6 +2838,35 @@ mod tests {
     fn test_block_id_from_bytes() {
         assert!(BlockId::from_bytes(&[0u8; 32]).is_some());
         assert!(BlockId::from_bytes(&[0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn test_process_peer_list_deduplication() {
+        use std::net::SocketAddr;
+        let config = NetworkConfig::default();
+        let my_id = NodeId([0u8; 20]);
+        let mut pm = PeerManager::new(config, my_id);
+
+        let peers = vec![PeerInfo {
+            node_id: NodeId([1u8; 20]),
+            ip_addr: vec![10, 0, 0, 1],
+            ip_port: 9651,
+            cert_bytes: vec![],
+            timestamp: 0,
+            signature: vec![],
+        }];
+
+        let new1 = pm.process_peer_list(&peers);
+        assert_eq!(new1.len(), 1, "first time should discover 1 new peer");
+
+        // Add the peer to the manager
+        let addr: SocketAddr = "10.0.0.1:9651".parse().unwrap();
+        let mut peer = Peer::new(NodeId([1u8; 20]), addr);
+        peer.state = PeerState::Connected;
+        let _ = pm.add_peer(peer);
+
+        let new2 = pm.process_peer_list(&peers);
+        assert_eq!(new2.len(), 0, "already-known peer should not be returned");
     }
 
     #[test]

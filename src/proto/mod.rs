@@ -942,4 +942,23 @@ mod tests {
             assert_eq!(msg.name(), decoded.name());
         }
     }
+
+    #[test]
+    fn test_ping_uptime_100() {
+        let ping = NetworkMessage::Ping { uptime: 100 };
+        let encoded = ping.encode_proto().unwrap();
+        let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
+        match decoded {
+            NetworkMessage::Ping { uptime } => assert_eq!(uptime, 100),
+            other => panic!("expected Ping, got {:?}", other.name()),
+        }
+    }
+
+    #[test]
+    fn test_pong_decode() {
+        let pong = NetworkMessage::Pong { uptime: 0 };
+        let encoded = pong.encode_proto().unwrap();
+        let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
+        assert!(matches!(decoded, NetworkMessage::Pong { .. }));
+    }
 }

@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use avalanche_rs::db::Database;
 use avalanche_rs::evm::EvmExecutor;
 use avalanche_rs::identity::{self, NodeIdentity};
-use avalanche_rs::network::{ChainId, NetworkConfig, NetworkMessage, NodeId, PeerManager, Peer, PeerState};
+use avalanche_rs::network::{BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, PeerInfo, PeerManager, Peer, PeerState};
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
 use avalanche_rs::sync::{SyncConfig, SyncEngine, SyncPhase};
 
@@ -394,6 +394,43 @@ async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
     }
 }
 
+/// Dial up to 10 new peers discovered via PeerList.
+/// Skips peers we can't parse as a SocketAddr.
+fn dial_new_peers(new_peers: Vec<PeerInfo>, node: Arc<NodeState>) {
+    let to_dial: Vec<_> = new_peers
+        .into_iter()
+        .take(10)
+        .filter_map(|p| {
+            // Convert raw IP bytes + port to SocketAddr
+            let ip = match p.ip_addr.len() {
+                4 => {
+                    let arr: [u8; 4] = p.ip_addr.try_into().ok()?;
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(arr))
+                }
+                16 => {
+                    let arr: [u8; 16] = p.ip_addr.try_into().ok()?;
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(arr))
+                }
+                _ => return None,
+            };
+            if p.ip_port == 0 {
+                return None;
+            }
+            Some(std::net::SocketAddr::new(ip, p.ip_port))
+        })
+        .collect();
+
+    for addr in to_dial {
+        let node = node.clone();
+        tokio::spawn(async move {
+            info!("Dialing discovered peer {}", addr);
+            if let Err(e) = connect_and_handshake(addr, node).await {
+                debug!("Discovered peer {} failed: {}", addr, e);
+            }
+        });
+    }
+}
+
 /// Read one length-prefixed protobuf message from a TLS stream.
 async fn read_one_message<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
@@ -645,71 +682,116 @@ async fn connect_and_handshake(
 
     // 6. Keep connection alive — read messages in a loop
     info!("Entering message loop with {}", addr);
-    let mut read_buf = [0u8; 4];
+
+    let ping_interval = Duration::from_secs(30);
+    let pong_timeout = Duration::from_secs(60);
+    let mut ping_timer = tokio::time::interval(ping_interval);
+    ping_timer.tick().await; // consume the immediate first tick
+    let mut last_ping_sent: Option<Instant> = None;
+    let mut pong_received_since_last_ping = true; // start true so first ping isn't rejected
+
     loop {
-        match tokio::time::timeout(Duration::from_secs(120), tls_stream.read_exact(&mut read_buf)).await {
-            Ok(Ok(_)) => {
-                let msg_len = u32::from_be_bytes(read_buf) as usize;
-                if msg_len > 16 * 1024 * 1024 {
-                    warn!("Message too large from {}: {} bytes", addr, msg_len);
-                    break;
-                }
-                let mut msg_data = vec![0u8; msg_len];
-                match tls_stream.read_exact(&mut msg_data).await {
-                    Ok(_) => {
-                        let mut full = Vec::with_capacity(4 + msg_len);
-                        full.extend_from_slice(&read_buf);
-                        full.extend_from_slice(&msg_data);
-                        match NetworkMessage::decode_proto(&full) {
-                            Ok(msg) => {
-                                debug!("Received {} from {} ({} bytes)", msg.name(), addr, msg_len);
-                                match &msg {
-                                    NetworkMessage::Ping { uptime } => {
-                                        // Respond with Pong
-                                        let pong = NetworkMessage::Pong { uptime: *uptime };
-                                        if let Ok(encoded) = pong.encode_proto() {
-                                            let _ = tls_stream.write_all(&encoded).await;
-                                            let _ = tls_stream.flush().await;
-                                            debug!("Sent Pong to {}", addr);
-                                        }
-                                    }
-                                    NetworkMessage::PeerList { peers } => {
-                                        let mut pm = node.peer_manager.write().await;
-                                        let new = pm.process_peer_list(peers);
-                                        if !new.is_empty() {
-                                            info!("Discovered {} new peers via {}", new.len(), addr);
-                                        }
-                                    }
-                                    _ => {
-                                        debug!("Unhandled message {} from {}", msg.name(), addr);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Failed to decode message from {}: {}", addr, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Read error from {}: {}", addr, e);
+        let mut len_buf = [0u8; 4];
+        tokio::select! {
+            // Arm 1: periodic ping
+            _ = ping_timer.tick() => {
+                // Check if we haven't received a pong since last ping
+                if let Some(t) = last_ping_sent {
+                    if !pong_received_since_last_ping && t.elapsed() > pong_timeout {
+                        warn!("No Pong from {} within {}s, closing", addr, pong_timeout.as_secs());
                         break;
                     }
                 }
-            }
-            Ok(Err(e)) => {
-                warn!("Connection to {} closed: {}", addr, e);
-                break;
-            }
-            Err(_) => {
-                debug!("No message from {} for 120s, sending Ping", addr);
                 let ping = NetworkMessage::Ping { uptime: 100 };
                 if let Ok(encoded) = ping.encode_proto() {
                     match tls_stream.write_all(&encoded).await {
-                        Ok(_) => { let _ = tls_stream.flush().await; }
+                        Ok(_) => {
+                            let _ = tls_stream.flush().await;
+                            last_ping_sent = Some(Instant::now());
+                            pong_received_since_last_ping = false;
+                            debug!("Sent Ping to {}", addr);
+                        }
                         Err(e) => {
                             warn!("Failed to send Ping to {}: {}", addr, e);
                             break;
                         }
+                    }
+                }
+            }
+
+            // Arm 2: incoming message
+            result = tls_stream.read_exact(&mut len_buf) => {
+                match result {
+                    Ok(_) => {
+                        let msg_len = u32::from_be_bytes(len_buf) as usize;
+                        if msg_len > 16 * 1024 * 1024 {
+                            warn!("Message too large from {}: {} bytes", addr, msg_len);
+                            break;
+                        }
+                        let mut msg_data = vec![0u8; msg_len];
+                        match tls_stream.read_exact(&mut msg_data).await {
+                            Ok(_) => {
+                                let mut full = Vec::with_capacity(4 + msg_len);
+                                full.extend_from_slice(&len_buf);
+                                full.extend_from_slice(&msg_data);
+                                match NetworkMessage::decode_proto(&full) {
+                                    Ok(msg) => {
+                                        debug!("Received {} from {} ({} bytes)", msg.name(), addr, msg_len);
+                                        match &msg {
+                                            NetworkMessage::Ping { uptime } => {
+                                                let pong = NetworkMessage::Pong { uptime: *uptime };
+                                                if let Ok(encoded) = pong.encode_proto() {
+                                                    let _ = tls_stream.write_all(&encoded).await;
+                                                    let _ = tls_stream.flush().await;
+                                                    debug!("Sent Pong to {}", addr);
+                                                }
+                                            }
+                                            NetworkMessage::Pong { .. } => {
+                                                pong_received_since_last_ping = true;
+                                                debug!("Received Pong from {}", addr);
+                                            }
+                                            NetworkMessage::PeerList { peers } => {
+                                                let new_peers = {
+                                                    let mut pm = node.peer_manager.write().await;
+                                                    pm.process_peer_list(peers)
+                                                };
+                                                if !new_peers.is_empty() {
+                                                    info!("Discovered {} new peers via {}", new_peers.len(), addr);
+                                                    // Dial up to 10 new peers concurrently
+                                                    dial_new_peers(new_peers, node.clone());
+                                                }
+                                            }
+                                            NetworkMessage::GetAcceptedFrontier { chain_id, request_id, .. } => {
+                                                // Respond with empty frontier (we have nothing yet)
+                                                let response = NetworkMessage::AcceptedFrontier {
+                                                    chain_id: chain_id.clone(),
+                                                    request_id: *request_id,
+                                                    container_id: BlockId::zero(),
+                                                };
+                                                if let Ok(encoded) = response.encode_proto() {
+                                                    let _ = tls_stream.write_all(&encoded).await;
+                                                    let _ = tls_stream.flush().await;
+                                                }
+                                            }
+                                            _ => {
+                                                debug!("Unhandled message {} from {}", msg.name(), addr);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("Failed to decode message from {}: {}", addr, e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Read error from {}: {}", addr, e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Connection to {} closed: {}", addr, e);
+                        break;
                     }
                 }
             }
