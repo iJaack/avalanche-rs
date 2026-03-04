@@ -153,7 +153,7 @@ mod tests {
             parent_id: parent,
             height,
             timestamp: 0,
-            block_type: crate::block::BlockType::PChainStandard,
+            block_type: crate::block::BlockType::BanffStandard,
             raw_size: 54,
         }
     }

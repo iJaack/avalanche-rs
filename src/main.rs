@@ -142,8 +142,10 @@ struct ValidatorInfo {
 
 /// Walk the P-Chain block tree from tip toward genesis, verifying the stored chain.
 /// Blocks are stored by SHA-256(raw_bytes) in CF_BLOCKS.
-/// Parent block ID is embedded at bytes [6..38] of each raw block (after 2-byte codec
-/// version and 4-byte type ID).
+/// Parent block ID offset depends on block type:
+///   - Banff (typeID 29): bytes [18..50]
+///   - Banff (typeID 30-32): bytes [14..46]
+///   - Apricot (typeID 0-4): bytes [6..38]
 fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> u64 {
     let mut current = tip_id;
     let mut count = 0u64;
@@ -151,16 +153,19 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> u64 {
         match db.get_cf(CF_BLOCKS, &current) {
             Ok(Some(block_data)) => {
                 count += 1;
-                if block_data.len() < 38 {
-                    info!("Chain walk: block too short ({} bytes) at depth {}", block_data.len(), count);
-                    break;
+                match avalanche_rs::block::BlockHeader::extract_parent_id(&block_data) {
+                    Some(parent) => {
+                        if parent == [0u8; 32] {
+                            info!("Verified chain of {} blocks from tip to genesis", count);
+                            break;
+                        }
+                        current = parent;
+                    }
+                    None => {
+                        info!("Chain walk: block too short ({} bytes) at depth {}", block_data.len(), count);
+                        break;
+                    }
                 }
-                let parent: [u8; 32] = block_data[6..38].try_into().unwrap_or([0u8; 32]);
-                if parent == [0u8; 32] {
-                    info!("Verified chain of {} blocks from tip to genesis", count);
-                    break;
-                }
-                current = parent;
             }
             Ok(None) => {
                 info!(
@@ -192,6 +197,10 @@ struct NodeState {
     config: Cli,
     start_time: Instant,
     validators: std::collections::HashMap<String, ValidatorInfo>,
+    /// Unique validator NodeIDs seen via PeerList gossip.
+    validators_seen: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Accumulated stake weight from PeerList info (best-effort, 0 if unavailable).
+    total_stake_weight: Arc<RwLock<u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +312,8 @@ async fn main() {
         config: cli,
         start_time: Instant::now(),
         validators,
+        validators_seen: Arc::new(RwLock::new(std::collections::HashSet::new())),
+        total_stake_weight: Arc::new(RwLock::new(0u64)),
     });
 
     // 6. Start P2P listener
@@ -835,6 +846,15 @@ async fn connect_and_handshake(
     let mut cchain_bootstrap_state = CChainBootstrapState::Idle;
     let mut cchain_frontier: Option<[u8; 32]> = None;
 
+    // Continuous sync: check for new blocks every 2s after bootstrap completes
+    let mut sync_timer = tokio::time::interval(Duration::from_secs(2));
+    sync_timer.tick().await; // consume the immediate first tick
+    let mut continuous_sync_req: Option<u32> = None;
+    let mut sync_req_counter: u32 = bootstrap_request_base.wrapping_add(10000);
+    let mut last_known_tip: Option<[u8; 32]> = None;
+    // Flag: has first C-Chain block bytes been logged for debug?
+    let mut cchain_debug_logged = false;
+
     // Decode C-Chain Fuji ID from CB58
     let cchain_id: [u8; 32] = {
         let cb58 = "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp";
@@ -911,6 +931,25 @@ async fn connect_and_handshake(
                 }
             }
 
+            // Arm 4: continuous sync timer — every 2s, check for new blocks after bootstrap
+            _ = sync_timer.tick() => {
+                if matches!(bootstrap_state, BootstrapState::Done) {
+                    sync_req_counter = sync_req_counter.wrapping_add(1);
+                    continuous_sync_req = Some(sync_req_counter);
+                    let req = NetworkMessage::GetAcceptedFrontier {
+                        chain_id: ChainId([0u8; 32]),
+                        request_id: sync_req_counter,
+                        deadline: 5_000_000_000u64,
+                    };
+                    if let Ok(encoded) = req.encode_proto() {
+                        if tls_stream.write_all(&encoded).await.is_ok() {
+                            let _ = tls_stream.flush().await;
+                            debug!("Continuous sync: GetAcceptedFrontier req={} to {}", sync_req_counter, addr);
+                        }
+                    }
+                }
+            }
+
             // Arm 2: incoming message
             result = tls_stream.read_exact(&mut len_buf) => {
                 match result {
@@ -951,6 +990,23 @@ async fn connect_and_handshake(
                                                     info!("Discovered {} new peers via {}", new_peers.len(), addr);
                                                     dial_new_peers(new_peers, node.clone());
                                                 }
+                                                // Track validators seen via PeerList gossip
+                                                {
+                                                    let mut vs = node.validators_seen.write().await;
+                                                    for peer in &peers {
+                                                        // Derive NodeID from cert if available, else use node_id field
+                                                        let nid_str = if !peer.cert_bytes.is_empty() {
+                                                            format!("{}", identity::derive_node_id(&peer.cert_bytes))
+                                                        } else {
+                                                            format!("{}", peer.node_id)
+                                                        };
+                                                        vs.insert(nid_str);
+                                                    }
+                                                    let count = vs.len();
+                                                    if count > 0 {
+                                                        info!("Validator tracking: {} unique validators seen (via {})", count, addr);
+                                                    }
+                                                }
                                             }
                                             NetworkMessage::GetAcceptedFrontier { chain_id, request_id, .. } => {
                                                 // Respond with empty frontier (we have nothing yet)
@@ -967,6 +1023,37 @@ async fn connect_and_handshake(
                                             }
                                             NetworkMessage::AcceptedFrontier { request_id, container_id, .. } => {
                                                 info!("AcceptedFrontier from {} — tip={}", addr, container_id);
+
+                                                // Continuous sync: handle periodic frontier check
+                                                if Some(request_id) == continuous_sync_req {
+                                                    continuous_sync_req = None;
+                                                    if container_id.0 != [0u8; 32] {
+                                                        let is_new = last_known_tip.map_or(true, |t| t != container_id.0);
+                                                        if is_new {
+                                                            info!("Continuous sync: new tip detected {} from {}", container_id, addr);
+                                                            last_known_tip = Some(container_id.0);
+                                                            // Kick off GetAccepted to fetch new blocks
+                                                            sync_req_counter = sync_req_counter.wrapping_add(1);
+                                                            let fetch_req = sync_req_counter;
+                                                            let get_accepted = NetworkMessage::GetAccepted {
+                                                                chain_id: ChainId([0u8; 32]),
+                                                                request_id: fetch_req,
+                                                                deadline: 5_000_000_000u64,
+                                                                container_ids: vec![container_id.clone()],
+                                                            };
+                                                            if let Ok(encoded) = get_accepted.encode_proto() {
+                                                                if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                    let _ = tls_stream.flush().await;
+                                                                    info!("Continuous sync: GetAccepted req={} for new tip", fetch_req);
+                                                                    bootstrap_state = BootstrapState::WaitingAccepted(fetch_req);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            debug!("Continuous sync: tip unchanged {}", container_id);
+                                                        }
+                                                    }
+                                                }
+
                                                 // Store C-Chain frontier for later use
                                                 if request_id == bootstrap_request_base + 1000 {
                                                     info!("C-Chain AcceptedFrontier from {} — tip={}", addr, container_id);
@@ -1077,6 +1164,27 @@ async fn connect_and_handshake(
                                                             let mut oldest_container: Option<Vec<u8>> = None;
 
                                                             for container in &containers {
+                                                                // Debug: log first C-Chain block format once
+                                                                if !cchain_debug_logged {
+                                                                    cchain_debug_logged = true;
+                                                                    let preview_len = container.len().min(20);
+                                                                    info!(
+                                                                        "C-Chain block format debug: first {} bytes = {:02x?} (total {} bytes)",
+                                                                        preview_len, &container[..preview_len], container.len()
+                                                                    );
+                                                                    if container.len() >= 2 {
+                                                                        if container[0] == 0x00 && container[1] == 0x00 {
+                                                                            info!("C-Chain block: detected Avalanche codec wrapper (0x00 0x00 prefix)");
+                                                                        } else if container[0] >= 0xf8 {
+                                                                            info!("C-Chain block: detected raw RLP long list (0x{:02x} prefix)", container[0]);
+                                                                        } else if container[0] >= 0xc0 {
+                                                                            info!("C-Chain block: detected raw RLP short list (0x{:02x} prefix)", container[0]);
+                                                                        } else {
+                                                                            warn!("C-Chain block: unexpected format — first byte 0x{:02x}", container[0]);
+                                                                        }
+                                                                    }
+                                                                }
+
                                                                 let mut hasher = Sha256::new();
                                                                 hasher.update(container);
                                                                 let hash: [u8; 32] = hasher.finalize().into();
@@ -1099,13 +1207,13 @@ async fn connect_and_handshake(
                                                                 &new_total.to_le_bytes(),
                                                             );
 
+                                                            // Use block parser to determine if oldest block is genesis
+                                                            // (handles both raw RLP and Avalanche-wrapped format)
                                                             let should_recurse = depth < 10
                                                                 && oldest_container.as_ref().map_or(false, |c| {
-                                                                    if c.len() >= 38 {
-                                                                        let parent: [u8; 32] = c[6..38].try_into().unwrap_or([0u8; 32]);
-                                                                        parent != [0u8; 32]
-                                                                    } else {
-                                                                        false
+                                                                    match avalanche_rs::block::BlockHeader::parse(c, avalanche_rs::block::Chain::CChain) {
+                                                                        Ok(h) => !h.is_genesis(),
+                                                                        Err(_) => !c.is_empty() && c[0] >= 0xc0,
                                                                     }
                                                                 });
 
@@ -1185,13 +1293,12 @@ async fn connect_and_handshake(
                                                                 &new_total.to_le_bytes(),
                                                             );
 
+                                                            // Use type-aware parent extraction (handles Apricot and Banff)
                                                             let should_recurse = depth < 10
                                                                 && oldest_container.as_ref().map_or(false, |c| {
-                                                                    if c.len() >= 34 {
-                                                                        let parent: [u8; 32] = c[2..34].try_into().unwrap_or([0u8; 32]);
-                                                                        parent != [0u8; 32]
-                                                                    } else {
-                                                                        false
+                                                                    match avalanche_rs::block::BlockHeader::extract_parent_id(c) {
+                                                                        Some(parent) => parent != [0u8; 32],
+                                                                        None => false,
                                                                     }
                                                                 });
 

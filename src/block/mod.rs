@@ -8,16 +8,32 @@ use sha2::{Digest, Sha256};
 pub type BlockId = [u8; 32];
 
 /// Block type derived from the Avalanche codec typeID (P-Chain) or RLP structure (C-Chain).
+///
+/// Type ID registration order (block/codec.go linearcodec):
+///   0: ApricotProposalBlock   1: ApricotAbortBlock    2: ApricotCommitBlock
+///   3: ApricotStandardBlock   4: ApricotAtomicBlock   (5-28: tx types)
+///  29: BanffProposalBlock    30: BanffAbortBlock      31: BanffCommitBlock
+///  32: BanffStandardBlock
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockType {
-    /// typeID = 0
-    PChainProposal,
-    /// typeID = 1
-    PChainAbort,
-    /// typeID = 2
-    PChainCommit,
-    /// typeID = 3
-    PChainStandard,
+    /// typeID = 0 (Apricot)
+    ApricotProposal,
+    /// typeID = 1 (Apricot)
+    ApricotAbort,
+    /// typeID = 2 (Apricot)
+    ApricotCommit,
+    /// typeID = 3 (Apricot)
+    ApricotStandard,
+    /// typeID = 4 (Apricot)
+    ApricotAtomic,
+    /// typeID = 29 (Banff)
+    BanffProposal,
+    /// typeID = 30 (Banff)
+    BanffAbort,
+    /// typeID = 31 (Banff)
+    BanffCommit,
+    /// typeID = 32 (Banff)
+    BanffStandard,
     /// Coreth EVM block (C-Chain)
     CChainEvm,
     /// Unknown typeID
@@ -51,15 +67,29 @@ pub struct BlockHeader {
 impl BlockHeader {
     /// Parse a raw block into a `BlockHeader`.
     ///
-    /// **P-Chain block layout (Banff/Post-Banff):**
+    /// **P-Chain Apricot block layout (typeID 0-4):**
     /// - Bytes `[0..2]`: codec version (uint16 BE, usually 0)
     /// - Bytes `[2..6]`: typeID (uint32 BE)
     /// - Bytes `[6..38]`: parentID (32 bytes)
     /// - Bytes `[38..46]`: height (uint64 BE)
-    /// - Bytes `[46..54]`: timestamp (uint64 BE)
+    /// - Bytes `[46..]`: transactions (no explicit timestamp field)
     ///
-    /// **C-Chain block layout:** RLP-encoded Ethereum block
-    /// `[header_rlp, uncles_rlp, txs_rlp]` where header contains parentHash, number, timestamp.
+    /// **P-Chain Banff block layout (typeID 29-32, except BanffProposal):**
+    /// - Bytes `[0..2]`: codec version
+    /// - Bytes `[2..6]`: typeID (uint32 BE)
+    /// - Bytes `[6..14]`: timestamp/Time (uint64 BE) — comes FIRST in Banff blocks
+    /// - Bytes `[14..46]`: parentID (32 bytes)
+    /// - Bytes `[46..54]`: height (uint64 BE)
+    ///
+    /// **P-Chain BanffProposalBlock layout (typeID 29):**
+    /// - Bytes `[0..2]`: codec version
+    /// - Bytes `[2..6]`: typeID (uint32 BE = 29)
+    /// - Bytes `[6..14]`: timestamp/Time (uint64 BE)
+    /// - Bytes `[14..18]`: Transactions slice length (uint32 BE, usually 0)
+    /// - Bytes `[18..50]`: parentID (32 bytes)
+    /// - Bytes `[50..58]`: height (uint64 BE)
+    ///
+    /// **C-Chain block layout:** RLP-encoded Ethereum block (possibly with Avalanche wrapper).
     pub fn parse(raw: &[u8], chain: Chain) -> Result<Self, String> {
         let id = sha256(raw);
         match chain {
@@ -72,6 +102,41 @@ impl BlockHeader {
     pub fn is_genesis(&self) -> bool {
         self.parent_id == [0u8; 32]
     }
+
+    /// Returns the parent ID extracted from a raw block byte slice, accounting for
+    /// the block type at the correct offset. Used for chain-walk without full parse.
+    pub fn extract_parent_id(raw: &[u8]) -> Option<[u8; 32]> {
+        if raw.len() < 6 {
+            return None;
+        }
+        let type_id = u32::from_be_bytes(raw[2..6].try_into().ok()?);
+        match type_id {
+            29 => {
+                // BanffProposal: ts(8) + txs_len(4) + parent(32) @ [18..50]
+                if raw.len() >= 50 {
+                    raw[18..50].try_into().ok()
+                } else {
+                    None
+                }
+            }
+            30 | 31 | 32 => {
+                // BanffAbort/Commit/Standard: ts(8) + parent(32) @ [14..46]
+                if raw.len() >= 46 {
+                    raw[14..46].try_into().ok()
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // Apricot: parent(32) @ [6..38]
+                if raw.len() >= 38 {
+                    raw[6..38].try_into().ok()
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -79,24 +144,77 @@ impl BlockHeader {
 // ---------------------------------------------------------------------------
 
 fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
-    if raw.len() < 54 {
+    if raw.len() < 6 {
         return Err(format!(
-            "P-Chain block too short: {} bytes (need ≥54)",
+            "P-Chain block too short: {} bytes (need ≥6 for typeID)",
             raw.len()
         ));
     }
 
     let type_id = u32::from_be_bytes(raw[2..6].try_into().unwrap());
-    let mut parent_id = [0u8; 32];
-    parent_id.copy_from_slice(&raw[6..38]);
-    let height = u64::from_be_bytes(raw[38..46].try_into().unwrap());
-    let timestamp = u64::from_be_bytes(raw[46..54].try_into().unwrap());
+
+    let (parent_id, height, timestamp) = match type_id {
+        29 => {
+            // BanffProposalBlock: [6..14]=Time, [14..18]=Txs_len, [18..50]=PrntID, [50..58]=Hght
+            if raw.len() < 58 {
+                return Err(format!(
+                    "BanffProposalBlock too short: {} bytes (need ≥58)",
+                    raw.len()
+                ));
+            }
+            let ts = u64::from_be_bytes(raw[6..14].try_into().unwrap());
+            let mut pid = [0u8; 32];
+            pid.copy_from_slice(&raw[18..50]);
+            let h = u64::from_be_bytes(raw[50..58].try_into().unwrap());
+            (pid, h, ts)
+        }
+        30 | 31 | 32 => {
+            // BanffAbortBlock / BanffCommitBlock / BanffStandardBlock:
+            // [6..14]=Time, [14..46]=PrntID, [46..54]=Hght
+            if raw.len() < 54 {
+                return Err(format!(
+                    "Banff block (typeID={}) too short: {} bytes (need ≥54)",
+                    type_id,
+                    raw.len()
+                ));
+            }
+            let ts = u64::from_be_bytes(raw[6..14].try_into().unwrap());
+            let mut pid = [0u8; 32];
+            pid.copy_from_slice(&raw[14..46]);
+            let h = u64::from_be_bytes(raw[46..54].try_into().unwrap());
+            (pid, h, ts)
+        }
+        _ => {
+            // Apricot blocks (typeID 0-4) and unknown future types:
+            // [6..38]=PrntID, [38..46]=Hght, [46..54]=optional data (read as ts if present)
+            if raw.len() < 46 {
+                return Err(format!(
+                    "P-Chain Apricot block too short: {} bytes (need ≥46)",
+                    raw.len()
+                ));
+            }
+            let mut pid = [0u8; 32];
+            pid.copy_from_slice(&raw[6..38]);
+            let h = u64::from_be_bytes(raw[38..46].try_into().unwrap());
+            let ts = if raw.len() >= 54 {
+                u64::from_be_bytes(raw[46..54].try_into().unwrap())
+            } else {
+                0
+            };
+            (pid, h, ts)
+        }
+    };
 
     let block_type = match type_id {
-        0 => BlockType::PChainProposal,
-        1 => BlockType::PChainAbort,
-        2 => BlockType::PChainCommit,
-        3 => BlockType::PChainStandard,
+        0 => BlockType::ApricotProposal,
+        1 => BlockType::ApricotAbort,
+        2 => BlockType::ApricotCommit,
+        3 => BlockType::ApricotStandard,
+        4 => BlockType::ApricotAtomic,
+        29 => BlockType::BanffProposal,
+        30 => BlockType::BanffAbort,
+        31 => BlockType::BanffCommit,
+        32 => BlockType::BanffStandard,
         t => BlockType::Unknown(t),
     };
 
@@ -114,17 +232,48 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
 // C-Chain / Ethereum RLP parser
 // ---------------------------------------------------------------------------
 
-/// Parse an RLP-encoded Ethereum block from the Ancestors protocol.
+/// Parse a C-Chain block from the Ancestors protocol response.
 ///
-/// Structure: `[header_list, uncles_list, txs_list]` (outer list, 3 items)
-/// Header fields (in order):
-///   parentHash(0) sha3Uncles(1) miner(2) stateRoot(3) txRoot(4) receiptRoot(5)
-///   bloom(6) difficulty(7) number(8) gasLimit(9) gasUsed(10) timestamp(11) …
+/// Handles two formats:
+/// 1. Raw RLP: starts with 0xf8/0xf9 (RLP long list prefix)
+/// 2. Avalanche-wrapped RLP: starts with 0x00 0x00 (codec version), followed by
+///    4-byte typeID, then raw RLP bytes
 fn parse_cchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
     if raw.is_empty() {
         return Err("empty C-Chain block".to_string());
     }
 
+    // Detect Avalanche codec wrapper: version bytes 0x00 0x00 followed by typeID
+    let rlp_data = if raw.len() >= 6 && raw[0] == 0x00 && raw[1] == 0x00 {
+        // Skip 2-byte codec version + 4-byte typeID
+        &raw[6..]
+    } else {
+        raw
+    };
+
+    if rlp_data.is_empty() {
+        return Err("C-Chain block empty after header strip".to_string());
+    }
+
+    // Verify it looks like an RLP list
+    if rlp_data[0] < 0xc0 {
+        return Err(format!(
+            "C-Chain block: expected RLP list (0xc0+) at start, got 0x{:02x} (first raw bytes: {:02x?})",
+            rlp_data[0],
+            &raw[..raw.len().min(8)]
+        ));
+    }
+
+    parse_cchain_rlp(rlp_data, id)
+}
+
+/// Parse an RLP-encoded Ethereum block.
+///
+/// Structure: `[header_list, uncles_list, txs_list]` (outer list, 3 items)
+/// Header fields (in order):
+///   parentHash(0) sha3Uncles(1) miner(2) stateRoot(3) txRoot(4) receiptRoot(5)
+///   bloom(6) difficulty(7) number(8) gasLimit(9) gasUsed(10) timestamp(11) …
+fn parse_cchain_rlp(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
     // Outer list: [header, uncles, txs]
     let (_, header_start) =
         rlp_list_start(raw, 0).map_err(|e| format!("outer list: {}", e))?;
@@ -357,8 +506,10 @@ impl ChainGraph {
 mod tests {
     use super::*;
 
-    /// Build a minimal 54-byte P-Chain block for testing.
-    fn make_pchain_block(
+    /// Build a minimal Apricot P-Chain block for testing (type_id 0-4).
+    /// Layout: [0..2]=version=0, [2..6]=type_id, [6..38]=parent_id,
+    ///         [38..46]=height, [46..54]=extra_data (readable as timestamp for test purposes).
+    fn make_apricot_block(
         type_id: u32,
         parent_id: [u8; 32],
         height: u64,
@@ -373,6 +524,56 @@ mod tests {
         raw
     }
 
+    /// Alias for backward compat in tests that used make_pchain_block.
+    fn make_pchain_block(
+        type_id: u32,
+        parent_id: [u8; 32],
+        height: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        make_apricot_block(type_id, parent_id, height, timestamp)
+    }
+
+    /// Build a minimal Banff block (typeID 30/31/32).
+    /// Layout: [0..2]=version=0, [2..6]=type_id, [6..14]=timestamp,
+    ///         [14..46]=parent_id, [46..54]=height.
+    fn make_banff_block(
+        type_id: u32,
+        parent_id: [u8; 32],
+        height: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        assert!(type_id == 30 || type_id == 31 || type_id == 32,
+            "use make_banff_proposal_block for typeID 29");
+        let mut raw = vec![0u8; 54];
+        raw[2..6].copy_from_slice(&type_id.to_be_bytes());
+        raw[6..14].copy_from_slice(&timestamp.to_be_bytes());
+        raw[14..46].copy_from_slice(&parent_id);
+        raw[46..54].copy_from_slice(&height.to_be_bytes());
+        raw
+    }
+
+    /// Build a minimal BanffProposalBlock (typeID 29).
+    /// Layout: [0..2]=version, [2..6]=29, [6..14]=timestamp, [14..18]=txs_len=0,
+    ///         [18..50]=parent_id, [50..58]=height.
+    fn make_banff_proposal_block(
+        parent_id: [u8; 32],
+        height: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut raw = vec![0u8; 58];
+        raw[2..6].copy_from_slice(&29u32.to_be_bytes());
+        raw[6..14].copy_from_slice(&timestamp.to_be_bytes());
+        // [14..18] = txs slice len = 0 (already zero)
+        raw[18..50].copy_from_slice(&parent_id);
+        raw[50..58].copy_from_slice(&height.to_be_bytes());
+        raw
+    }
+
+    // -----------------------------------------------------------------------
+    // Apricot P-Chain tests (backward-compatible)
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_parse_pchain_genesis() {
         let raw = make_pchain_block(0, [0u8; 32], 0, 1_000_000);
@@ -380,16 +581,16 @@ mod tests {
         assert!(h.is_genesis());
         assert_eq!(h.height, 0);
         assert_eq!(h.timestamp, 1_000_000);
-        assert_eq!(h.block_type, BlockType::PChainProposal);
+        assert_eq!(h.block_type, BlockType::ApricotProposal);
     }
 
     #[test]
     fn test_parse_pchain_block_types() {
         let cases = [
-            (0u32, BlockType::PChainProposal),
-            (1, BlockType::PChainAbort),
-            (2, BlockType::PChainCommit),
-            (3, BlockType::PChainStandard),
+            (0u32, BlockType::ApricotProposal),
+            (1, BlockType::ApricotAbort),
+            (2, BlockType::ApricotCommit),
+            (3, BlockType::ApricotStandard),
             (99, BlockType::Unknown(99)),
         ];
         for (type_id, expected) in cases {
@@ -423,6 +624,76 @@ mod tests {
         assert_eq!(h.parent_id, parent);
         assert!(!h.is_genesis());
     }
+
+    // -----------------------------------------------------------------------
+    // Banff P-Chain tests — fixes the height extraction bug
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_banff_standard_block() {
+        let parent = [0xBBu8; 32];
+        let raw = make_banff_block(32, parent, 1_500_000, 1_700_000_000);
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+        assert_eq!(h.block_type, BlockType::BanffStandard);
+        assert_eq!(h.parent_id, parent);
+        assert_eq!(h.height, 1_500_000);
+        assert_eq!(h.timestamp, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_parse_banff_abort_block() {
+        let raw = make_banff_block(30, [0u8; 32], 0, 1_600_000_000);
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+        assert_eq!(h.block_type, BlockType::BanffAbort);
+        assert!(h.is_genesis());
+        assert_eq!(h.height, 0);
+        assert_eq!(h.timestamp, 1_600_000_000);
+    }
+
+    #[test]
+    fn test_parse_banff_commit_block() {
+        let raw = make_banff_block(31, [0xCCu8; 32], 999, 1_700_000_001);
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+        assert_eq!(h.block_type, BlockType::BanffCommit);
+        assert_eq!(h.height, 999);
+        assert_eq!(h.timestamp, 1_700_000_001);
+    }
+
+    #[test]
+    fn test_parse_banff_proposal_block() {
+        let parent = [0xDDu8; 32];
+        let raw = make_banff_proposal_block(parent, 42_000, 1_699_999_999);
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+        assert_eq!(h.block_type, BlockType::BanffProposal);
+        assert_eq!(h.parent_id, parent);
+        assert_eq!(h.height, 42_000);
+        assert_eq!(h.timestamp, 1_699_999_999);
+    }
+
+    #[test]
+    fn test_banff_heights_sequential() {
+        // Simulate a chain: genesis -> block1 -> block2
+        let g_raw = make_banff_block(32, [0u8; 32], 0, 1_000_000);
+        let g = BlockHeader::parse(&g_raw, Chain::PChain).unwrap();
+        assert_eq!(g.height, 0);
+        assert!(g.is_genesis());
+
+        let b1_raw = make_banff_block(32, g.id, 1, 1_000_001);
+        let b1 = BlockHeader::parse(&b1_raw, Chain::PChain).unwrap();
+        assert_eq!(b1.height, 1);
+
+        let b2_raw = make_banff_block(32, b1.id, 2, 1_000_002);
+        let b2 = BlockHeader::parse(&b2_raw, Chain::PChain).unwrap();
+        assert_eq!(b2.height, 2);
+
+        let graph = ChainGraph::build([g, b1, b2]);
+        assert_eq!(graph.tip_height, 2);
+        assert_eq!(graph.fork_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Chain graph tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_chain_graph_linear() {
@@ -464,6 +735,10 @@ mod tests {
         let graph = ChainGraph::build([g, a, b]);
         assert_eq!(graph.fork_count, 1);
     }
+
+    // -----------------------------------------------------------------------
+    // RLP helper tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_rlp_skip_single_byte() {
@@ -548,6 +823,16 @@ mod tests {
         rlp_list(outer_payload)
     }
 
+    /// Build a C-Chain block wrapped in an Avalanche codec header.
+    fn make_cchain_block_wrapped(parent: [u8; 32], number: u64, timestamp: u64) -> Vec<u8> {
+        let rlp = make_cchain_block(parent, number, timestamp);
+        let mut wrapped = Vec::with_capacity(6 + rlp.len());
+        wrapped.extend_from_slice(&[0x00, 0x00]); // codec version
+        wrapped.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // typeID = 1 (placeholder)
+        wrapped.extend_from_slice(&rlp);
+        wrapped
+    }
+
     fn encode_rlp_u64(buf: &mut Vec<u8>, v: u64) {
         if v == 0 {
             buf.push(0x80);
@@ -595,5 +880,17 @@ mod tests {
         assert_eq!(h.height, 42);
         assert_eq!(h.timestamp, 1_700_000_000);
         assert!(!h.is_genesis());
+    }
+
+    #[test]
+    fn test_parse_cchain_wrapped() {
+        // Test that Avalanche-wrapped C-Chain blocks are parsed correctly
+        let parent = [0xEEu8; 32];
+        let raw = make_cchain_block_wrapped(parent, 100, 1_750_000_000);
+        let h = BlockHeader::parse(&raw, Chain::CChain).unwrap();
+        assert_eq!(h.parent_id, parent);
+        assert_eq!(h.height, 100);
+        assert_eq!(h.timestamp, 1_750_000_000);
+        assert_eq!(h.block_type, BlockType::CChainEvm);
     }
 }
