@@ -5,6 +5,7 @@
 //! sandwich construction, liquidation scanning, and bundle submission.
 
 pub mod v4;
+pub mod engine;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

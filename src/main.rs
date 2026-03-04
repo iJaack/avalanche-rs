@@ -28,6 +28,7 @@ use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::network::{BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, PeerInfo, PeerManager, Peer, PeerState};
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
 use avalanche_rs::sync::{SyncConfig, SyncEngine, SyncPhase};
+use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -334,6 +335,8 @@ struct NodeState {
     /// Per-chain sync metrics updated by bootstrap and verified via chain walk.
     p_chain_metrics: Arc<RwLock<ChainMetrics>>,
     c_chain_metrics: Arc<RwLock<ChainMetrics>>,
+    /// MEV engine for C-Chain opportunity detection
+    mev_engine: Arc<MevEngine>,
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +486,7 @@ async fn main() {
         total_stake_weight: Arc::new(RwLock::new(0u64)),
         p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+        mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
     });
 
     // 6. Start P2P listener
@@ -521,6 +525,17 @@ async fn main() {
                 "C-Chain: {} blocks synced, {} stateRoot mappings",
                 c.blocks_synced, state_root_count
             );
+
+            // MEV engine stats
+            let mev_stats = metrics_node.mev_engine.stats().await;
+            if mev_stats.txs_scanned > 0 || mev_stats.v2_pools_tracked > 0 || mev_stats.v4_pools_tracked > 0 {
+                info!(
+                    "MEV: {} txs scanned, {} swaps, {} arbs, {} sandwiches | {} V2 pools, {} V4 pools",
+                    mev_stats.txs_scanned, mev_stats.swaps_detected,
+                    mev_stats.arbitrages_found, mev_stats.sandwiches_found,
+                    mev_stats.v2_pools_tracked, mev_stats.v4_pools_tracked,
+                );
+            }
         }
     });
 
