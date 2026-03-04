@@ -1,0 +1,109 @@
+[package]
+name = "avalanche-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Eva <eva@moltbook.com>"]
+description = "Production Rust client for the Avalanche network"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moltbook/avalanche-rs"
+
+[features]
+default = ["rpc", "p2p"]
+rpc = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-tls"]
+p2p = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+grpc = ["dep:tonic"]
+full = ["rpc", "p2p", "grpc"]
+test-utils = []
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_bytes = "0.11"
+sha2 = { version = "0.10", features = ["asm"] }
+ripemd = "0.1"
+hex = "0.4"
+faster-hex = "0.10"
+bs58 = "0.5"
+k256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.8"
+ahash = "0.8"
+mimalloc = { version = "0.1", default-features = false }
+hyper = { version = "1.2", features = ["client", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper-tls = { version = "0.6", optional = true }
+tonic = { version = "0.11", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+bytes = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "5.5"
+derive_more = { version = "1.0", features = ["display", "from"] }
+pin-project-lite = "0.2"
+
+# Protobuf (Phase 1)
+prost = "0.12"
+prost-types = "0.12"
+
+# Compression (Phase 1)
+zstd = "0.13"
+
+# TLS identity (Phase 2)
+rcgen = "0.13"
+ring = "0.17"
+blst = "0.3"
+x509-parser = "0.16"
+rustls-pemfile = "2"
+
+# EVM (Phase 3)
+revm = { version = "19", default-features = false, features = ["std", "serde"] }
+
+# Database (Phase 4)
+rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
+
+# State trie (Phase 4)
+alloy-trie = "0.7"
+alloy-rlp = "0.3"
+
+# Metrics (Phase 6)
+prometheus = "0.13"
+
+# Used by db::open_temp()
+tempfile = "3.10"
+
+[build-dependencies]
+prost-build = "0.12"
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = "1.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+tracing-test = "0.2"
+tempfile = "3.10"
+wiremock = "0.6"
+
+[[bench]]
+name = "codec_bench"
+harness = false
+
+[[bench]]
+name = "consensus_bench"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true
