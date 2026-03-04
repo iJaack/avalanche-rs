@@ -267,6 +267,19 @@ impl Database {
     pub fn raw(&self) -> &Arc<RocksDB> {
         &self.db
     }
+
+    /// Iterate over all key-value pairs in a column family.
+    ///
+    /// Returns an iterator of `(key_bytes, value_bytes)` pairs.
+    pub fn iter_cf_owned(&self, cf_name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let cf = self.cf_handle(cf_name);
+        self.db
+            .iterator_cf(&cf, rocksdb::IteratorMode::Start)
+            .filter_map(|item| {
+                item.ok().map(|(k, v)| (k.to_vec(), v.to_vec()))
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
