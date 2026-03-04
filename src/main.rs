@@ -1315,6 +1315,9 @@ async fn connect_and_handshake(
                                                             let new_req = req + 1;
                                                             let target = container_ids.into_iter().next().unwrap();
                                                             p_chain_ancestors_target = Some(target.0);
+                                                            // Update tip to match the actual accepted block ID
+                                                            // (may differ from AcceptedFrontier tip)
+                                                            p_chain_tip = Some(target.0);
                                                             let get_ancestors = NetworkMessage::GetAncestors {
                                                                 chain_id: ChainId([0u8; 32]),
                                                                 request_id: new_req,
@@ -1497,14 +1500,11 @@ async fn connect_and_handshake(
 
                                                                 // Extract parent_id — this is the block ID of the NEXT container
                                                                 let parent = avalanche_rs::block::BlockHeader::extract_parent_id(container);
+                                                                // Debug: log first few blocks at trace level
                                                                 if stored <= 3 {
-                                                                    let hex: String = container[..std::cmp::min(64, container.len())].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                                                                    let type_id = if container.len() >= 6 { u32::from_be_bytes(container[2..6].try_into().unwrap_or([0;4])) } else { 0 };
-                                                                    info!("Block[{}]: {} bytes, typeID={}, id={:02x}{:02x}{:02x}{:02x}, parent={}, hex={}",
-                                                                        stored, container.len(), type_id,
+                                                                    debug!("Block[{}]: {} bytes, id={:02x}{:02x}{:02x}{:02x}",
+                                                                        stored, container.len(),
                                                                         block_id[0], block_id[1], block_id[2], block_id[3],
-                                                                        parent.map(|p| format!("{:02x}{:02x}{:02x}{:02x}", p[0], p[1], p[2], p[3])).unwrap_or("none".into()),
-                                                                        hex
                                                                     );
                                                                 }
                                                                 current_id = parent;
