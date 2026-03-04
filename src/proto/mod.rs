@@ -944,6 +944,45 @@ mod tests {
     }
 
     #[test]
+    fn test_get_accepted_frontier_roundtrip() {
+        let msg = NetworkMessage::GetAcceptedFrontier {
+            chain_id: ChainId([0u8; 32]), // P-Chain
+            request_id: 1,
+            deadline: 5_000_000_000,
+        };
+        let encoded = msg.encode_proto().unwrap();
+        let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
+        match decoded {
+            NetworkMessage::GetAcceptedFrontier { chain_id, request_id, .. } => {
+                assert_eq!(chain_id.0, [0u8; 32]);
+                assert_eq!(request_id, 1);
+            }
+            other => panic!("expected GetAcceptedFrontier, got {:?}", other.name()),
+        }
+    }
+
+    #[test]
+    fn test_get_ancestors_bootstrap() {
+        let container_id = BlockId([0xAA; 32]);
+        let msg = NetworkMessage::GetAncestors {
+            chain_id: ChainId([0u8; 32]),
+            request_id: 5,
+            deadline: 5_000_000_000,
+            container_id: container_id.clone(),
+            max_containers_size: 2_000_000,
+        };
+        let encoded = msg.encode_proto().unwrap();
+        let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
+        match decoded {
+            NetworkMessage::GetAncestors { request_id, container_id: cid, .. } => {
+                assert_eq!(request_id, 5);
+                assert_eq!(cid.0, [0xAA; 32]);
+            }
+            other => panic!("expected GetAncestors, got {:?}", other.name()),
+        }
+    }
+
+    #[test]
     fn test_ping_uptime_100() {
         let ping = NetworkMessage::Ping { uptime: 100 };
         let encoded = ping.encode_proto().unwrap();

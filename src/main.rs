@@ -680,6 +680,11 @@ async fn connect_and_handshake(
         info!("Peer {} registered (NodeID: {})", addr, peer_node_id);
     }
 
+    // 5b. Attempt P-Chain bootstrap
+    // Use a fixed request_id base; in production this should be from a global counter.
+    let bootstrap_request_base: u32 = rand::thread_rng().gen::<u16>() as u32 * 10;
+    bootstrap_p_chain(&mut tls_stream, addr, bootstrap_request_base).await;
+
     // 6. Keep connection alive — read messages in a loop
     info!("Entering message loop with {}", addr);
 
@@ -804,6 +809,166 @@ async fn connect_and_handshake(
     warn!("Peer {} disconnected", addr);
 
     Ok(())
+}
+
+/// Bootstrap P-Chain state from a connected peer.
+/// Implements: GetAcceptedFrontier → AcceptedFrontier → GetAccepted → Accepted → GetAncestors → Ancestors.
+/// Logs what we receive; does not yet validate or apply blocks.
+async fn bootstrap_p_chain<S>(
+    stream: &mut S,
+    addr: std::net::SocketAddr,
+    request_id_base: u32,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let p_chain_id = ChainId([0u8; 32]);
+    let deadline_ns = 5_000_000_000u64; // 5 seconds in nanoseconds
+
+    // Step 1: GetAcceptedFrontier
+    let req = NetworkMessage::GetAcceptedFrontier {
+        chain_id: p_chain_id.clone(),
+        request_id: request_id_base,
+        deadline: deadline_ns,
+    };
+    if let Ok(encoded) = req.encode_proto() {
+        if let Err(e) = stream.write_all(&encoded).await {
+            warn!("bootstrap: failed to send GetAcceptedFrontier to {}: {}", addr, e);
+            return;
+        }
+        let _ = stream.flush().await;
+        info!("bootstrap: sent GetAcceptedFrontier (req={}) to {}", request_id_base, addr);
+    }
+
+    // Step 2: Wait for AcceptedFrontier
+    let frontier_block_id = loop {
+        match read_one_message(stream, addr, 30).await {
+            Ok(NetworkMessage::AcceptedFrontier { request_id, container_id, .. })
+                if request_id == request_id_base =>
+            {
+                info!("bootstrap: AcceptedFrontier from {} — tip={}", addr, container_id);
+                break container_id;
+            }
+            Ok(NetworkMessage::Ping { uptime }) => {
+                // Respond to pings while waiting
+                let pong = NetworkMessage::Pong { uptime };
+                if let Ok(enc) = pong.encode_proto() {
+                    let _ = stream.write_all(&enc).await;
+                    let _ = stream.flush().await;
+                }
+            }
+            Ok(other) => {
+                debug!("bootstrap: ignoring {} while waiting for AcceptedFrontier", other.name());
+            }
+            Err(e) => {
+                warn!("bootstrap: error waiting for AcceptedFrontier from {}: {}", addr, e);
+                return;
+            }
+        }
+    };
+
+    if frontier_block_id.0 == [0u8; 32] {
+        info!("bootstrap: peer {} has empty frontier — nothing to bootstrap", addr);
+        return;
+    }
+
+    // Step 3: GetAccepted
+    let req = NetworkMessage::GetAccepted {
+        chain_id: p_chain_id.clone(),
+        request_id: request_id_base + 1,
+        deadline: deadline_ns,
+        container_ids: vec![frontier_block_id.clone()],
+    };
+    if let Ok(encoded) = req.encode_proto() {
+        if let Err(e) = stream.write_all(&encoded).await {
+            warn!("bootstrap: failed to send GetAccepted to {}: {}", addr, e);
+            return;
+        }
+        let _ = stream.flush().await;
+        info!("bootstrap: sent GetAccepted (req={}) to {}", request_id_base + 1, addr);
+    }
+
+    // Step 4: Wait for Accepted
+    let accepted_ids = loop {
+        match read_one_message(stream, addr, 30).await {
+            Ok(NetworkMessage::Accepted { request_id, container_ids, .. })
+                if request_id == request_id_base + 1 =>
+            {
+                info!("bootstrap: Accepted from {} — {} block IDs", addr, container_ids.len());
+                break container_ids;
+            }
+            Ok(NetworkMessage::Ping { uptime }) => {
+                let pong = NetworkMessage::Pong { uptime };
+                if let Ok(enc) = pong.encode_proto() {
+                    let _ = stream.write_all(&enc).await;
+                    let _ = stream.flush().await;
+                }
+            }
+            Ok(other) => {
+                debug!("bootstrap: ignoring {} while waiting for Accepted", other.name());
+            }
+            Err(e) => {
+                warn!("bootstrap: error waiting for Accepted from {}: {}", addr, e);
+                return;
+            }
+        }
+    };
+
+    if accepted_ids.is_empty() {
+        info!("bootstrap: peer {} accepted no blocks from our set", addr);
+        return;
+    }
+
+    // Step 5: GetAncestors for the first accepted block
+    let target = &accepted_ids[0];
+    let req = NetworkMessage::GetAncestors {
+        chain_id: p_chain_id.clone(),
+        request_id: request_id_base + 2,
+        deadline: deadline_ns,
+        container_id: target.clone(),
+        max_containers_size: 2_000_000,
+    };
+    if let Ok(encoded) = req.encode_proto() {
+        if let Err(e) = stream.write_all(&encoded).await {
+            warn!("bootstrap: failed to send GetAncestors to {}: {}", addr, e);
+            return;
+        }
+        let _ = stream.flush().await;
+        info!("bootstrap: sent GetAncestors (req={}) for block {} to {}", request_id_base + 2, target, addr);
+    }
+
+    // Step 6: Wait for Ancestors
+    loop {
+        match read_one_message(stream, addr, 30).await {
+            Ok(NetworkMessage::Ancestors { request_id, containers, .. })
+                if request_id == request_id_base + 2 =>
+            {
+                info!(
+                    "bootstrap: Ancestors from {} — {} containers, total {} bytes",
+                    addr,
+                    containers.len(),
+                    containers.iter().map(|c| c.len()).sum::<usize>()
+                );
+                for (i, c) in containers.iter().enumerate() {
+                    debug!("  container[{}]: {} bytes", i, c.len());
+                }
+                break;
+            }
+            Ok(NetworkMessage::Ping { uptime }) => {
+                let pong = NetworkMessage::Pong { uptime };
+                if let Ok(enc) = pong.encode_proto() {
+                    let _ = stream.write_all(&enc).await;
+                    let _ = stream.flush().await;
+                }
+            }
+            Ok(other) => {
+                debug!("bootstrap: ignoring {} while waiting for Ancestors", other.name());
+            }
+            Err(e) => {
+                warn!("bootstrap: error waiting for Ancestors from {}: {}", addr, e);
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
