@@ -274,6 +274,30 @@ impl NetworkMessage {
                     .collect(),
             }),
 
+            NetworkMessage::GetAncestors {
+                chain_id,
+                request_id,
+                deadline,
+                container_id,
+                max_containers_size: _,
+            } => ProtoOneOf::GetAncestors(pb::GetAncestors {
+                chain_id: Bytes::copy_from_slice(&chain_id.0),
+                request_id: *request_id,
+                deadline: *deadline,
+                container_id: Bytes::copy_from_slice(&container_id.0),
+                engine_type: 0,
+            }),
+
+            NetworkMessage::Ancestors {
+                chain_id,
+                request_id,
+                containers,
+            } => ProtoOneOf::Ancestors(pb::Ancestors {
+                chain_id: Bytes::copy_from_slice(&chain_id.0),
+                request_id: *request_id,
+                containers: containers.iter().map(|c| Bytes::copy_from_slice(c)).collect(),
+            }),
+
             NetworkMessage::Get {
                 chain_id,
                 request_id,
@@ -494,20 +518,17 @@ impl NetworkMessage {
                 container_ids: a.container_ids.iter().map(|b| bytes_to_block_id(b)).collect(),
             }),
 
-            ProtoOneOf::GetAncestors(g) => Ok(NetworkMessage::Get {
+            ProtoOneOf::GetAncestors(g) => Ok(NetworkMessage::GetAncestors {
                 chain_id: bytes_to_chain_id(&g.chain_id),
                 request_id: g.request_id,
                 deadline: g.deadline,
                 container_id: bytes_to_block_id(&g.container_id),
+                max_containers_size: 2_000_000,
             }),
-            ProtoOneOf::Ancestors(a) => Ok(NetworkMessage::Put {
+            ProtoOneOf::Ancestors(a) => Ok(NetworkMessage::Ancestors {
                 chain_id: bytes_to_chain_id(&a.chain_id),
                 request_id: a.request_id,
-                container: if a.containers.is_empty() {
-                    vec![]
-                } else {
-                    a.containers[0].to_vec()
-                },
+                containers: a.containers.iter().map(|c| c.to_vec()).collect(),
             }),
 
             ProtoOneOf::Get(g) => Ok(NetworkMessage::Get {

@@ -159,6 +159,18 @@ pub enum NetworkMessage {
         request_id: u32,
         container_ids: Vec<BlockId>,
     },
+    GetAncestors {
+        chain_id: ChainId,
+        request_id: u32,
+        deadline: u64,
+        container_id: BlockId,
+        max_containers_size: u32,
+    },
+    Ancestors {
+        chain_id: ChainId,
+        request_id: u32,
+        containers: Vec<Vec<u8>>,
+    },
 
     // -- Consensus (Avalanche/Snowman) --
     Get {
@@ -225,6 +237,8 @@ impl NetworkMessage {
             Self::AcceptedFrontier { .. } => "AcceptedFrontier",
             Self::GetAccepted { .. } => "GetAccepted",
             Self::Accepted { .. } => "Accepted",
+            Self::GetAncestors { .. } => "GetAncestors",
+            Self::Ancestors { .. } => "Ancestors",
             Self::Get { .. } => "Get",
             Self::Put { .. } => "Put",
             Self::PushQuery { .. } => "PushQuery",
@@ -2824,6 +2838,44 @@ mod tests {
     fn test_block_id_from_bytes() {
         assert!(BlockId::from_bytes(&[0u8; 32]).is_some());
         assert!(BlockId::from_bytes(&[0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn test_get_ancestors_roundtrip() {
+        let msg = NetworkMessage::GetAncestors {
+            chain_id: ChainId([0xBB; 32]),
+            request_id: 7,
+            deadline: 5_000_000_000,
+            container_id: BlockId([0xCC; 32]),
+            max_containers_size: 2_000_000,
+        };
+        let encoded = msg.encode_proto().unwrap();
+        let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
+        match decoded {
+            NetworkMessage::GetAncestors { request_id, max_containers_size, .. } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(max_containers_size, 2_000_000);
+            }
+            other => panic!("expected GetAncestors, got {:?}", other.name()),
+        }
+    }
+
+    #[test]
+    fn test_ancestors_roundtrip() {
+        let msg = NetworkMessage::Ancestors {
+            chain_id: ChainId([0x11; 32]),
+            request_id: 8,
+            containers: vec![vec![1, 2, 3], vec![4, 5, 6]],
+        };
+        let encoded = msg.encode_proto().unwrap();
+        let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
+        match decoded {
+            NetworkMessage::Ancestors { request_id, containers, .. } => {
+                assert_eq!(request_id, 8);
+                assert_eq!(containers.len(), 2);
+            }
+            other => panic!("expected Ancestors, got {:?}", other.name()),
+        }
     }
 }
 
