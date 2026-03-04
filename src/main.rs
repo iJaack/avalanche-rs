@@ -2037,7 +2037,9 @@ async fn run_consensus_loop(node: Arc<NodeState>) {
         // After 60 seconds, run chain graph analysis if we have blocks
         if !chain_analysis_done && node.start_time.elapsed().as_secs() > 60 {
             chain_analysis_done = true;
-            analyze_chain_graphs(&node);
+            // TODO: analyze_chain_graphs reads from RocksDB and gets wrong heights
+            // (DB format differs from wire format). Use in-memory metrics instead.
+            // analyze_chain_graphs(&node);
         }
     }
 }
