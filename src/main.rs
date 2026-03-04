@@ -20,9 +20,9 @@ use tracing::{debug, error, info, warn};
 use sha2::{Digest, Sha256};
 use bs58;
 
-use avalanche_rs::block::{BlockHeader, Chain, ChainGraph};
+use avalanche_rs::block::{BlockHeader, BlockMetadata, Chain, ChainGraph};
 use avalanche_rs::consensus::SnowmanConsensus;
-use avalanche_rs::db::{Database, CF_BLOCKS};
+use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
 use avalanche_rs::evm::EvmExecutor;
 use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::network::{BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, PeerInfo, PeerManager, Peer, PeerState};
@@ -254,6 +254,61 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
     (count, tip_height, genesis_height)
 }
 
+/// Iterate all P-Chain blocks in CF_BLOCKS, compute SHA-256 of each block's raw bytes,
+/// and verify it matches the stored key. Returns (verified_count, mismatch_count).
+fn integrity_check_pchain(db: &Database) -> (usize, usize) {
+    use sha2::{Digest, Sha256};
+    let all = db.iter_cf_owned(CF_BLOCKS);
+    let mut ok = 0usize;
+    let mut mismatch = 0usize;
+
+    for (key, value) in &all {
+        if key.starts_with(b"c:") {
+            continue;
+        }
+        if key.len() != 32 {
+            continue;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(value);
+        let computed: [u8; 32] = hasher.finalize().into();
+        let stored_key: [u8; 32] = key.as_slice().try_into().unwrap();
+        if computed == stored_key {
+            ok += 1;
+        } else {
+            mismatch += 1;
+            info!(
+                "Integrity mismatch: key={:02x}{:02x}{:02x}{:02x}… computed={:02x}{:02x}{:02x}{:02x}…",
+                stored_key[0], stored_key[1], stored_key[2], stored_key[3],
+                computed[0], computed[1], computed[2], computed[3]
+            );
+        }
+    }
+    info!(
+        "Block integrity check: {} blocks verified, {} mismatches",
+        ok, mismatch
+    );
+    (ok, mismatch)
+}
+
+/// Iterate P-Chain blocks and find the one whose parent_id is all zeros.
+/// Returns (block_id_key, raw_bytes) of the genesis block.
+fn find_genesis_block(db: &Database) -> Option<([u8; 32], Vec<u8>)> {
+    let all = db.iter_cf_owned(CF_BLOCKS);
+    for (key, value) in all {
+        if key.starts_with(b"c:") || key.len() != 32 {
+            continue;
+        }
+        if let Some(parent) = avalanche_rs::block::BlockHeader::extract_parent_id(&value) {
+            if parent == [0u8; 32] {
+                let id: [u8; 32] = key.try_into().unwrap();
+                return Some((id, value));
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Node state
 // ---------------------------------------------------------------------------
@@ -330,6 +385,40 @@ async fn main() {
 
     let last_height = db.last_accepted_height().unwrap_or(None).unwrap_or(0);
     info!("Database opened at {:?}, last accepted height: {}", db_path, last_height);
+
+    // Phase 8: verify block chain integrity on startup
+    let (ok, bad) = integrity_check_pchain(&db);
+    if bad > 0 {
+        warn!("Chain integrity: {} blocks OK, {} MISMATCHES — block storage format issue!", ok, bad);
+    } else if ok > 0 {
+        info!("Chain integrity: {} blocks verified, all match", ok);
+    }
+
+    // Phase 8: dump P-Chain genesis for validator extraction analysis
+    if let Some((genesis_id, genesis_raw)) = find_genesis_block(&db) {
+        let dump_len = genesis_raw.len().min(200);
+        info!(
+            "P-Chain genesis found: id={:02x}{:02x}{:02x}{:02x}…, {} bytes total",
+            genesis_id[0], genesis_id[1], genesis_id[2], genesis_id[3],
+            genesis_raw.len()
+        );
+        info!(
+            "P-Chain genesis: first {} bytes = {:02x?}",
+            dump_len, &genesis_raw[..dump_len]
+        );
+        if let Ok(hdr) = avalanche_rs::block::BlockHeader::parse(&genesis_raw, avalanche_rs::block::Chain::PChain) {
+            info!(
+                "P-Chain genesis parsed: height={}, type={:?}, timestamp={}",
+                hdr.height, hdr.block_type, hdr.timestamp
+            );
+        }
+    } else {
+        info!("P-Chain genesis block not found in DB (need more sync rounds)");
+    }
+
+    // Log C-Chain stateRoot mapping count
+    let state_root_entries = db.iter_cf_owned(CF_STATE_ROOTS).len();
+    info!("C-Chain stateRoot mapping: {} entries", state_root_entries);
 
     // 3. Initialize EVM executor
     let evm = Arc::new(RwLock::new(EvmExecutor::new(cli.chain_id)));
@@ -423,9 +512,10 @@ async fn main() {
                 "P-Chain: {} blocks synced, height {}→{}, chain length {}",
                 p.blocks_synced, p.genesis_height, p.tip_height, p.chain_length
             );
+            let state_root_count = metrics_node.db.iter_cf_owned(avalanche_rs::db::CF_STATE_ROOTS).len();
             info!(
-                "C-Chain: {} blocks synced, EVM analysis pending",
-                c.blocks_synced
+                "C-Chain: {} blocks synced, {} stateRoot mappings",
+                c.blocks_synced, state_root_count
             );
         }
     });
@@ -1299,6 +1389,12 @@ async fn connect_and_handshake(
                                                                     warn!("C-Chain: failed to store block {:02x?}: {}", &hash[..4], e);
                                                                 } else {
                                                                     stored += 1;
+                                                                    // Store stateRoot → block_hash mapping
+                                                                    if let Some(state_root) = avalanche_rs::block::BlockHeader::extract_state_root(container) {
+                                                                        if let Err(e) = node.db.put_cf(CF_STATE_ROOTS, &state_root, &hash) {
+                                                                            debug!("state_root store failed: {}", e);
+                                                                        }
+                                                                    }
                                                                 }
                                                                 oldest_container = Some(container.clone());
                                                             }
@@ -1394,6 +1490,16 @@ async fn connect_and_handshake(
                                                                     warn!("Failed to store block {:02x?}: {}", &hash[..4], e);
                                                                 } else {
                                                                     stored += 1;
+                                                                    if let Ok(meta) = BlockMetadata::from_raw(container, Chain::PChain) {
+                                                                        debug!(
+                                                                            "P-Chain block: height={}, parent={:02x}{:02x}…, type={:?}, {} txs, {} bytes",
+                                                                            meta.height,
+                                                                            meta.parent_id[0], meta.parent_id[1],
+                                                                            meta.block_type,
+                                                                            meta.tx_count,
+                                                                            meta.size_bytes
+                                                                        );
+                                                                    }
                                                                 }
                                                                 oldest_container = Some(container.clone());
                                                             }
@@ -2085,6 +2191,87 @@ fn analyze_chain_graphs(node: &NodeState) {
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn make_banff_std(parent: [u8; 32], height: u64) -> Vec<u8> {
+        let mut raw = vec![0u8; 54];
+        raw[2..6].copy_from_slice(&32u32.to_be_bytes());
+        raw[6..14].copy_from_slice(&1_700_000_000u64.to_be_bytes());
+        raw[14..46].copy_from_slice(&parent);
+        raw[46..54].copy_from_slice(&height.to_be_bytes());
+        raw
+    }
+
+    fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(data);
+        h.finalize().into()
+    }
+
+    #[test]
+    fn test_integrity_check_all_match() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let g = make_banff_std([0u8; 32], 0);
+        let g_id = sha256_bytes(&g);
+        let b1 = make_banff_std(g_id, 1);
+        let b1_id = sha256_bytes(&b1);
+        let b2 = make_banff_std(b1_id, 2);
+        let b2_id = sha256_bytes(&b2);
+
+        db.put_cf(CF_BLOCKS, &g_id, &g).unwrap();
+        db.put_cf(CF_BLOCKS, &b1_id, &b1).unwrap();
+        db.put_cf(CF_BLOCKS, &b2_id, &b2).unwrap();
+
+        let (ok, mismatch) = integrity_check_pchain(&db);
+        assert_eq!(ok, 3);
+        assert_eq!(mismatch, 0);
+    }
+
+    #[test]
+    fn test_chain_walk_full() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let g = make_banff_std([0u8; 32], 0);
+        let g_id = sha256_bytes(&g);
+        let b1 = make_banff_std(g_id, 1);
+        let b1_id = sha256_bytes(&b1);
+        let b2 = make_banff_std(b1_id, 2);
+        let b2_id = sha256_bytes(&b2);
+
+        db.put_cf(CF_BLOCKS, &g_id, &g).unwrap();
+        db.put_cf(CF_BLOCKS, &b1_id, &b1).unwrap();
+        db.put_cf(CF_BLOCKS, &b2_id, &b2).unwrap();
+
+        let (length, tip_h, genesis_h) = verify_block_chain(&db, b2_id);
+        assert_eq!(length, 3);
+        assert_eq!(tip_h, 2);
+        assert_eq!(genesis_h, 0);
+    }
+
+    #[test]
+    fn test_dump_genesis_finds_correct_block() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let genesis = make_banff_std([0u8; 32], 0);
+        let genesis_id = sha256_bytes(&genesis);
+        db.put_cf(CF_BLOCKS, &genesis_id, &genesis).unwrap();
+        let b1 = make_banff_std(genesis_id, 1);
+        let b1_id = sha256_bytes(&b1);
+        db.put_cf(CF_BLOCKS, &b1_id, &b1).unwrap();
+
+        let result = find_genesis_block(&db);
+        assert!(result.is_some(), "should find genesis block");
+        let (key, raw) = result.unwrap();
+        assert_eq!(key, genesis_id);
+        assert_eq!(raw.len(), genesis.len());
+    }
+}
 
 fn init_logging(level: &str, format: &str) {
     use tracing_subscriber::EnvFilter;

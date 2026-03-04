@@ -103,6 +103,34 @@ impl BlockHeader {
         self.parent_id == [0u8; 32]
     }
 
+    /// Extract the stateRoot (field 3) from a C-Chain RLP block.
+    /// Returns None if not parseable or not a C-Chain block.
+    pub fn extract_state_root(raw: &[u8]) -> Option<[u8; 32]> {
+        if raw.is_empty() {
+            return None;
+        }
+        // Handle Avalanche wrapper
+        let rlp = if raw.len() >= 6 && raw[0] == 0x00 && raw[1] == 0x00 {
+            &raw[6..]
+        } else {
+            raw
+        };
+        if rlp.is_empty() || rlp[0] < 0xc0 {
+            return None;
+        }
+        // Outer list
+        let (_, header_start) = rlp_list_start(rlp, 0).ok()?;
+        // Inner header list
+        let (_, fields_start) = rlp_list_start(rlp, header_start).ok()?;
+        // Skip field 0 (parentHash), 1 (sha3Uncles), 2 (miner), then read field 3 (stateRoot)
+        let mut pos = fields_start;
+        for _ in 0..3 {
+            pos = rlp_skip(rlp, pos).ok()?;
+        }
+        // Field 3 is stateRoot: 0xa0 + 32 bytes
+        rlp_read_bytes32(rlp, pos).ok()
+    }
+
     /// Returns the parent ID extracted from a raw block byte slice, accounting for
     /// the block type at the correct offset. Used for chain-walk without full parse.
     pub fn extract_parent_id(raw: &[u8]) -> Option<[u8; 32]> {
@@ -136,6 +164,59 @@ impl BlockHeader {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BlockMetadata
+// ---------------------------------------------------------------------------
+
+/// Block metadata: a superset of BlockHeader with derived fields.
+#[derive(Debug, Clone)]
+pub struct BlockMetadata {
+    pub id: BlockId,
+    pub height: u64,
+    pub timestamp: u64,
+    pub parent_id: BlockId,
+    pub block_type: BlockType,
+    /// Number of transactions extracted from the block body (best-effort, 0 if unparseable).
+    pub tx_count: u32,
+    pub size_bytes: usize,
+}
+
+impl BlockMetadata {
+    /// Parse a raw block into `BlockMetadata`.
+    pub fn from_raw(raw: &[u8], chain: Chain) -> Result<Self, String> {
+        let hdr = BlockHeader::parse(raw, chain)?;
+        let tx_count = extract_tx_count(raw, &hdr.block_type);
+        Ok(Self {
+            id: hdr.id,
+            height: hdr.height,
+            timestamp: hdr.timestamp,
+            parent_id: hdr.parent_id,
+            block_type: hdr.block_type,
+            tx_count,
+            size_bytes: raw.len(),
+        })
+    }
+}
+
+/// Extract the transaction count from a P-Chain block body.
+fn extract_tx_count(raw: &[u8], block_type: &BlockType) -> u32 {
+    match block_type {
+        BlockType::BanffStandard | BlockType::ApricotStandard => {
+            let tx_len_offset = match block_type {
+                BlockType::BanffStandard => 54,
+                BlockType::ApricotStandard => 46,
+                _ => unreachable!(),
+            };
+            if raw.len() >= tx_len_offset + 4 {
+                u32::from_be_bytes(raw[tx_len_offset..tx_len_offset + 4].try_into().unwrap())
+            } else {
+                0
+            }
+        }
+        _ => 0,
     }
 }
 
@@ -859,6 +940,73 @@ mod tests {
         }
         result.extend_from_slice(&payload);
         result
+    }
+
+    fn make_cchain_block_with_state_root(
+        parent: [u8; 32],
+        number: u64,
+        timestamp: u64,
+        state_root: [u8; 32],
+    ) -> Vec<u8> {
+        let mut header_payload: Vec<u8> = Vec::new();
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&parent);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0x1du8; 32]);
+        header_payload.push(0x94);
+        header_payload.extend_from_slice(&[0u8; 20]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&state_root);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xb9);
+        header_payload.push(0x01);
+        header_payload.push(0x00);
+        header_payload.extend_from_slice(&[0u8; 256]);
+        header_payload.push(0x80);
+        encode_rlp_u64(&mut header_payload, number);
+        encode_rlp_u64(&mut header_payload, 8_000_000);
+        header_payload.push(0x80);
+        encode_rlp_u64(&mut header_payload, timestamp);
+
+        let header_list = rlp_list(header_payload);
+        let empty = 0xc0u8;
+        let mut outer = Vec::new();
+        outer.extend_from_slice(&header_list);
+        outer.push(empty);
+        outer.push(empty);
+        rlp_list(outer)
+    }
+
+    #[test]
+    fn test_extract_state_root() {
+        let state_root = [0x42u8; 32];
+        let raw = make_cchain_block_with_state_root([0u8; 32], 1, 1_700_000_000, state_root);
+        let extracted = BlockHeader::extract_state_root(&raw);
+        assert_eq!(extracted, Some(state_root));
+    }
+
+    #[test]
+    fn test_block_metadata_from_banff_standard() {
+        let parent = [0xDEu8; 32];
+        let raw = make_banff_block(32, parent, 100, 1_700_000_000);
+        let meta = BlockMetadata::from_raw(&raw, Chain::PChain).unwrap();
+        assert_eq!(meta.height, 100);
+        assert_eq!(meta.timestamp, 1_700_000_000);
+        assert_eq!(meta.parent_id, parent);
+        assert_eq!(meta.block_type, BlockType::BanffStandard);
+        assert_eq!(meta.size_bytes, raw.len());
+    }
+
+    #[test]
+    fn test_block_metadata_cchain() {
+        let parent = [0xCCu8; 32];
+        let raw = make_cchain_block(parent, 42, 1_750_000_000);
+        let meta = BlockMetadata::from_raw(&raw, Chain::CChain).unwrap();
+        assert_eq!(meta.height, 42);
+        assert_eq!(meta.block_type, BlockType::CChainEvm);
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub const CF_RECEIPTS: &str = "receipts";
 pub const CF_TX_INDEX: &str = "tx_index";
 pub const CF_METADATA: &str = "metadata";
 pub const CF_TRIE_NODES: &str = "trie_nodes";
+pub const CF_STATE_ROOTS: &str = "state_roots";
 
 const ALL_CFS: &[&str] = &[
     CF_BLOCKS,
@@ -35,6 +36,7 @@ const ALL_CFS: &[&str] = &[
     CF_TX_INDEX,
     CF_METADATA,
     CF_TRIE_NODES,
+    CF_STATE_ROOTS,
 ];
 
 /// Well-known metadata keys.
@@ -678,6 +680,16 @@ mod tests {
         let rlp = acc.rlp_encode();
         // Should be a valid RLP list
         assert!(rlp[0] >= 0xc0, "should start with list prefix");
+    }
+
+    #[test]
+    fn test_state_roots_cf_exists() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let block_hash = [0xAAu8; 32];
+        let state_root = [0xBBu8; 32];
+        db.put_cf(CF_STATE_ROOTS, &block_hash, &state_root).unwrap();
+        let retrieved = db.get_cf(CF_STATE_ROOTS, &block_hash).unwrap().unwrap();
+        assert_eq!(retrieved.as_slice(), &state_root);
     }
 
     #[test]
