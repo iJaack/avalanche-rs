@@ -17,7 +17,9 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use avalanche_rs::db::Database;
+use sha2::{Digest, Sha256};
+
+use avalanche_rs::db::{Database, CF_BLOCKS};
 use avalanche_rs::evm::EvmExecutor;
 use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::network::{BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, PeerInfo, PeerManager, Peer, PeerState};
@@ -102,6 +104,7 @@ enum BootstrapState {
     WaitingFrontier(u32),
     WaitingAccepted(u32),
     WaitingAncestors(u32),
+    FetchingAncestors { req: u32, depth: u32, total_blocks: u32 },
     Done,
 }
 
@@ -889,19 +892,104 @@ async fn connect_and_handshake(
                                                     }
                                                 }
                                             }
-                                            NetworkMessage::Ancestors { request_id, containers, .. } => {
+                                            NetworkMessage::Ancestors { request_id, containers, chain_id } => {
+                                                let total_bytes: usize = containers.iter().map(|c| c.len()).sum();
                                                 info!(
                                                     "Ancestors from {} — {} containers, {} bytes total",
-                                                    addr,
-                                                    containers.len(),
-                                                    containers.iter().map(|c| c.len()).sum::<usize>()
+                                                    addr, containers.len(), total_bytes
                                                 );
-                                                if let BootstrapState::WaitingAncestors(req) = bootstrap_state {
+
+                                                let expected_req = match bootstrap_state {
+                                                    BootstrapState::WaitingAncestors(req) => Some((req, 0u32, 0u32)),
+                                                    BootstrapState::FetchingAncestors { req, depth, total_blocks } => Some((req, depth, total_blocks)),
+                                                    _ => None,
+                                                };
+
+                                                if let Some((req, depth, prev_total)) = expected_req {
                                                     if request_id == req {
-                                                        bootstrap_state = BootstrapState::Done;
-                                                        info!("Bootstrap: complete with {}", addr);
+                                                        // ── Store all containers ─────────────────────────────────────────
+                                                        let mut stored = 0u32;
+                                                        let mut oldest_container: Option<Vec<u8>> = None;
+
+                                                        for container in &containers {
+                                                            let mut hasher = Sha256::new();
+                                                            hasher.update(container);
+                                                            let hash: [u8; 32] = hasher.finalize().into();
+
+                                                            if let Err(e) = node.db.put_cf(CF_BLOCKS, &hash, container) {
+                                                                warn!("Failed to store block {:02x?}: {}", &hash[..4], e);
+                                                            } else {
+                                                                stored += 1;
+                                                            }
+                                                            oldest_container = Some(container.clone());
+                                                        }
+
+                                                        let new_total = prev_total + stored;
+                                                        info!("Bootstrap: stored {} blocks (total: {})", stored, new_total);
+
+                                                        // Update metadata with total stored count
+                                                        let _ = node.db.put_metadata(
+                                                            b"p_chain_blocks_downloaded",
+                                                            &new_total.to_le_bytes(),
+                                                        );
+
+                                                        // ── Decide: recurse or finish ────────────────────────────────────
+                                                        let should_recurse = depth < 10
+                                                            && oldest_container.as_ref().map_or(false, |c| {
+                                                                // Extract parent ID: bytes [2..34] after 2-byte codec version
+                                                                if c.len() >= 34 {
+                                                                    let parent: [u8; 32] = c[2..34].try_into().unwrap_or([0u8; 32]);
+                                                                    parent != [0u8; 32]
+                                                                } else {
+                                                                    false
+                                                                }
+                                                            });
+
+                                                        if should_recurse {
+                                                            let oldest = oldest_container.unwrap();
+                                                            // The "block ID" to request ancestors of = SHA-256 of the oldest container
+                                                            let mut hasher = Sha256::new();
+                                                            hasher.update(&oldest);
+                                                            let oldest_id: [u8; 32] = hasher.finalize().into();
+
+                                                            let new_req = req + 1;
+                                                            let new_depth = depth + 1;
+                                                            let get_ancestors = NetworkMessage::GetAncestors {
+                                                                chain_id: ChainId([0u8; 32]),
+                                                                request_id: new_req,
+                                                                deadline: 5_000_000_000u64,
+                                                                container_id: BlockId(oldest_id),
+                                                                max_containers_size: 2_000_000,
+                                                            };
+                                                            if let Ok(encoded) = get_ancestors.encode_proto() {
+                                                                if tls_stream.write_all(&encoded).await.is_ok() {
+                                                                    let _ = tls_stream.flush().await;
+                                                                    info!(
+                                                                        "Bootstrap: recursive GetAncestors depth={} req={} (total blocks so far: {})",
+                                                                        new_depth, new_req, new_total
+                                                                    );
+                                                                    bootstrap_state = BootstrapState::FetchingAncestors {
+                                                                        req: new_req,
+                                                                        depth: new_depth,
+                                                                        total_blocks: new_total,
+                                                                    };
+                                                                } else {
+                                                                    warn!("Bootstrap: failed to send recursive GetAncestors, stopping");
+                                                                    bootstrap_state = BootstrapState::Done;
+                                                                }
+                                                            }
+                                                        } else {
+                                                            if depth >= 10 {
+                                                                info!("Bootstrap: reached max depth (10 rounds, {} blocks), stopping fetch", new_total);
+                                                            } else {
+                                                                info!("Bootstrap: reached genesis (or short block), {} blocks total", new_total);
+                                                            }
+                                                            bootstrap_state = BootstrapState::Done;
+                                                            info!("Bootstrap P-Chain complete with {} — {} total blocks stored", addr, new_total);
+                                                        }
                                                     }
                                                 }
+                                                let _ = chain_id; // suppress unused warning
                                             }
                                             NetworkMessage::GetAccepted { chain_id, request_id, .. } => {
                                                 // Respond with empty accepted list
