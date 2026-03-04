@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use sha2::{Digest, Sha256};
+use bs58;
 
 use avalanche_rs::db::{Database, CF_BLOCKS};
 use avalanche_rs::evm::EvmExecutor;
@@ -736,6 +737,19 @@ async fn connect_and_handshake(
     let mut bootstrap_timer = Box::pin(tokio::time::sleep(Duration::from_secs(10)));
     let mut bootstrap_timer_fired = false;
 
+    // Decode C-Chain Fuji ID from CB58
+    let cchain_id: [u8; 32] = {
+        let cb58 = "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp";
+        let decoded = bs58::decode(cb58).into_vec().unwrap_or_default();
+        // CB58 = base58(payload + checksum4), strip last 4 bytes
+        if decoded.len() >= 36 {
+            decoded[..32].try_into().unwrap_or([0u8; 32])
+        } else {
+            warn!("Failed to decode C-Chain ID from CB58");
+            [0u8; 32]
+        }
+    };
+
     loop {
         let mut len_buf = [0u8; 4];
         tokio::select! {
@@ -780,6 +794,21 @@ async fn connect_and_handshake(
                         bootstrap_state = BootstrapState::WaitingFrontier(bootstrap_request_base);
                     } else {
                         warn!("Bootstrap: failed to send GetAcceptedFrontier to {}", addr);
+                    }
+                }
+                // Also kick off C-Chain bootstrap
+                if node.config.network_id == 5 {
+                    let cchain_req = NetworkMessage::GetAcceptedFrontier {
+                        chain_id: ChainId(cchain_id),
+                        request_id: bootstrap_request_base + 1000,
+                        deadline: 5_000_000_000u64,
+                    };
+                    if let Ok(encoded) = cchain_req.encode_proto() {
+                        if tls_stream.write_all(&encoded).await.is_ok() {
+                            let _ = tls_stream.flush().await;
+                            info!("Bootstrap: sent GetAcceptedFrontier for C-Chain (req={})",
+                                bootstrap_request_base + 1000);
+                        }
                     }
                 }
             }
@@ -840,6 +869,10 @@ async fn connect_and_handshake(
                                             }
                                             NetworkMessage::AcceptedFrontier { request_id, container_id, .. } => {
                                                 info!("AcceptedFrontier from {} — tip={}", addr, container_id);
+                                                // Log C-Chain frontier if it comes back
+                                                if request_id == bootstrap_request_base + 1000 {
+                                                    info!("C-Chain AcceptedFrontier from {} — tip={}", addr, container_id);
+                                                }
                                                 if let BootstrapState::WaitingFrontier(req) = bootstrap_state {
                                                     if request_id == req {
                                                         if container_id.0 != [0u8; 32] {
