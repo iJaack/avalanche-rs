@@ -266,23 +266,26 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
             (pid, h, ts)
         }
         _ => {
-            // Apricot blocks (typeID 0-4) and unknown future types:
-            // [6..38]=PrntID, [38..46]=Hght, [46..54]=optional data (read as ts if present)
+            // All P-Chain blocks from Ancestors use the same wire format:
+            // [6..38]=PrntID(32), [38..46]=Timestamp(u64), [46..54]=Height(u64)
+            // This applies even to blocks with Apricot type IDs (0-4).
             if raw.len() < 46 {
                 return Err(format!(
-                    "P-Chain Apricot block too short: {} bytes (need ≥46)",
+                    "P-Chain block too short: {} bytes (need ≥46)",
                     raw.len()
                 ));
             }
             let mut pid = [0u8; 32];
             pid.copy_from_slice(&raw[6..38]);
-            let h = u64::from_be_bytes(raw[38..46].try_into().unwrap());
-            let ts = if raw.len() >= 54 {
-                u64::from_be_bytes(raw[46..54].try_into().unwrap())
+            if raw.len() >= 54 {
+                let ts = u64::from_be_bytes(raw[38..46].try_into().unwrap());
+                let h = u64::from_be_bytes(raw[46..54].try_into().unwrap());
+                (pid, h, ts)
             } else {
-                0
-            };
-            (pid, h, ts)
+                // Short block: just parent + height, no timestamp
+                let h = u64::from_be_bytes(raw[38..46].try_into().unwrap());
+                (pid, h, 0)
+            }
         }
     };
 
@@ -597,11 +600,16 @@ mod tests {
         timestamp: u64,
     ) -> Vec<u8> {
         let mut raw = vec![0u8; 54];
-        // [0..2] codec version = 0 (already zero)
+        // Wire format (observed on Fuji v1.14.x):
+        // [0..2] codec version = 0
+        // [2..6] type ID
+        // [6..38] parent ID (32 bytes)
+        // [38..46] timestamp (uint64 BE)
+        // [46..54] height (uint64 BE)
         raw[2..6].copy_from_slice(&type_id.to_be_bytes());
         raw[6..38].copy_from_slice(&parent_id);
-        raw[38..46].copy_from_slice(&height.to_be_bytes());
-        raw[46..54].copy_from_slice(&timestamp.to_be_bytes());
+        raw[38..46].copy_from_slice(&timestamp.to_be_bytes());
+        raw[46..54].copy_from_slice(&height.to_be_bytes());
         raw
     }
 
