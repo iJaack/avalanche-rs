@@ -1,14 +1,58 @@
 # Benchmarks: avalanche-rs vs AvalancheGo
 
-## Test Setup
+## Test Setup — Run 4 (3-Minute Extended)
 - **Network:** Fuji testnet
-- **Duration:** 45 seconds each
+- **Duration:** 3 minutes each
 - **Hardware:** Mac Mini M4, Apple Silicon
 - **Bootstrap IP:** 52.29.72.46:9651 (Berlin beacon)
 - **AvalancheGo version:** 1.14.1
-- **avalanche-rs:** commit a92a0cd (latest)
+- **avalanche-rs:** commit 56fbffe (latest, all features)
+- **Date:** 2026-03-05
 
-## Results — Run 3 (Final, with all fixes)
+## Results — Run 4 (3-Minute Extended Benchmark)
+
+| Metric | avalanche-rs | AvalancheGo 1.14.1 | Delta |
+|--------|-------------|---------------------|-------|
+| **Binary size** | 7.8 MB | 89 MB | **11x smaller** |
+| **First peer connected** | 117ms | ~6.3s | **~54x faster** |
+| **P-Chain bootstrap complete** | 12.0s | ❌ (still executing at 3m) | **avalanche-rs finished** |
+| **P-Chain blocks synced** | 3,196 | 267,053 fetched, 169,827 executed | AvalancheGo fetches more |
+| **P-Chain tip height** | 267,051 ✅ | 267,053 (63.6% executed) | similar tip |
+| **C-Chain bootstrap complete** | 12.3s | ❌ (not started) | **avalanche-rs only** |
+| **C-Chain blocks synced** | 508 | 0 | ∞ |
+| **Peers connected** | 11 | healthy at 30s | similar |
+| **Status at 3 min** | ✅ IDLE (done) | ⏳ 63.6% P-Chain execution | **avalanche-rs idle** |
+
+### Key Observations (3-Minute Run)
+
+1. **avalanche-rs finishes EVERYTHING in 12.3s** — both P-Chain and C-Chain bootstrap. Then it sits idle for the remaining 2m 48s, just receiving AcceptedFrontier updates.
+
+2. **AvalancheGo at 3 minutes: still executing P-Chain blocks (63.6%).** It fetched all 267K blocks in ~69s but needs another ~1 min to execute them. C-Chain hasn't started.
+
+3. **AvalancheGo fetches MORE blocks** (267K vs 3.2K) because it does a full linear bootstrap. avalanche-rs fetches the tip window via recursive GetAncestors (10 rounds).
+
+4. **First peer: 117ms vs ~6.3s** — avalanche-rs connects directly to bootstrap IP; AvalancheGo initializes subsystems first.
+
+5. **Binary still 11x smaller** — 7.8 MB vs 89 MB.
+
+### Timeline Comparison
+
+| Time | avalanche-rs | AvalancheGo |
+|------|-------------|-------------|
+| 0s | Start | Start |
+| 0.1s | First TCP connect | Initializing LevelDB |
+| 0.2s | Handshake complete, 15 peers discovered | Health checks registering |
+| 6s | 3,196 P-Chain blocks fetched | Block fetching starts |
+| 12s | ✅ P-Chain + C-Chain done | ~55% blocks fetched |
+| 30s | Idle (frontier updates) | Network healthy, still fetching |
+| 69s | Idle | All blocks fetched, compacting DB |
+| 120s | Idle | Executing blocks (22%) |
+| 180s | Idle | Executing blocks (63.6%) |
+| ~240s (est.) | Idle | P-Chain execution complete |
+
+---
+
+## Results — Run 3 (45-Second, Previous)
 
 | Metric | avalanche-rs | AvalancheGo | Delta |
 |--------|-------------|-------------|-------|

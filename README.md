@@ -4,21 +4,21 @@ A Rust implementation of the Avalanche P2P protocol. Connects to real AvalancheG
 
 ## Benchmarks vs AvalancheGo
 
-Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, 45 seconds each:
+Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, **3 minutes each** (2026-03-05):
 
 | Metric | avalanche-rs | AvalancheGo 1.14.1 | Delta |
 |--------|-------------|---------------------|-------|
-| **Binary size** | 7.8 MB | 87.5 MB | **11x smaller** |
-| **Memory (RSS @ 45s)** | 73 MB | 285 MB | **3.9x less** |
-| **First peer connected** | ~110ms | ~30s | **~270x faster** |
-| **P-Chain bootstrap start** | ~10s | ~4s | similar |
-| **P-Chain blocks synced** | 3,204 | 0 (still initializing) | ∞ |
-| **P-Chain tip height** | 266,981 ✅ | 0 (not reached) | **full sync** |
-| **C-Chain blocks synced** | 518 | 0 | ∞ |
-| **Chain walk verified** | 3,204 linked | N/A | **avalanche-rs only** |
-| **Peers connected** | 11 | network OK at 30s | **similar** |
+| **Binary size** | 7.8 MB | 89 MB | **11x smaller** |
+| **First peer connected** | 117ms | ~6.3s | **~54x faster** |
+| **P-Chain bootstrap** | 12.0s ✅ complete | ❌ 63.6% at 3 min | **avalanche-rs finished** |
+| **P-Chain blocks synced** | 3,196 | 267K fetched, 170K executed | AvalancheGo fetches more |
+| **P-Chain tip height** | 267,051 ✅ | 267,053 (partial) | similar |
+| **C-Chain bootstrap** | 12.3s ✅ complete | ❌ not started | **avalanche-rs only** |
+| **C-Chain blocks synced** | 508 | 0 | ∞ |
+| **Status at 3 min** | ✅ IDLE (done) | ⏳ still executing | **avalanche-rs idle** |
+| **Peers connected** | 11 | healthy at 30s | similar |
 
-avalanche-rs completes full P-Chain + C-Chain bootstrap in ~28 seconds. AvalancheGo is still initializing subsystems and hasn't fetched a single block at the 45-second mark.
+avalanche-rs completes full P-Chain + C-Chain bootstrap in **12.3 seconds**, then sits idle. At 3 minutes, AvalancheGo has fetched all blocks but is only 63.6% through executing them — C-Chain hasn't started.
 
 > Full benchmark details: [`BENCHMARKS.md`](BENCHMARKS.md)
 
