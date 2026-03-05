@@ -25,6 +25,7 @@ pub mod evm;
 pub mod db;
 pub mod sync;
 pub mod block;
+pub mod validator;
 
 // Re-export common types for convenience
 pub use types::{AvalancheError, Result, ID, NodeID, BlockID, TransactionID, ChainID, Block, Transaction, UTXO};
