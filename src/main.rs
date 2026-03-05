@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use sha2::{Digest, Sha256};
 use bs58;
 
-use avalanche_rs::block::{BlockHeader, BlockMetadata, Chain, ChainGraph};
+use avalanche_rs::block::{BlockHeader, Chain, ChainGraph};
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
 use avalanche_rs::evm::EvmExecutor;
@@ -2065,6 +2065,7 @@ async fn run_consensus_loop(node: Arc<NodeState>) {
 
 /// Read all blocks from RocksDB, parse headers, build chain graphs, run Snowman.
 /// Tasks 2, 3, and 4 are all executed here.
+#[allow(dead_code)]
 fn analyze_chain_graphs(node: &NodeState) {
     info!("Starting chain graph analysis...");
 

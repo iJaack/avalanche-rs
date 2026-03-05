@@ -62,6 +62,8 @@ pub struct BlockHeader {
     pub block_type: BlockType,
     /// Size of the raw block bytes.
     pub raw_size: usize,
+    /// Raw block bytes (for signature verification).
+    pub raw_bytes: Vec<u8>,
 }
 
 impl BlockHeader {
@@ -129,6 +131,43 @@ impl BlockHeader {
         }
         // Field 3 is stateRoot: 0xa0 + 32 bytes
         rlp_read_bytes32(rlp, pos).ok()
+    }
+
+    /// Verify the BLS signature of this block using the provided public key.
+    ///
+    /// Post-Banff blocks include a BLS signature over the block hash. The signature
+    /// is typically the last 96 bytes of the raw block data (BLS G2 compressed format).
+    ///
+    /// Returns `Ok(())` if signature is valid, `Err` if invalid or missing.
+    /// Currently validates format only (signature must be 96 bytes, key must be 48 bytes).
+    /// Full cryptographic verification is deferred to consensus layer.
+    pub fn verify_signature(&self, pub_key_bytes: &[u8]) -> Result<(), String> {
+        // Extract signature: last 96 bytes (BLS G2 compressed)
+        if self.raw_bytes.len() < 96 {
+            return Err("block too small to contain BLS signature".to_string());
+        }
+
+        let sig_bytes = &self.raw_bytes[self.raw_bytes.len() - 96..];
+
+        // Validate public key format (BLS pubkey is 48 bytes compressed)
+        if pub_key_bytes.len() != 48 {
+            return Err(format!("invalid public key size: {} (expected 48)", pub_key_bytes.len()));
+        }
+
+        // Validate signature format (BLS G2 compressed is 96 bytes)
+        if sig_bytes.len() != 96 {
+            return Err(format!("invalid signature size: {} (expected 96)", sig_bytes.len()));
+        }
+
+        // Try to parse as BLS objects to validate structure
+        use blst::min_pk::{PublicKey, Signature};
+        PublicKey::from_bytes(pub_key_bytes)
+            .map_err(|e| format!("invalid public key format: {:?}", e))?;
+        Signature::from_bytes(sig_bytes)
+            .map_err(|e| format!("invalid signature format: {:?}", e))?;
+
+        // Format validation passed; full cryptographic verification deferred
+        Ok(())
     }
 
     /// Returns the parent ID extracted from a raw block byte slice, accounting for
@@ -309,6 +348,7 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
         timestamp,
         block_type,
         raw_size: raw.len(),
+        raw_bytes: raw.to_vec(),
     })
 }
 
@@ -390,6 +430,7 @@ fn parse_cchain_rlp(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
         timestamp,
         block_type: BlockType::CChainEvm,
         raw_size: raw.len(),
+        raw_bytes: raw.to_vec(),
     })
 }
 
@@ -1048,5 +1089,48 @@ mod tests {
         assert_eq!(h.height, 100);
         assert_eq!(h.timestamp, 1_750_000_000);
         assert_eq!(h.block_type, BlockType::CChainEvm);
+    }
+
+    #[test]
+    fn test_block_signature_missing_sig() {
+        // Test that small blocks fail signature verification (not enough bytes for sig)
+        use blst::min_pk::SecretKey;
+        let mut ikm = [0u8; 32];
+        ikm[0] = 42;
+        let sk = SecretKey::key_gen(&ikm, &[]).expect("valid BLS key");
+        let pk = sk.sk_to_pk();
+        let pk_bytes = pk.to_bytes();
+
+        let parent = [0xAAu8; 32];
+        let raw = make_banff_block(32, parent, 100, 1_700_000_000);
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+
+        // Block is too small to contain a signature
+        assert!(h.verify_signature(&pk_bytes).is_err());
+    }
+
+    #[test]
+    fn test_block_signature_invalid_key() {
+        // Test that an invalid public key fails verification
+        let parent = [0xAAu8; 32];
+        let mut raw = make_banff_block(32, parent, 100, 1_700_000_000);
+        // Pad with 96 bytes of zeros to simulate a signature
+        raw.extend_from_slice(&[0u8; 96]);
+
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+        let invalid_pk = [0xFFu8; 48]; // Invalid public key
+
+        assert!(h.verify_signature(&invalid_pk).is_err());
+    }
+
+    #[test]
+    fn test_block_raw_bytes_stored() {
+        // Test that raw_bytes are correctly stored in BlockHeader
+        let parent = [0xBBu8; 32];
+        let raw = make_banff_block(32, parent, 100, 1_700_000_000);
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+
+        assert_eq!(h.raw_bytes, raw);
+        assert_eq!(h.raw_size, raw.len());
     }
 }

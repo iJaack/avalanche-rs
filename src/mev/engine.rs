@@ -5,10 +5,9 @@ use super::*;
 use super::v4::{V4PoolScanner, PoolKey, V4ArbOpportunity};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
-use tracing::{debug, info, warn};
 
 // ============================================================================
 // MEV ENGINE — unified interface for all MEV strategies

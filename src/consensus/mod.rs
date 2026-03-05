@@ -155,6 +155,7 @@ mod tests {
             timestamp: 0,
             block_type: crate::block::BlockType::BanffStandard,
             raw_size: 54,
+            raw_bytes: Vec::new(),
         }
     }
 

@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use k256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
 use k256::ecdsa::signature::Verifier;
 use rand::Rng;
-use blst::min_pk::{SecretKey as BlsSecretKey, PublicKey as BlsPublicKey, Signature as BlsSignature};
+use blst::min_pk::SecretKey as BlsSecretKey;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use ring::rand::SystemRandom;
 use sha2::{Digest, Sha256};
@@ -173,7 +173,7 @@ impl NodeIdentity {
         bytes.extend_from_slice(&timestamp.to_be_bytes());
 
         // SHA-256 hash (AvalancheGo uses hashing.ComputeHash256 which is SHA-256)
-        let hash = Sha256::digest(&bytes);
+        let _hash = Sha256::digest(&bytes);
 
         // Sign the hash with the TLS ECDSA P-256 key using ring
         let rng = SystemRandom::new();
