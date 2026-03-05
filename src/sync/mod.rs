@@ -422,6 +422,90 @@ impl SyncEngine {
 }
 
 // ---------------------------------------------------------------------------
+// State Sync Engine
+// ---------------------------------------------------------------------------
+
+/// State synchronization engine for downloading and verifying account trie.
+///
+/// Handles the GetStateSummaryFrontier / StateSummaryFrontier protocol
+/// for discovering the latest state root and downloading trie nodes.
+#[derive(Debug)]
+pub struct StateSyncEngine {
+    /// State root from C-Chain block
+    state_root: Arc<RwLock<Option<[u8; 32]>>>,
+    /// Trie nodes keyed by their hash (node_hash -> node_bytes)
+    trie_nodes: Arc<RwLock<HashMap<[u8; 32], Vec<u8>>>>,
+    /// Current sync phase
+    phase: Arc<RwLock<SyncPhase>>,
+    /// Peers with known state summaries
+    peer_summaries: Arc<RwLock<HashMap<NodeId, [u8; 32]>>>,
+}
+
+impl StateSyncEngine {
+    /// Create a new state sync engine
+    pub fn new() -> Self {
+        StateSyncEngine {
+            state_root: Arc::new(RwLock::new(None)),
+            trie_nodes: Arc::new(RwLock::new(HashMap::new())),
+            phase: Arc::new(RwLock::new(SyncPhase::StateSummaryFrontier)),
+            peer_summaries: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Record a state summary from a peer
+    pub async fn handle_state_summary(&self, peer: NodeId, state_root: [u8; 32]) {
+        self.peer_summaries.write().await.insert(peer, state_root);
+    }
+
+    /// Set the target state root to sync to
+    pub async fn set_target_state_root(&self, state_root: [u8; 32]) {
+        *self.state_root.write().await = Some(state_root);
+        *self.phase.write().await = SyncPhase::AcceptedStateSummary;
+    }
+
+    /// Store a downloaded trie node
+    pub async fn store_trie_node(&self, node_hash: [u8; 32], node_bytes: Vec<u8>) {
+        self.trie_nodes.write().await.insert(node_hash, node_bytes);
+    }
+
+    /// Get a trie node by hash
+    pub async fn get_trie_node(&self, node_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.trie_nodes.read().await.get(node_hash).cloned()
+    }
+
+    /// Get the count of downloaded trie nodes
+    pub async fn trie_node_count(&self) -> usize {
+        self.trie_nodes.read().await.len()
+    }
+
+    /// Get the current state root
+    pub async fn state_root(&self) -> Option<[u8; 32]> {
+        *self.state_root.read().await
+    }
+
+    /// Check if state sync is complete
+    pub async fn is_complete(&self) -> bool {
+        *self.phase.read().await == SyncPhase::Synced
+    }
+
+    /// Mark state sync as complete
+    pub async fn mark_complete(&self) {
+        *self.phase.write().await = SyncPhase::Synced;
+    }
+
+    /// Get the current phase
+    pub async fn current_phase(&self) -> SyncPhase {
+        self.phase.read().await.clone()
+    }
+}
+
+impl Default for StateSyncEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -618,5 +702,47 @@ mod tests {
 
         let messages = engine.generate_fetch_requests(&[]).await;
         assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_state_sync_engine_creation() {
+        let engine = StateSyncEngine::new();
+        assert_eq!(engine.current_phase().await, SyncPhase::StateSummaryFrontier);
+        assert!(engine.state_root().await.is_none());
+        assert!(!engine.is_complete().await);
+    }
+
+    #[tokio::test]
+    async fn test_state_sync_store_trie_nodes() {
+        let engine = StateSyncEngine::new();
+        let node_hash = [0xAAu8; 32];
+        let node_bytes = vec![1, 2, 3, 4, 5];
+
+        engine.store_trie_node(node_hash, node_bytes.clone()).await;
+        
+        let retrieved = engine.get_trie_node(&node_hash).await;
+        assert_eq!(retrieved, Some(node_bytes));
+        assert_eq!(engine.trie_node_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_state_sync_target_root() {
+        let engine = StateSyncEngine::new();
+        let state_root = [0xBBu8; 32];
+
+        engine.set_target_state_root(state_root).await;
+        
+        assert_eq!(engine.state_root().await, Some(state_root));
+        assert_eq!(engine.current_phase().await, SyncPhase::AcceptedStateSummary);
+    }
+
+    #[tokio::test]
+    async fn test_state_sync_completion() {
+        let engine = StateSyncEngine::new();
+        assert!(!engine.is_complete().await);
+
+        engine.mark_complete().await;
+        assert!(engine.is_complete().await);
+        assert_eq!(engine.current_phase().await, SyncPhase::Synced);
     }
 }
