@@ -69,7 +69,7 @@ use crate::block::BlockHeader;
 /// Production Snowman consensus state.
 ///
 /// Tracks the preferred chain tip, the last accepted (finalized) block,
-/// and pending blocks not yet accepted.
+/// and pending blocks not yet accepted. Implements voting and finality detection.
 #[derive(Debug, Default)]
 pub struct SnowmanConsensus {
     /// Current preferred tip (may not be finalized yet).
@@ -82,11 +82,17 @@ pub struct SnowmanConsensus {
     pending: HashMap<[u8; 32], BlockHeader>,
     /// Count of accepted blocks.
     accepted_count: u64,
+    /// Vote count per block (for finality detection)
+    votes: HashMap<[u8; 32], u32>,
+    /// Finality threshold (beta): when confidence >= beta, block is accepted
+    pub beta: u32,
 }
 
 impl SnowmanConsensus {
     pub fn new() -> Self {
-        Self::default()
+        let mut s = Self::default();
+        s.beta = 20; // Finality threshold
+        s
     }
 
     /// Accept a block, advancing `last_accepted` and clearing it from pending.
@@ -95,6 +101,7 @@ impl SnowmanConsensus {
         self.last_accepted_height = header.height;
         self.preferred = Some(header.id);
         self.pending.remove(&header.id);
+        self.votes.remove(&header.id);
         self.accepted_count += 1;
     }
 
@@ -113,6 +120,41 @@ impl SnowmanConsensus {
         self.pending.insert(header.id, header);
     }
 
+    /// Record a vote for a block (from Chits message).
+    /// Returns true if the block reaches finality (votes >= beta).
+    pub fn record_vote(&mut self, block_id: [u8; 32]) -> bool {
+        let vote_count = self.votes.entry(block_id).or_insert(0);
+        *vote_count += 1;
+        
+        if *vote_count >= self.beta {
+            self.accept_block(&self.pending.get(&block_id).cloned().unwrap_or_else(|| {
+                // If block not in pending, create a minimal header
+                BlockHeader {
+                    id: block_id,
+                    parent_id: [0u8; 32],
+                    height: 0,
+                    timestamp: 0,
+                    block_type: crate::block::BlockType::Unknown(0),
+                    raw_size: 0,
+                    raw_bytes: Vec::new(),
+                }
+            }));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get current vote count for a block
+    pub fn vote_count(&self, block_id: &[u8; 32]) -> u32 {
+        *self.votes.get(block_id).unwrap_or(&0)
+    }
+
+    /// Check if block has reached finality
+    pub fn is_finalized(&self, block_id: &[u8; 32]) -> bool {
+        self.vote_count(block_id) >= self.beta
+    }
+
     /// Returns the last accepted block ID.
     pub fn last_accepted(&self) -> Option<[u8; 32]> {
         self.last_accepted
@@ -126,6 +168,11 @@ impl SnowmanConsensus {
     /// Total number of accepted blocks.
     pub fn accepted_count(&self) -> u64 {
         self.accepted_count
+    }
+
+    /// Get all pending blocks
+    pub fn pending_blocks(&self) -> Vec<BlockHeader> {
+        self.pending.values().cloned().collect()
     }
 }
 
@@ -206,5 +253,39 @@ mod tests {
         sc.set_preferred([0xAAu8; 32]);
         assert!(sc.is_preferred(&[0xAAu8; 32]));
         assert!(!sc.is_preferred(&[0u8; 32]));
+    }
+
+    #[test]
+    fn test_snowman_consensus_vote_tallying() {
+        let mut consensus = SnowmanConsensus::new();
+        let block_id = [0xBBu8; 32];
+
+        // Record votes - should not finalize until beta (20) votes
+        let mut header = make_header(block_id, [0u8; 32], 1);
+        consensus.add_pending(header.clone());
+
+        for i in 0..19 {
+            assert!(!consensus.record_vote(block_id)); // build up to 19 votes
+        }
+        
+        // 20th vote should trigger finality
+        assert!(consensus.record_vote(block_id));
+        // After acceptance, the block is no longer in pending but should be last_accepted
+        assert_eq!(consensus.last_accepted(), Some(block_id));
+        assert_eq!(consensus.accepted_count(), 1);
+    }
+
+    #[test]
+    fn test_snowman_consensus_multiple_blocks() {
+        let mut consensus = SnowmanConsensus::new();
+        let block1 = [0x11u8; 32];
+        let block2 = [0x22u8; 32];
+
+        consensus.record_vote(block1);
+        consensus.record_vote(block2);
+        consensus.record_vote(block1);
+
+        assert_eq!(consensus.vote_count(&block1), 2);
+        assert_eq!(consensus.vote_count(&block2), 1);
     }
 }
