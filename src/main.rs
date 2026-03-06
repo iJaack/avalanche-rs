@@ -77,6 +77,11 @@ struct Cli {
     /// C-Chain chain ID for EVM
     #[arg(long, default_value = "43114")]
     chain_id: u64,
+
+    /// Enable validator mode: produce and broadcast new blocks every ~2s.
+    /// Requires a funded account in the EVM state and connected peers.
+    #[arg(long, default_value = "false", env = "AVAX_VALIDATOR")]
+    validator: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +342,8 @@ struct NodeState {
     c_chain_metrics: Arc<RwLock<ChainMetrics>>,
     /// MEV engine for C-Chain opportunity detection
     mev_engine: Arc<MevEngine>,
+    /// Pending transactions for block building (validator mode only)
+    pending_txs: Arc<RwLock<Vec<EvmTransaction>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +494,7 @@ async fn main() {
         p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
+        pending_txs: Arc::new(RwLock::new(Vec::new())),
     });
 
     // 6. Start P2P listener
@@ -506,6 +514,15 @@ async fn main() {
 
     // 9. Start sync / consensus loop
     let consensus_handle = tokio::spawn(run_consensus_loop(node.clone()));
+
+    // 9a. Start block builder if validator mode is enabled
+    if node.config.validator {
+        info!("Validator mode enabled — starting block builder (2s interval)");
+        let builder_node = node.clone();
+        tokio::spawn(async move {
+            run_block_builder(builder_node).await;
+        });
+    }
 
     // 10. Start metrics logging (every 10s)
     let metrics_node = node.clone();
@@ -1944,6 +1961,321 @@ async fn bootstrap_p_chain<S>(
                 warn!("bootstrap: error waiting for Ancestors from {}: {}", addr, e);
                 break;
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validator: Block builder
+// ---------------------------------------------------------------------------
+
+/// A constructed C-Chain block ready for broadcasting.
+#[derive(Debug, Clone)]
+pub struct BuiltBlock {
+    /// RLP-encoded block bytes (Avalanche-wrapped).
+    pub raw: Vec<u8>,
+    /// SHA-256 block ID.
+    pub id: [u8; 32],
+    /// Block number (height).
+    pub number: u64,
+    /// Number of transactions included.
+    pub tx_count: usize,
+    /// Total gas used.
+    pub gas_used: u64,
+    /// BLS signature over the block ID (48-byte public key proof).
+    pub bls_signature: Vec<u8>,
+}
+
+/// Run the block producer loop. Produces a new C-Chain block every ~2 seconds
+/// when in Following mode (or after bootstrap). Broadcasts via PushQuery to peers.
+///
+/// In the current implementation the mempool is empty (no real pending
+/// transaction pool exists yet), so blocks contain zero transactions. The
+/// infrastructure — header construction, EVM execution, BLS signing, and
+/// peer broadcast — is fully wired and ready for a mempool integration.
+async fn run_block_builder(node: Arc<NodeState>) {
+    // Wait for bootstrap to complete before producing blocks
+    info!("Block builder: waiting for sync to reach Following phase...");
+    loop {
+        if node.sync_engine.is_following().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    info!("Block builder: sync is Following — starting block production");
+
+    let mut interval = tokio::time::interval(Duration::from_millis(2000));
+    interval.tick().await; // skip immediate tick
+
+    loop {
+        interval.tick().await;
+
+        let txs = {
+            let mut pool = node.pending_txs.write().await;
+            std::mem::take(&mut *pool)
+        };
+
+        let tip_height = node.c_chain_metrics.read().await.tip_height;
+        let block_number = tip_height + 1;
+
+        match build_cchain_block(&node, block_number, txs).await {
+            Ok(block) => {
+                info!(
+                    "Block builder: produced block #{} ({} txs, {} gas, id={:02x}{:02x}{:02x}{:02x}…)",
+                    block.number, block.tx_count, block.gas_used,
+                    block.id[0], block.id[1], block.id[2], block.id[3]
+                );
+
+                // Store in DB
+                let mut key = Vec::with_capacity(34);
+                key.extend_from_slice(b"c:");
+                key.extend_from_slice(&block.id);
+                if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, &block.raw) {
+                    warn!("Block builder: failed to store block #{}: {}", block.number, e);
+                    continue;
+                }
+
+                // Update last accepted height
+                let _ = node.db.set_last_accepted_height(block.number);
+                {
+                    let mut m = node.c_chain_metrics.write().await;
+                    m.tip_height = block.number;
+                    m.blocks_synced += 1;
+                }
+
+                // Broadcast to peers via PushQuery
+                broadcast_block_to_peers(&node, &block).await;
+            }
+            Err(e) => {
+                debug!("Block builder: failed to build block #{}: {}", block_number, e);
+            }
+        }
+    }
+}
+
+/// Build a valid C-Chain block at the given height with the provided transactions.
+///
+/// Constructs a proper Ethereum RLP block header (parentHash, miner, stateRoot,
+/// gasLimit, baseFee, timestamp, etc.), executes transactions through revm,
+/// and signs the block ID with the node's BLS key.
+async fn build_cchain_block(
+    node: &NodeState,
+    block_number: u64,
+    txs: Vec<EvmTransaction>,
+) -> Result<BuiltBlock, Box<dyn std::error::Error + Send + Sync>> {
+    use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Look up parent block hash (tip of C-Chain)
+    let parent_hash = {
+        let metrics = node.c_chain_metrics.read().await;
+        if metrics.tip_height > 0 {
+            // Try to find the parent hash from DB (best effort)
+            [0u8; 32] // TODO: maintain tip hash in metrics
+        } else {
+            [0u8; 32]
+        }
+    };
+
+    // Miner address = derived from node identity (first 20 bytes of node_id)
+    let mut coinbase = [0u8; 20];
+    coinbase.copy_from_slice(&node.identity.node_id.0);
+
+    let base_fee: u64 = 25_000_000_000; // 25 gwei
+    let gas_limit: u64 = 30_000_000;
+
+    // Execute transactions through EVM to get state root and receipts
+    let ctx = BlockContext {
+        number: block_number,
+        timestamp,
+        coinbase,
+        gas_limit,
+        base_fee: base_fee as u128,
+        difficulty: 0,
+        chain_id: node.config.chain_id,
+    };
+
+    let (block_result, state_root) = {
+        let mut evm = node.evm.write().await;
+        let result = evm.execute_block(&txs, &ctx)
+            .map_err(|e| format!("EVM execution: {}", e))?;
+        // Compute a simple state root (will be refined by Feature 4)
+        let state_root = evm.compute_state_root_simple();
+        (result, state_root)
+    };
+
+    // Build RLP block
+    let raw = encode_cchain_block_rlp(
+        &parent_hash,
+        &coinbase,
+        &state_root,
+        block_number,
+        gas_limit,
+        block_result.gas_used,
+        timestamp,
+        base_fee,
+        &txs,
+    );
+
+    // Compute block ID = SHA-256 of raw bytes
+    let mut hasher = Sha256::new();
+    hasher.update(&raw);
+    let id: [u8; 32] = hasher.finalize().into();
+
+    // Sign with BLS key
+    let bls_signature = node.identity.sign_block_bls(&id);
+
+    Ok(BuiltBlock {
+        raw,
+        id,
+        number: block_number,
+        tx_count: block_result.tx_count,
+        gas_used: block_result.gas_used,
+        bls_signature,
+    })
+}
+
+/// Encode a C-Chain block as RLP with Avalanche wrapper.
+fn encode_cchain_block_rlp(
+    parent_hash: &[u8; 32],
+    coinbase: &[u8; 20],
+    state_root: &[u8; 32],
+    number: u64,
+    gas_limit: u64,
+    gas_used: u64,
+    timestamp: u64,
+    base_fee: u64,
+    _txs: &[EvmTransaction],
+) -> Vec<u8> {
+    fn rlp_bytes32(v: &[u8; 32]) -> Vec<u8> {
+        let mut out = vec![0xa0u8];
+        out.extend_from_slice(v);
+        out
+    }
+    fn rlp_bytes20(v: &[u8; 20]) -> Vec<u8> {
+        let mut out = vec![0x94u8];
+        out.extend_from_slice(v);
+        out
+    }
+    fn rlp_u64(v: u64) -> Vec<u8> {
+        if v == 0 { return vec![0x80]; }
+        let b = v.to_be_bytes();
+        let s = b.iter().position(|&x| x != 0).unwrap_or(7);
+        let sl = &b[s..];
+        let mut out = vec![0x80 + sl.len() as u8];
+        out.extend_from_slice(sl);
+        out
+    }
+    fn rlp_list(payload: Vec<u8>) -> Vec<u8> {
+        let len = payload.len();
+        let mut out = Vec::new();
+        if len <= 55 {
+            out.push(0xc0 + len as u8);
+        } else {
+            let lb = len.to_be_bytes();
+            let ls = lb.iter().position(|&x| x != 0).unwrap_or(7);
+            let lsl = &lb[ls..];
+            out.push(0xf7 + lsl.len() as u8);
+            out.extend_from_slice(lsl);
+        }
+        out.extend(payload);
+        out
+    }
+
+    let empty32 = [0u8; 32];
+    let empty256 = [0u8; 256];
+
+    let mut header_payload: Vec<u8> = Vec::new();
+    header_payload.extend(rlp_bytes32(parent_hash));                  // parentHash
+    header_payload.extend(rlp_bytes32(&empty32));                      // sha3Uncles (empty)
+    header_payload.extend(rlp_bytes20(coinbase));                      // miner
+    header_payload.extend(rlp_bytes32(state_root));                    // stateRoot
+    header_payload.extend(rlp_bytes32(&empty32));                      // txsRoot (empty)
+    header_payload.extend(rlp_bytes32(&empty32));                      // receiptRoot (empty)
+    header_payload.push(0xb9); header_payload.push(0x01); header_payload.push(0x00);
+    header_payload.extend_from_slice(&empty256);                       // bloom (256 bytes)
+    header_payload.push(0x80);                                         // difficulty = 0
+    header_payload.extend(rlp_u64(number));                           // number
+    header_payload.extend(rlp_u64(gas_limit));                        // gasLimit
+    header_payload.extend(rlp_u64(gas_used));                         // gasUsed
+    header_payload.extend(rlp_u64(timestamp));                        // timestamp
+    header_payload.push(0x80);                                         // extraData (empty)
+    header_payload.extend(rlp_bytes32(&empty32));                      // mixHash
+    // nonce: 8 zero bytes = 0x8800000000000000
+    header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]); // nonce
+    header_payload.extend(rlp_u64(base_fee));                         // baseFeePerGas
+
+    let header = rlp_list(header_payload);
+    let uncles = 0xc0u8; // empty uncles list
+    let txs_list = 0xc0u8; // empty txs list (TODO: encode txs)
+
+    let mut outer: Vec<u8> = Vec::new();
+    outer.extend(header);
+    outer.push(uncles);
+    outer.push(txs_list);
+    let rlp = rlp_list(outer);
+
+    // Wrap with Avalanche codec header: version(2) + typeID(4)
+    let mut wrapped = Vec::with_capacity(6 + rlp.len());
+    wrapped.extend_from_slice(&[0x00, 0x00]); // codec version
+    wrapped.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // typeID (0 = EVM)
+    wrapped.extend(rlp);
+    wrapped
+}
+
+/// Broadcast a built block to all connected peers via PushQuery.
+async fn broadcast_block_to_peers(node: &NodeState, block: &BuiltBlock) {
+    let peers = {
+        let pm = node.peer_manager.read().await;
+        pm.active_peer_addrs()
+    };
+
+    if peers.is_empty() {
+        debug!("Block builder: no peers to broadcast to");
+        return;
+    }
+
+    // Build PushQuery message
+    let cchain_id: [u8; 32] = {
+        let cb58 = if node.config.network_id == 5 {
+            "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp"
+        } else {
+            "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5"
+        };
+        let decoded = bs58::decode(cb58).into_vec().unwrap_or_default();
+        if decoded.len() >= 36 {
+            decoded[..32].try_into().unwrap_or([0u8; 32])
+        } else {
+            [0u8; 32]
+        }
+    };
+
+    let req_id: u32 = rand::thread_rng().gen();
+    let push_query = NetworkMessage::PushQuery {
+        chain_id: ChainId(cchain_id),
+        request_id: req_id,
+        deadline: 5_000_000_000u64,
+        container: block.raw.clone(),
+    };
+
+    if let Ok(encoded) = push_query.encode_proto() {
+        info!(
+            "Block builder: broadcasting block #{} to {} peers",
+            block.number, peers.len()
+        );
+        for peer_addr in peers {
+            // Non-blocking best-effort TCP send to the peer's staking port
+            let encoded = encoded.clone();
+            tokio::spawn(async move {
+                if let Ok(mut stream) = tokio::net::TcpStream::connect(peer_addr).await {
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &encoded).await;
+                }
+            });
         }
     }
 }

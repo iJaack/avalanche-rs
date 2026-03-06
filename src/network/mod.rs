@@ -550,6 +550,17 @@ impl PeerManager {
             .collect()
     }
 
+    /// Return socket addresses of all currently connected peers.
+    ///
+    /// Used by the validator block builder to broadcast newly built blocks.
+    pub fn active_peer_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.peers
+            .values()
+            .filter(|p| p.state == PeerState::Connected)
+            .map(|p| p.address)
+            .collect()
+    }
+
     /// Ingest discovered peers from a PeerList message.
     pub fn process_peer_list(&mut self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
         let mut new_peers = Vec::new();

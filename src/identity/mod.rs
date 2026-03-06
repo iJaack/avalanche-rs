@@ -221,6 +221,17 @@ impl NodeIdentity {
         sig.compress().to_vec()
     }
 
+    /// Sign arbitrary bytes with BLS key for block attestation.
+    ///
+    /// Used by validators to sign newly built blocks before broadcasting.
+    pub fn sign_block_bls(&self, block_id: &[u8]) -> Vec<u8> {
+        let sk = BlsSecretKey::from_bytes(&self.bls_secret_key)
+            .expect("valid BLS secret key");
+        // Use the standard DST for message signing (distinct from proof-of-possession)
+        let sig = sk.sign(block_id, b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_", &[]);
+        sig.compress().to_vec()
+    }
+
     /// Get the verifying (public) key for IP signature verification.
     pub fn verifying_key(&self) -> VerifyingKey {
         *self.signing_key.verifying_key()

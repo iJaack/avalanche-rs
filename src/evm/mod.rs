@@ -292,6 +292,31 @@ impl EvmExecutor {
     pub fn account_count(&self) -> usize {
         self.db.accounts.len()
     }
+
+    /// Compute a simple state root from the in-memory account trie.
+    ///
+    /// This is a placeholder implementation that produces a deterministic 32-byte
+    /// hash of the current account state. Feature 4 will replace this with a proper
+    /// Merkle Patricia Trie root using alloy-trie.
+    pub fn compute_state_root_simple(&self) -> [u8; 32] {
+        use revm::primitives::keccak256;
+
+        // Collect and sort accounts for deterministic hashing
+        let mut entries: Vec<_> = self.db.accounts.iter().collect();
+        entries.sort_by_key(|(addr, _)| *addr);
+
+        let mut buf = Vec::with_capacity(entries.len() * 64);
+        for (addr, acct) in &entries {
+            buf.extend_from_slice(addr.as_slice());
+            buf.extend_from_slice(&acct.info.balance.to_be_bytes::<32>());
+            buf.extend_from_slice(&acct.info.nonce.to_be_bytes());
+        }
+
+        let hash = keccak256(&buf);
+        let mut root = [0u8; 32];
+        root.copy_from_slice(hash.as_slice());
+        root
+    }
 }
 
 // ---------------------------------------------------------------------------
