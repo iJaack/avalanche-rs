@@ -1079,9 +1079,14 @@ async fn connect_and_handshake(
     // Flag: has first C-Chain block bytes been logged for debug?
     let mut cchain_debug_logged = false;
 
-    // Decode C-Chain Fuji ID from CB58
+    // Decode C-Chain ID from CB58 based on network.
+    // Fuji (5):   yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp
+    // Mainnet (1): 2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5
     let cchain_id: [u8; 32] = {
-        let cb58 = "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp";
+        let cb58 = match node.config.network_id {
+            1 => "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5",
+            _ => "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp",
+        };
         let decoded = bs58::decode(cb58).into_vec().unwrap_or_default();
         // CB58 = base58(payload + checksum4), strip last 4 bytes
         if decoded.len() >= 36 {
@@ -1091,6 +1096,9 @@ async fn connect_and_handshake(
             [0u8; 32]
         }
     };
+    info!("C-Chain ID for network_id={}: 0x{:08x}...",
+        node.config.network_id,
+        u32::from_be_bytes(cchain_id[..4].try_into().unwrap_or([0u8; 4])));
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -1138,8 +1146,8 @@ async fn connect_and_handshake(
                         warn!("Bootstrap: failed to send GetAcceptedFrontier to {}", addr);
                     }
                 }
-                // Also kick off C-Chain bootstrap
-                if node.config.network_id == 5 {
+                // Also kick off C-Chain bootstrap (works on both mainnet and Fuji)
+                {
                     let cchain_req = NetworkMessage::GetAcceptedFrontier {
                         chain_id: ChainId(cchain_id),
                         request_id: bootstrap_request_base + 1000,
@@ -1391,7 +1399,7 @@ async fn connect_and_handshake(
                                             }
                                             NetworkMessage::Ancestors { request_id, containers, chain_id } => {
                                                 let total_bytes: usize = containers.iter().map(|c| c.len()).sum();
-                                                let is_cchain = chain_id.0 == cchain_id && node.config.network_id == 5;
+                                                let is_cchain = chain_id.0 == cchain_id;
                                                 info!(
                                                     "{} Ancestors from {} — {} containers, {} bytes total",
                                                     if is_cchain { "C-Chain" } else { "P-Chain" },
@@ -1715,7 +1723,7 @@ async fn connect_and_handshake(
                                                     addr, request_id, container.len()
                                                 );
                                                 // If this is a C-Chain block, execute it through the EVM
-                                                let is_cchain_block = chain_id.0 == cchain_id && node.config.network_id == 5
+                                                let is_cchain_block = chain_id.0 == cchain_id
                                                     || !container.is_empty() && (container[0] >= 0xc0
                                                         || (container.len() >= 6 && container[0] == 0x00 && container[1] == 0x00));
                                                 if is_cchain_block && matches!(bootstrap_state, BootstrapState::Done) {

@@ -412,4 +412,104 @@ mod tests {
             assert_eq!(pm.connected_count(), 50);
         }
     }
+
+    // ========================================================================
+    // MAINNET CONFIGURATION TESTS (Feature 5)
+    // ========================================================================
+
+    mod mainnet_tests {
+        /// Mainnet C-Chain CB58 ID (2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5).
+        /// Verify it decodes to a valid 32-byte array.
+        #[test]
+        fn test_mainnet_cchain_id_decodes() {
+            let cb58 = "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5";
+            let decoded = bs58::decode(cb58).into_vec().expect("valid base58");
+            // CB58 = base58(payload[32] + checksum[4])
+            assert!(decoded.len() >= 36, "decoded too short: {}", decoded.len());
+            let id: [u8; 32] = decoded[..32].try_into().expect("32 bytes");
+            // Must be non-zero
+            assert!(id.iter().any(|&b| b != 0), "C-Chain ID should not be all zeros");
+        }
+
+        /// Fuji C-Chain CB58 ID (yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp).
+        #[test]
+        fn test_fuji_cchain_id_decodes() {
+            let cb58 = "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp";
+            let decoded = bs58::decode(cb58).into_vec().expect("valid base58");
+            assert!(decoded.len() >= 36);
+            let id: [u8; 32] = decoded[..32].try_into().expect("32 bytes");
+            assert!(id.iter().any(|&b| b != 0));
+        }
+
+        /// Mainnet and Fuji C-Chain IDs must be distinct.
+        #[test]
+        fn test_mainnet_and_fuji_cchain_ids_differ() {
+            let mainnet_id: [u8; 32] = {
+                let d = bs58::decode("2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5")
+                    .into_vec().unwrap();
+                d[..32].try_into().unwrap()
+            };
+            let fuji_id: [u8; 32] = {
+                let d = bs58::decode("yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp")
+                    .into_vec().unwrap();
+                d[..32].try_into().unwrap()
+            };
+            assert_ne!(mainnet_id, fuji_id);
+        }
+
+        /// Verify the mainnet EVM executor initializes without panicking.
+        #[test]
+        fn test_mainnet_evm_executor_init() {
+            use avalanche_rs::evm::EvmExecutor;
+            let exec = EvmExecutor::new(43114);
+            // Chain initializes with zero accounts
+            assert_eq!(exec.account_count(), 0);
+        }
+
+        /// Verify the Fuji EVM executor initializes without panicking.
+        #[test]
+        fn test_fuji_evm_executor_init() {
+            use avalanche_rs::evm::EvmExecutor;
+            let exec = EvmExecutor::new(43113);
+            assert_eq!(exec.account_count(), 0);
+        }
+
+        /// Verify that state root computation works with mainnet chain ID.
+        #[test]
+        fn test_mainnet_state_root_not_empty() {
+            use avalanche_rs::evm::EvmExecutor;
+            let mut exec = EvmExecutor::new(43114); // mainnet
+            exec.set_balance([0x01u8; 20], 1_000_000_000_000_000_000u128); // 1 AVAX
+
+            let root = exec.compute_state_root_mpt();
+            // Should produce the empty-trie EMPTY_ROOT_HASH modified by the account
+            let empty_trie = [
+                0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
+                0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
+                0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
+                0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+            ];
+            assert_ne!(root, empty_trie, "state root with accounts should differ from empty trie");
+        }
+
+        /// Simulate the network_id selection logic used in main() for cchain_id.
+        #[test]
+        fn test_network_id_selects_correct_cchain_cb58() {
+            let for_network = |network_id: u32| -> [u8; 32] {
+                let cb58 = match network_id {
+                    1 => "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5",
+                    _ => "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp",
+                };
+                let decoded = bs58::decode(cb58).into_vec().unwrap();
+                decoded[..32].try_into().unwrap()
+            };
+
+            let mainnet = for_network(1);
+            let fuji = for_network(5);
+            let unknown = for_network(99);
+
+            assert_ne!(mainnet, fuji);
+            assert_eq!(fuji, unknown, "unknown networks fall back to Fuji ID");
+        }
+    }
 }
