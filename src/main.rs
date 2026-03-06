@@ -1141,6 +1141,7 @@ async fn connect_and_handshake(
             // Arm 4: continuous sync timer — every 2s, check for new blocks after bootstrap
             _ = sync_timer.tick() => {
                 if matches!(bootstrap_state, BootstrapState::Done) {
+                    // Poll P-Chain tip
                     sync_req_counter = sync_req_counter.wrapping_add(1);
                     continuous_sync_req = Some(sync_req_counter);
                     let req = NetworkMessage::GetAcceptedFrontier {
@@ -1152,6 +1153,18 @@ async fn connect_and_handshake(
                         if tls_stream.write_all(&encoded).await.is_ok() {
                             let _ = tls_stream.flush().await;
                             debug!("Continuous sync: GetAcceptedFrontier req={} to {}", sync_req_counter, addr);
+                        }
+                    }
+                    // Also poll C-Chain tip for new blocks
+                    sync_req_counter = sync_req_counter.wrapping_add(1);
+                    let cchain_sync_req = NetworkMessage::GetAcceptedFrontier {
+                        chain_id: ChainId(cchain_id),
+                        request_id: sync_req_counter,
+                        deadline: 5_000_000_000u64,
+                    };
+                    if let Ok(encoded) = cchain_sync_req.encode_proto() {
+                        if tls_stream.write_all(&encoded).await.is_ok() {
+                            let _ = tls_stream.flush().await;
                         }
                     }
                 }
@@ -1603,6 +1616,10 @@ async fn connect_and_handshake(
                                                                 bootstrap_state = BootstrapState::Done;
                                                                 info!("Bootstrap P-Chain complete with {} — {} total blocks stored", addr, new_total);
 
+                                                                // Transition sync engine to Following phase
+                                                                node.sync_engine.mark_following().await;
+                                                                info!("Sync engine: transitioned to Following (live chain tracking)");
+
                                                                 // Verify the stored chain and update metrics
                                                                 if let Some(tip) = p_chain_tip {
                                                                     let (chain_len, tip_height, genesis_height) = verify_block_chain(&node.db, tip);
@@ -1676,10 +1693,32 @@ async fn connect_and_handshake(
                                             }
                                             NetworkMessage::PushQuery { chain_id, request_id, deadline, container } => {
                                                 // PushQuery = peer pushes a block and asks for our preference
-                                                info!(
+                                                debug!(
                                                     "PushQuery from {} (req={}, block={} bytes)",
                                                     addr, request_id, container.len()
                                                 );
+                                                // If this is a C-Chain block, execute it through the EVM
+                                                let is_cchain_block = chain_id.0 == cchain_id && node.config.network_id == 5
+                                                    || !container.is_empty() && (container[0] >= 0xc0
+                                                        || (container.len() >= 6 && container[0] == 0x00 && container[1] == 0x00));
+                                                if is_cchain_block && matches!(bootstrap_state, BootstrapState::Done) {
+                                                    // Store the new block
+                                                    let mut h = sha2::Sha256::new();
+                                                    sha2::Digest::update(&mut h, &container);
+                                                    let hash: [u8; 32] = sha2::Digest::finalize(h).into();
+                                                    let mut key = Vec::with_capacity(34);
+                                                    key.extend_from_slice(b"c:");
+                                                    key.extend_from_slice(&hash);
+                                                    let _ = node.db.put_cf(CF_BLOCKS, &key, &container);
+                                                    // Execute through EVM
+                                                    execute_cchain_block_and_store(
+                                                        &container, node.config.chain_id,
+                                                        &node.evm, &node.db, &node.c_chain_metrics,
+                                                    ).await;
+                                                    if let Some(fields) = extract_cchain_block_fields(&container) {
+                                                        info!("Following: new C-Chain block #{} via PushQuery from {}", fields.number, addr);
+                                                    }
+                                                }
                                                 // Respond with Chits pointing to our zero (no preference yet)
                                                 let chits = NetworkMessage::Chits {
                                                     chain_id,
@@ -2093,7 +2132,7 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         }
         "eth_syncing" => {
             let phase = node.sync_engine.phase().await;
-            if phase == SyncPhase::Synced {
+            if phase == SyncPhase::Synced || phase == SyncPhase::Following {
                 "false".to_string()
             } else {
                 let stats = node.sync_engine.stats().await;

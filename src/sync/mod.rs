@@ -35,8 +35,10 @@ pub enum SyncPhase {
     Fetching,
     /// Replaying / verifying blocks
     Executing,
-    /// Caught up to chain tip
+    /// Caught up to chain tip — historical sync complete
     Synced,
+    /// Actively following the chain tip, processing new blocks as they arrive
+    Following,
 }
 
 impl std::fmt::Display for SyncPhase {
@@ -50,6 +52,7 @@ impl std::fmt::Display for SyncPhase {
             Self::Fetching => write!(f, "fetching"),
             Self::Executing => write!(f, "executing"),
             Self::Synced => write!(f, "synced"),
+            Self::Following => write!(f, "following"),
         }
     }
 }
@@ -377,9 +380,19 @@ impl SyncEngine {
         *self.phase.read().await == SyncPhase::Synced
     }
 
-    /// Mark sync as complete.
+    /// Mark sync as complete (historical bootstrap done).
     pub async fn mark_synced(&self) {
         *self.phase.write().await = SyncPhase::Synced;
+    }
+
+    /// Transition to `Following` phase: actively tracking new chain tip blocks.
+    pub async fn mark_following(&self) {
+        *self.phase.write().await = SyncPhase::Following;
+    }
+
+    /// Returns true if the node is in an active live-sync phase.
+    pub async fn is_following(&self) -> bool {
+        matches!(*self.phase.read().await, SyncPhase::Following)
     }
 
     /// Transition to execution phase.
@@ -650,6 +663,37 @@ mod tests {
         engine.mark_synced().await;
         assert!(engine.is_synced().await);
         assert_eq!(engine.phase().await, SyncPhase::Synced);
+    }
+
+    #[tokio::test]
+    async fn test_mark_following() {
+        let config = SyncConfig::default();
+        let engine = SyncEngine::new(config);
+
+        assert!(!engine.is_following().await);
+        engine.mark_following().await;
+        assert!(engine.is_following().await);
+        assert_eq!(engine.phase().await, SyncPhase::Following);
+        assert_eq!(format!("{}", engine.phase().await), "following");
+    }
+
+    #[tokio::test]
+    async fn test_sync_phase_display_all() {
+        assert_eq!(format!("{}", SyncPhase::Idle), "idle");
+        assert_eq!(format!("{}", SyncPhase::Fetching), "fetching");
+        assert_eq!(format!("{}", SyncPhase::Executing), "executing");
+        assert_eq!(format!("{}", SyncPhase::Synced), "synced");
+        assert_eq!(format!("{}", SyncPhase::Following), "following");
+    }
+
+    #[tokio::test]
+    async fn test_following_is_not_synced() {
+        let config = SyncConfig::default();
+        let engine = SyncEngine::new(config);
+        engine.mark_following().await;
+        // Following is a distinct phase from Synced
+        assert!(!engine.is_synced().await);
+        assert!(engine.is_following().await);
     }
 
     #[tokio::test]
