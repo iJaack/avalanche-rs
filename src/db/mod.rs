@@ -334,19 +334,43 @@ impl StateTrie {
         self.accounts.remove(address);
     }
 
-    /// Compute the state root hash (Keccak-256 of the trie).
-    /// Uses a simplified approach: sort accounts, hash them together.
+    /// Compute the Ethereum MPT state root (keccak256-keyed, RLP-encoded leaves).
+    ///
+    /// Uses alloy-trie's `state_root_unsorted` so the result matches the state
+    /// root produced by geth / AvalancheGo coreth for the same account set.
     pub fn root_hash(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        for (addr, state_rlp) in &self.accounts {
-            hasher.update(addr);
-            hasher.update(state_rlp);
+        use alloy_trie::{root::state_root_unsorted, TrieAccount, EMPTY_ROOT_HASH, KECCAK_EMPTY};
+        use alloy_primitives::{keccak256, B256, U256};
+
+        let entries: Vec<(B256, TrieAccount)> = self
+            .accounts
+            .iter()
+            .map(|(addr, rlp)| {
+                // Decode our minimal RLP back into fields for TrieAccount
+                let state = decode_account_rlp(rlp);
+                let hashed = keccak256(addr);
+                let trie_acct = TrieAccount {
+                    nonce: state.nonce,
+                    balance: U256::from(state.balance),
+                    storage_root: B256::from_slice(&state.storage_root),
+                    code_hash: if state.code_hash == [0u8; 32] {
+                        KECCAK_EMPTY
+                    } else {
+                        B256::from_slice(&state.code_hash)
+                    },
+                };
+                (hashed, trie_acct)
+            })
+            .collect();
+
+        if entries.is_empty() {
+            return *EMPTY_ROOT_HASH.as_ref();
         }
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+
+        let root = state_root_unsorted(entries);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(root.as_slice());
+        out
     }
 
     /// Number of accounts in the trie.
@@ -433,6 +457,73 @@ fn rlp_encode_list(items: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(len_significant);
         out.extend_from_slice(&payload);
         out
+    }
+}
+
+/// Decode a minimal RLP-encoded account back into `AccountState` fields.
+/// This is the inverse of `AccountState::rlp_encode()`.
+fn decode_account_rlp(rlp: &[u8]) -> AccountState {
+    // Minimal decoder: parse list header, then 4 fields (nonce, balance, storage_root, code_hash)
+    if rlp.is_empty() {
+        return AccountState::default();
+    }
+
+    let mut pos = 0usize;
+
+    // Skip list header
+    if pos >= rlp.len() { return AccountState::default(); }
+    let first = rlp[pos];
+    if first >= 0xf8 {
+        let len_bytes = (first - 0xf7) as usize;
+        pos += 1 + len_bytes;
+    } else if first >= 0xc0 {
+        pos += 1;
+    }
+
+    fn read_uint_field(data: &[u8], pos: &mut usize) -> u128 {
+        if *pos >= data.len() { return 0; }
+        let b = data[*pos];
+        if b == 0x80 { *pos += 1; return 0; }
+        if b < 0x80 { *pos += 1; return b as u128; }
+        let len = (b - 0x80) as usize;
+        *pos += 1;
+        if *pos + len > data.len() { return 0; }
+        let mut val = 0u128;
+        for &byte in &data[*pos..*pos + len] {
+            val = (val << 8) | byte as u128;
+        }
+        *pos += len;
+        val
+    }
+
+    fn read_bytes32(data: &[u8], pos: &mut usize) -> [u8; 32] {
+        if *pos >= data.len() { return [0u8; 32]; }
+        let b = data[*pos];
+        let len = if b >= 0x80 && b < 0xb8 {
+            *pos += 1;
+            (b - 0x80) as usize
+        } else {
+            *pos += 1;
+            0
+        };
+        let mut arr = [0u8; 32];
+        let take = len.min(32).min(data.len().saturating_sub(*pos));
+        arr[32 - take..].copy_from_slice(&data[*pos..*pos + take]);
+        *pos += len;
+        arr
+    }
+
+    let nonce = read_uint_field(rlp, &mut pos) as u64;
+    let balance = read_uint_field(rlp, &mut pos);
+    let storage_root = read_bytes32(rlp, &mut pos);
+    let code_hash = read_bytes32(rlp, &mut pos);
+
+    AccountState { nonce, balance, storage_root, code_hash }
+}
+
+impl Default for AccountState {
+    fn default() -> Self {
+        Self { nonce: 0, balance: 0, storage_root: [0u8; 32], code_hash: [0u8; 32] }
     }
 }
 
@@ -702,5 +793,86 @@ mod tests {
             let data = db.get_block(i).unwrap().unwrap();
             assert_eq!(data, format!("block_{}", i).into_bytes());
         }
+    }
+
+    // --- Feature 4: StateTrie MPT root tests ---
+
+    #[test]
+    fn test_state_trie_empty_root() {
+        let trie = StateTrie::new();
+        let root = trie.root_hash();
+        // Empty MPT root (alloy-trie EMPTY_ROOT_HASH)
+        let expected = [
+            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
+            0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
+            0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
+            0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+        ];
+        assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn test_state_trie_insert_changes_root() {
+        let mut trie = StateTrie::new();
+        let addr = [0x42u8; 20];
+
+        let root_before = trie.root_hash();
+        trie.insert(addr, &AccountState {
+            nonce: 1,
+            balance: 1_000_000,
+            storage_root: [0u8; 32],
+            code_hash: [0u8; 32],
+        });
+        let root_after = trie.root_hash();
+
+        assert_ne!(root_before, root_after);
+    }
+
+    #[test]
+    fn test_state_trie_deterministic() {
+        let account = AccountState {
+            nonce: 5,
+            balance: 100_000_000,
+            storage_root: [0u8; 32],
+            code_hash: [0u8; 32],
+        };
+        let addr = [0x11u8; 20];
+
+        let mut trie1 = StateTrie::new();
+        let mut trie2 = StateTrie::new();
+        trie1.insert(addr, &account);
+        trie2.insert(addr, &account);
+
+        assert_eq!(trie1.root_hash(), trie2.root_hash());
+    }
+
+    #[test]
+    fn test_state_trie_remove_restores_root() {
+        let mut trie = StateTrie::new();
+        let addr = [0xAAu8; 20];
+        let empty_root = trie.root_hash();
+
+        trie.insert(addr, &AccountState::default());
+        assert_ne!(trie.root_hash(), empty_root);
+
+        trie.remove(&addr);
+        assert_eq!(trie.root_hash(), empty_root);
+    }
+
+    #[test]
+    fn test_decode_account_rlp_roundtrip() {
+        let original = AccountState {
+            nonce: 42,
+            balance: 9_999_999_999,
+            storage_root: [0xBBu8; 32],
+            code_hash: [0xCCu8; 32],
+        };
+        let encoded = original.rlp_encode();
+        let decoded = decode_account_rlp(&encoded);
+
+        assert_eq!(decoded.nonce, original.nonce);
+        assert_eq!(decoded.balance, original.balance);
+        assert_eq!(decoded.storage_root, original.storage_root);
+        assert_eq!(decoded.code_hash, original.code_hash);
     }
 }

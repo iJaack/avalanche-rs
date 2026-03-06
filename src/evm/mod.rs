@@ -293,6 +293,78 @@ impl EvmExecutor {
         self.db.accounts.len()
     }
 
+    /// Compute the Ethereum Merkle Patricia Trie state root from the in-memory
+    /// account state, using alloy-trie.
+    ///
+    /// This produces the same state root as geth/AvalancheGo for the same
+    /// account set (keccak256 keyed, RLP-encoded account leaves). Storage tries
+    /// are also hashed via alloy-trie for accounts that have modified slots.
+    pub fn compute_state_root_mpt(&self) -> [u8; 32] {
+        use alloy_trie::{root::state_root_unsorted, TrieAccount, EMPTY_ROOT_HASH, KECCAK_EMPTY};
+        use revm::primitives::{keccak256, B256, U256};
+
+        let accounts: Vec<(B256, TrieAccount)> = self
+            .db
+            .accounts
+            .iter()
+            .map(|(addr, db_acct)| {
+                // Hash the address to produce the MPT key
+                let hashed_addr = keccak256(addr.as_slice());
+
+                // Compute the storage trie root for this account
+                let storage_root = if db_acct.storage.is_empty() {
+                    EMPTY_ROOT_HASH
+                } else {
+                    use alloy_trie::root::storage_root_unhashed;
+                    let storage_iter = db_acct.storage.iter().map(|(slot, value)| {
+                        let slot_b256 = B256::from(slot.to_be_bytes::<32>());
+                        let val_u256 = U256::from(*value);
+                        (slot_b256, val_u256)
+                    });
+                    storage_root_unhashed(storage_iter)
+                };
+
+                // Determine code hash
+                let code_hash = match &db_acct.info.code {
+                    Some(code) if !code.is_empty() => {
+                        B256::from_slice(keccak256(code.bytes()).as_slice())
+                    }
+                    _ => {
+                        if db_acct.info.code_hash != revm::primitives::KECCAK_EMPTY {
+                            B256::from_slice(db_acct.info.code_hash.as_slice())
+                        } else {
+                            KECCAK_EMPTY
+                        }
+                    }
+                };
+
+                let trie_acct = TrieAccount {
+                    nonce: db_acct.info.nonce,
+                    balance: db_acct.info.balance,
+                    storage_root,
+                    code_hash,
+                };
+
+                (hashed_addr, trie_acct)
+            })
+            .collect();
+
+        let root = state_root_unsorted(accounts);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(root.as_slice());
+        out
+    }
+
+    /// Verify that the post-execution state root matches the expected value
+    /// declared in a block header.
+    ///
+    /// Returns `true` if they match, `false` otherwise. Used during block
+    /// import to detect state corruption or implementation bugs.
+    pub fn verify_state_root(&self, expected: &[u8; 32]) -> bool {
+        let computed = self.compute_state_root_mpt();
+        computed == *expected
+    }
+
     /// Compute a simple state root from the in-memory account trie.
     ///
     /// This is a placeholder implementation that produces a deterministic 32-byte
@@ -658,5 +730,88 @@ mod tests {
             exec.set_balance(addr, (i as u128 + 1) * 1000);
         }
         assert_eq!(exec.account_count(), 10);
+    }
+
+    // --- Feature 4: State Trie Verification tests ---
+
+    #[test]
+    fn test_compute_state_root_mpt_empty() {
+        // Empty state should produce the Ethereum empty trie root
+        let exec = EvmExecutor::new(43114);
+        let root = exec.compute_state_root_mpt();
+        // alloy_trie::EMPTY_ROOT_HASH = 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
+        let expected = [
+            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
+            0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
+            0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
+            0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+        ];
+        assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn test_compute_state_root_mpt_deterministic() {
+        // Same accounts → same root
+        let mut exec1 = EvmExecutor::new(43114);
+        let mut exec2 = EvmExecutor::new(43114);
+        let addr_a = [0x11u8; 20];
+        let addr_b = [0x22u8; 20];
+
+        exec1.set_balance(addr_a, 1_000_000);
+        exec1.set_balance(addr_b, 2_000_000);
+        exec2.set_balance(addr_a, 1_000_000);
+        exec2.set_balance(addr_b, 2_000_000);
+
+        assert_eq!(exec1.compute_state_root_mpt(), exec2.compute_state_root_mpt());
+    }
+
+    #[test]
+    fn test_compute_state_root_mpt_changes_with_state() {
+        let mut exec = EvmExecutor::new(43114);
+        let addr = [0xABu8; 20];
+
+        let root_empty = exec.compute_state_root_mpt();
+        exec.set_balance(addr, 1_000);
+        let root_with_account = exec.compute_state_root_mpt();
+        exec.set_balance(addr, 2_000);
+        let root_updated = exec.compute_state_root_mpt();
+
+        assert_ne!(root_empty, root_with_account);
+        assert_ne!(root_with_account, root_updated);
+    }
+
+    #[test]
+    fn test_verify_state_root_pass() {
+        let mut exec = EvmExecutor::new(43114);
+        exec.set_balance([0x01u8; 20], 5_000_000);
+
+        let root = exec.compute_state_root_mpt();
+        assert!(exec.verify_state_root(&root));
+    }
+
+    #[test]
+    fn test_verify_state_root_fail() {
+        let mut exec = EvmExecutor::new(43114);
+        exec.set_balance([0x01u8; 20], 5_000_000);
+
+        let wrong_root = [0xFFu8; 32];
+        assert!(!exec.verify_state_root(&wrong_root));
+    }
+
+    #[test]
+    fn test_state_root_mpt_order_independent() {
+        // Inserting accounts in different order should yield same root
+        let mut exec1 = EvmExecutor::new(43114);
+        let mut exec2 = EvmExecutor::new(43114);
+        let addrs: Vec<[u8; 20]> = (0..5u8).map(|i| [i; 20]).collect();
+
+        for addr in &addrs {
+            exec1.set_balance(*addr, 1000);
+        }
+        for addr in addrs.iter().rev() {
+            exec2.set_balance(*addr, 1000);
+        }
+
+        assert_eq!(exec1.compute_state_root_mpt(), exec2.compute_state_root_mpt());
     }
 }

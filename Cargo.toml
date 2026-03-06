@@ -69,7 +69,8 @@ revm = { version = "19", default-features = false, features = ["std", "serde"] }
 rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
 
 # State trie (Phase 4)
-alloy-trie = "0.7"
+alloy-trie = { version = "0.7", features = ["ethereum"] }
+alloy-primitives = "0.8"
 alloy-rlp = "0.3"
 
 # Metrics (Phase 6)
