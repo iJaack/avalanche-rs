@@ -561,6 +561,355 @@ fn rlp_skip(data: &[u8], pos: usize) -> Result<usize, String> {
 }
 
 // ---------------------------------------------------------------------------
+// C-Chain transaction extraction
+// ---------------------------------------------------------------------------
+
+/// A raw transaction decoded from a C-Chain (Ethereum) block, before ECDSA
+/// sender recovery.
+#[derive(Debug, Clone)]
+pub struct CChainRawTx {
+    /// Transaction type: 0 = legacy, 1 = EIP-2930, 2 = EIP-1559.
+    pub tx_type: u8,
+    /// Sender nonce.
+    pub nonce: u64,
+    /// Gas price in wei (legacy/EIP-2930) or `maxFeePerGas` (EIP-1559).
+    pub gas_price: u128,
+    /// Gas limit.
+    pub gas_limit: u64,
+    /// Recipient address, or `None` for contract creation.
+    pub to: Option<[u8; 20]>,
+    /// Value in wei.
+    pub value: u128,
+    /// Call data / init code.
+    pub data: Vec<u8>,
+}
+
+/// Block-level fields extracted from a C-Chain block header, needed to build
+/// a `BlockContext` for EVM execution.
+#[derive(Debug, Clone)]
+pub struct CChainBlockFields {
+    /// Ethereum block number.
+    pub number: u64,
+    /// Unix-seconds timestamp.
+    pub timestamp: u64,
+    /// Gas limit for the block.
+    pub gas_limit: u64,
+    /// Base fee per gas (EIP-1559). Defaults to 25 gwei for pre-EIP-1559 blocks.
+    pub base_fee: u128,
+    /// Block producer / coinbase address.
+    pub miner: [u8; 20],
+}
+
+/// Extract all transactions from a raw C-Chain block (handles both
+/// Avalanche-wrapped and raw RLP formats).
+///
+/// Supports legacy (type-0), EIP-2930 (type-1), and EIP-1559 (type-2)
+/// transactions. The `from` field is not recovered here — callers should
+/// pre-fund a placeholder sender or perform ECDSA recovery separately.
+pub fn extract_cchain_transactions(raw: &[u8]) -> Vec<CChainRawTx> {
+    let rlp = strip_avalanche_wrapper(raw);
+    if rlp.is_empty() || rlp[0] < 0xc0 {
+        return vec![];
+    }
+
+    // Navigate: outer list → skip header → skip uncles → txs list
+    let (_, outer_start) = match rlp_list_start(rlp, 0) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let after_header = match rlp_skip(rlp, outer_start) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let txs_list_pos = match rlp_skip(rlp, after_header) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    if txs_list_pos >= rlp.len() || rlp[txs_list_pos] < 0xc0 {
+        return vec![];
+    }
+
+    let txs_end = match rlp_skip(rlp, txs_list_pos) {
+        Ok(v) => v,
+        Err(_) => rlp.len(),
+    };
+    let (_, mut pos) = match rlp_list_start(rlp, txs_list_pos) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut txs = Vec::new();
+    while pos < txs_end && pos < rlp.len() {
+        let byte = rlp[pos];
+        if byte >= 0xc0 {
+            // Legacy RLP list transaction
+            if let Some(tx) = parse_legacy_tx(rlp, pos) {
+                txs.push(tx);
+            }
+            match rlp_skip(rlp, pos) {
+                Ok(next) => pos = next,
+                Err(_) => break,
+            }
+        } else {
+            // EIP-2718 typed transaction encoded as an RLP byte string
+            // whose content is [type_byte || rlp_payload]
+            match rlp_read_bytes_raw(rlp, pos) {
+                Ok((content, next_pos)) => {
+                    if !content.is_empty() {
+                        if let Some(tx) = parse_typed_tx(content) {
+                            txs.push(tx);
+                        }
+                    }
+                    pos = next_pos;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    txs
+}
+
+/// Extract block-level header fields from a raw C-Chain block.
+///
+/// Handles blocks with varying numbers of header fields (pre- and post-EIP-1559).
+/// Returns `None` only if the block is structurally unparseable.
+pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
+    let rlp = strip_avalanche_wrapper(raw);
+    if rlp.is_empty() || rlp[0] < 0xc0 {
+        return None;
+    }
+
+    // Outer list → header list
+    let (_, header_start) = rlp_list_start(rlp, 0).ok()?;
+    let (_, mut pos) = rlp_list_start(rlp, header_start).ok()?;
+
+    /// Skip a field, returning `false` if out of bounds (graceful end).
+    fn skip(data: &[u8], pos: &mut usize) -> bool {
+        match rlp_skip(data, *pos) {
+            Ok(next) => { *pos = next; true }
+            Err(_) => false,
+        }
+    }
+
+    // field 0: parentHash – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 1: sha3Uncles – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 2: miner (20 bytes, 0x94 prefix)
+    let miner = rlp_read_address(rlp, pos).unwrap_or([0u8; 20]);
+    if !skip(rlp, &mut pos) { return None; }
+    // field 3: stateRoot – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 4: txRoot – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 5: receiptRoot – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 6: bloom – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 7: difficulty – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 8: number
+    let number = rlp_read_u64(rlp, pos).unwrap_or(0);
+    if !skip(rlp, &mut pos) { return None; }
+    // field 9: gasLimit
+    let gas_limit = rlp_read_u64(rlp, pos).unwrap_or(30_000_000);
+    if !skip(rlp, &mut pos) { return None; }
+    // field 10: gasUsed – skip
+    if !skip(rlp, &mut pos) { return None; }
+    // field 11: timestamp
+    let timestamp = rlp_read_u64(rlp, pos).unwrap_or(0);
+    // Fields 12+ are optional in synthetic/test blocks
+    // field 12: extraData
+    if !skip(rlp, &mut pos) {
+        return Some(CChainBlockFields { number, timestamp, gas_limit, base_fee: 25_000_000_000, miner });
+    }
+    // field 13: mixHash
+    if !skip(rlp, &mut pos) {
+        return Some(CChainBlockFields { number, timestamp, gas_limit, base_fee: 25_000_000_000, miner });
+    }
+    // field 14: nonce
+    if !skip(rlp, &mut pos) {
+        return Some(CChainBlockFields { number, timestamp, gas_limit, base_fee: 25_000_000_000, miner });
+    }
+    // field 15: baseFeePerGas (EIP-1559; absent in pre-London blocks)
+    let base_fee = if pos < rlp.len() {
+        rlp_read_u128(rlp, pos).unwrap_or(25_000_000_000)
+    } else {
+        25_000_000_000 // 25 gwei default
+    };
+
+    Some(CChainBlockFields { number, timestamp, gas_limit, base_fee, miner })
+}
+
+// ---------------------------------------------------------------------------
+// C-Chain parsing helpers
+// ---------------------------------------------------------------------------
+
+/// Strip Avalanche codec wrapper (0x00 0x00 + 4-byte typeID) if present.
+fn strip_avalanche_wrapper(raw: &[u8]) -> &[u8] {
+    if raw.len() >= 6 && raw[0] == 0x00 && raw[1] == 0x00 {
+        &raw[6..]
+    } else {
+        raw
+    }
+}
+
+/// Parse a legacy (type-0) Ethereum transaction from an RLP list.
+/// Format: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
+fn parse_legacy_tx(data: &[u8], pos: usize) -> Option<CChainRawTx> {
+    let (_, mut fp) = rlp_list_start(data, pos).ok()?;
+    let nonce = rlp_read_u64(data, fp).unwrap_or(0);
+    fp = rlp_skip(data, fp).ok()?;
+    let gas_price = rlp_read_u128(data, fp).unwrap_or(0);
+    fp = rlp_skip(data, fp).ok()?;
+    let gas_limit = rlp_read_u64(data, fp).unwrap_or(21_000);
+    fp = rlp_skip(data, fp).ok()?;
+    let to = rlp_read_address(data, fp);
+    fp = rlp_skip(data, fp).ok()?;
+    let value = rlp_read_u128(data, fp).unwrap_or(0);
+    fp = rlp_skip(data, fp).ok()?;
+    let tx_data = rlp_read_bytes_vec(data, fp).unwrap_or_default();
+    Some(CChainRawTx { tx_type: 0, nonce, gas_price, gas_limit, to, value, data: tx_data })
+}
+
+/// Parse an EIP-2718 typed transaction. `raw` is `[type_byte || rlp_payload]`.
+fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
+    if raw.is_empty() {
+        return None;
+    }
+    let tx_type = raw[0];
+    let payload = &raw[1..];
+    if payload.is_empty() || payload[0] < 0xc0 {
+        return None;
+    }
+    let (_, mut fp) = rlp_list_start(payload, 0).ok()?;
+
+    match tx_type {
+        0x01 => {
+            // EIP-2930: [chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, ...]
+            fp = rlp_skip(payload, fp).ok()?; // chainId
+            let nonce = rlp_read_u64(payload, fp).unwrap_or(0);
+            fp = rlp_skip(payload, fp).ok()?;
+            let gas_price = rlp_read_u128(payload, fp).unwrap_or(0);
+            fp = rlp_skip(payload, fp).ok()?;
+            let gas_limit = rlp_read_u64(payload, fp).unwrap_or(21_000);
+            fp = rlp_skip(payload, fp).ok()?;
+            let to = rlp_read_address(payload, fp);
+            fp = rlp_skip(payload, fp).ok()?;
+            let value = rlp_read_u128(payload, fp).unwrap_or(0);
+            fp = rlp_skip(payload, fp).ok()?;
+            let data = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
+            Some(CChainRawTx { tx_type: 1, nonce, gas_price, gas_limit, to, value, data })
+        }
+        0x02 => {
+            // EIP-1559: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, ...]
+            fp = rlp_skip(payload, fp).ok()?; // chainId
+            let nonce = rlp_read_u64(payload, fp).unwrap_or(0);
+            fp = rlp_skip(payload, fp).ok()?;
+            fp = rlp_skip(payload, fp).ok()?; // maxPriorityFeePerGas
+            let gas_price = rlp_read_u128(payload, fp).unwrap_or(0); // maxFeePerGas
+            fp = rlp_skip(payload, fp).ok()?;
+            let gas_limit = rlp_read_u64(payload, fp).unwrap_or(21_000);
+            fp = rlp_skip(payload, fp).ok()?;
+            let to = rlp_read_address(payload, fp);
+            fp = rlp_skip(payload, fp).ok()?;
+            let value = rlp_read_u128(payload, fp).unwrap_or(0);
+            fp = rlp_skip(payload, fp).ok()?;
+            let data = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
+            Some(CChainRawTx { tx_type: 2, nonce, gas_price, gas_limit, to, value, data })
+        }
+        _ => None,
+    }
+}
+
+/// Read a 20-byte Ethereum address at `pos` (expects `0x94` = 0x80+20 prefix,
+/// or `0x80` for null/empty = contract creation).
+fn rlp_read_address(data: &[u8], pos: usize) -> Option<[u8; 20]> {
+    if pos >= data.len() {
+        return None;
+    }
+    match data[pos] {
+        0x80 => None, // null address → contract creation
+        0x94 if pos + 21 <= data.len() => {
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&data[pos + 1..pos + 21]);
+            Some(addr)
+        }
+        _ => None,
+    }
+}
+
+/// Read an RLP-encoded big-endian integer as `u128` at `pos`.
+fn rlp_read_u128(data: &[u8], pos: usize) -> Result<u128, String> {
+    if pos >= data.len() {
+        return Err(format!("pos {} out of bounds (len={})", pos, data.len()));
+    }
+    let first = data[pos];
+    if first == 0x80 {
+        return Ok(0);
+    }
+    if first <= 0x7f {
+        return Ok(first as u128);
+    }
+    if first <= 0xb7 {
+        let len = (first - 0x80) as usize;
+        if len > 16 {
+            return Err(format!("u128 field too long: {} bytes", len));
+        }
+        if pos + 1 + len > data.len() {
+            return Err("not enough bytes for u128".to_string());
+        }
+        let mut value = 0u128;
+        for i in 0..len {
+            value = (value << 8) | (data[pos + 1 + i] as u128);
+        }
+        return Ok(value);
+    }
+    Err(format!("unexpected RLP prefix 0x{:02x} for u128 at pos {}", first, pos))
+}
+
+/// Read an RLP byte string at `pos`, returning `(content, next_pos)`.
+fn rlp_read_bytes_raw(data: &[u8], pos: usize) -> Result<(&[u8], usize), String> {
+    if pos >= data.len() {
+        return Err(format!("pos {} out of bounds", pos));
+    }
+    let first = data[pos];
+    if first <= 0x7f {
+        return Ok((&data[pos..pos + 1], pos + 1));
+    }
+    if first <= 0xb7 {
+        let len = (first - 0x80) as usize;
+        let start = pos + 1;
+        if start + len > data.len() {
+            return Err("short string OOB".to_string());
+        }
+        return Ok((&data[start..start + len], start + len));
+    }
+    if first <= 0xbf {
+        let len_bytes = (first - 0xb7) as usize;
+        if pos + 1 + len_bytes > data.len() {
+            return Err("long string len OOB".to_string());
+        }
+        let mut len = 0usize;
+        for i in 0..len_bytes {
+            len = (len << 8) | (data[pos + 1 + i] as usize);
+        }
+        let start = pos + 1 + len_bytes;
+        if start + len > data.len() {
+            return Err("long string content OOB".to_string());
+        }
+        return Ok((&data[start..start + len], start + len));
+    }
+    Err(format!("pos {} is a list, not a string", pos))
+}
+
+/// Read an RLP byte string at `pos` as an owned `Vec<u8>`.
+fn rlp_read_bytes_vec(data: &[u8], pos: usize) -> Result<Vec<u8>, String> {
+    let (slice, _) = rlp_read_bytes_raw(data, pos)?;
+    Ok(slice.to_vec())
+}
+
+// ---------------------------------------------------------------------------
 // SHA-256 helper
 // ---------------------------------------------------------------------------
 
@@ -1132,5 +1481,181 @@ mod tests {
 
         assert_eq!(h.raw_bytes, raw);
         assert_eq!(h.raw_size, raw.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // C-Chain transaction extraction tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal legacy Ethereum transaction RLP item.
+    /// Format: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
+    fn make_legacy_tx_rlp(nonce: u64, gas_price: u128, gas_limit: u64,
+                           to: Option<[u8; 20]>, value: u128, data: &[u8]) -> Vec<u8> {
+        let mut fields: Vec<u8> = Vec::new();
+        encode_rlp_u64(&mut fields, nonce);
+        // gasPrice as u128
+        if gas_price == 0 {
+            fields.push(0x80);
+        } else {
+            let bytes = gas_price.to_be_bytes();
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(15);
+            let slice = &bytes[start..];
+            fields.push(0x80 + slice.len() as u8);
+            fields.extend_from_slice(slice);
+        }
+        encode_rlp_u64(&mut fields, gas_limit);
+        // to
+        match to {
+            None => fields.push(0x80), // empty = contract creation
+            Some(addr) => {
+                fields.push(0x94); // 0x80 + 20
+                fields.extend_from_slice(&addr);
+            }
+        }
+        // value as u128
+        if value == 0 {
+            fields.push(0x80);
+        } else {
+            let bytes = value.to_be_bytes();
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(15);
+            let slice = &bytes[start..];
+            fields.push(0x80 + slice.len() as u8);
+            fields.extend_from_slice(slice);
+        }
+        // data
+        if data.is_empty() {
+            fields.push(0x80);
+        } else {
+            fields.push(0x80 + data.len() as u8);
+            fields.extend_from_slice(data);
+        }
+        // v, r, s (stub values)
+        fields.push(0x80); // v = 0
+        fields.push(0x80); // r = 0
+        fields.push(0x80); // s = 0
+        rlp_list(fields)
+    }
+
+    /// Build a C-Chain block with one legacy transaction.
+    fn make_cchain_block_with_tx(parent: [u8; 32], number: u64, timestamp: u64,
+                                  tx: Vec<u8>) -> Vec<u8> {
+        let mut header_payload: Vec<u8> = Vec::new();
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&parent);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0x1du8; 32]);
+        header_payload.push(0x94);
+        header_payload.extend_from_slice(&[0u8; 20]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]); // stateRoot
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]); // txRoot
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]); // receiptRoot
+        header_payload.push(0xb9);
+        header_payload.push(0x01);
+        header_payload.push(0x00);
+        header_payload.extend_from_slice(&[0u8; 256]); // bloom
+        header_payload.push(0x80); // difficulty
+        encode_rlp_u64(&mut header_payload, number);
+        encode_rlp_u64(&mut header_payload, 30_000_000); // gasLimit
+        header_payload.push(0x80); // gasUsed
+        encode_rlp_u64(&mut header_payload, timestamp);
+        header_payload.push(0x80); // extraData
+        header_payload.push(0xa0); // mixHash
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.extend_from_slice(&[0x88, 0,0,0,0,0,0,0,0]); // nonce (8 bytes)
+
+        let header_list = rlp_list(header_payload);
+        let empty = 0xc0u8; // empty uncles
+
+        // txs list: wrap the single tx item
+        let txs_list = rlp_list(tx);
+
+        let mut outer_payload: Vec<u8> = Vec::new();
+        outer_payload.extend_from_slice(&header_list);
+        outer_payload.push(empty); // uncles
+        outer_payload.extend_from_slice(&txs_list);
+        rlp_list(outer_payload)
+    }
+
+    #[test]
+    fn test_extract_cchain_transactions_empty_block() {
+        // A block with no transactions should return empty vec
+        let raw = make_cchain_block([0u8; 32], 1, 1_700_000_000);
+        let txs = extract_cchain_transactions(&raw);
+        assert_eq!(txs.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_cchain_transactions_with_one_tx() {
+        let to_addr = [0x42u8; 20];
+        let tx = make_legacy_tx_rlp(
+            5,                      // nonce
+            25_000_000_000u128,     // gasPrice (25 gwei)
+            21_000,                 // gasLimit
+            Some(to_addr),          // to
+            1_000_000_000_000_000_000u128, // value (1 ETH)
+            &[],                    // data
+        );
+        let raw = make_cchain_block_with_tx([0u8; 32], 100, 1_700_000_000, tx);
+        let txs = extract_cchain_transactions(&raw);
+        assert_eq!(txs.len(), 1, "should extract one transaction");
+        assert_eq!(txs[0].nonce, 5);
+        assert_eq!(txs[0].gas_price, 25_000_000_000);
+        assert_eq!(txs[0].gas_limit, 21_000);
+        assert_eq!(txs[0].to, Some(to_addr));
+        assert_eq!(txs[0].value, 1_000_000_000_000_000_000);
+        assert_eq!(txs[0].tx_type, 0);
+    }
+
+    #[test]
+    fn test_extract_cchain_transactions_contract_creation() {
+        let tx = make_legacy_tx_rlp(
+            0, 25_000_000_000, 100_000,
+            None, // no to = contract creation
+            0, &[0x60, 0x00], // init code
+        );
+        let raw = make_cchain_block_with_tx([0u8; 32], 1, 1_700_000_000, tx);
+        let txs = extract_cchain_transactions(&raw);
+        assert_eq!(txs.len(), 1);
+        assert!(txs[0].to.is_none(), "contract creation should have no to");
+        assert_eq!(txs[0].data, vec![0x60, 0x00]);
+    }
+
+    #[test]
+    fn test_extract_cchain_block_fields() {
+        let raw = make_cchain_block([0u8; 32], 42, 1_700_000_000);
+        let fields = extract_cchain_block_fields(&raw);
+        assert!(fields.is_some(), "should extract block fields");
+        let f = fields.unwrap();
+        assert_eq!(f.number, 42);
+        assert_eq!(f.timestamp, 1_700_000_000);
+        assert_eq!(f.gas_limit, 8_000_000); // from make_cchain_block
+    }
+
+    #[test]
+    fn test_extract_cchain_block_fields_wrapped() {
+        let raw = make_cchain_block_wrapped([0u8; 32], 99, 1_750_000_000);
+        let fields = extract_cchain_block_fields(&raw);
+        assert!(fields.is_some());
+        let f = fields.unwrap();
+        assert_eq!(f.number, 99);
+        assert_eq!(f.timestamp, 1_750_000_000);
+    }
+
+    #[test]
+    fn test_rlp_read_u128() {
+        // Test reading u128 values
+        let data = [0x85u8, 0x05, 0xd2, 0x1d, 0xb8, 0x00]; // 5-byte number
+        assert!(rlp_read_u128(&data, 0).is_ok());
+
+        // Zero
+        let zero = [0x80u8];
+        assert_eq!(rlp_read_u128(&zero, 0).unwrap(), 0);
+
+        // Single byte
+        let single = [0x0fu8];
+        assert_eq!(rlp_read_u128(&single, 0).unwrap(), 15);
     }
 }

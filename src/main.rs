@@ -20,10 +20,10 @@ use tracing::{debug, error, info, warn};
 use sha2::{Digest, Sha256};
 use bs58;
 
-use avalanche_rs::block::{BlockHeader, Chain, ChainGraph};
+use avalanche_rs::block::{BlockHeader, Chain, ChainGraph, extract_cchain_block_fields, extract_cchain_transactions};
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
-use avalanche_rs::evm::EvmExecutor;
+use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction};
 use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::network::{BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, PeerInfo, PeerManager, Peer, PeerState};
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
@@ -1420,6 +1420,14 @@ async fn connect_and_handshake(
                                                                             debug!("state_root store failed: {}", e);
                                                                         }
                                                                     }
+                                                                    // Execute block through EVM and store receipts
+                                                                    execute_cchain_block_and_store(
+                                                                        container,
+                                                                        node.config.chain_id,
+                                                                        &node.evm,
+                                                                        &node.db,
+                                                                        &node.c_chain_metrics,
+                                                                    ).await;
                                                                 }
                                                                 oldest_container = Some(container.clone());
                                                             }
@@ -1897,6 +1905,98 @@ async fn bootstrap_p_chain<S>(
                 warn!("bootstrap: error waiting for Ancestors from {}: {}", addr, e);
                 break;
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C-Chain EVM execution helper
+// ---------------------------------------------------------------------------
+
+/// Execute a downloaded C-Chain block through the EVM and persist receipts.
+///
+/// Extracts transactions from the raw RLP block, runs them through the in-memory
+/// EVM executor, and stores receipts in CF_RECEIPTS keyed by `(block_height, tx_idx)`.
+/// The EVM state is cumulative across blocks within a single peer session.
+async fn execute_cchain_block_and_store(
+    raw_block: &[u8],
+    chain_id: u64,
+    evm: &Arc<RwLock<EvmExecutor>>,
+    db: &Database,
+    metrics: &Arc<RwLock<ChainMetrics>>,
+) {
+    let fields = match extract_cchain_block_fields(raw_block) {
+        Some(f) => f,
+        None => return, // not a valid C-Chain block
+    };
+
+    let raw_txs = extract_cchain_transactions(raw_block);
+    if raw_txs.is_empty() {
+        // Even with no transactions update tip height
+        let mut m = metrics.write().await;
+        if fields.number > m.tip_height {
+            m.tip_height = fields.number;
+        }
+        return;
+    }
+
+    let ctx = BlockContext {
+        number: fields.number,
+        timestamp: fields.timestamp,
+        coinbase: fields.miner,
+        gas_limit: fields.gas_limit,
+        base_fee: fields.base_fee,
+        difficulty: 0,
+        chain_id,
+    };
+
+    // Convert raw txs to EVM transactions (zero sender — ECDSA recovery is a planned enhancement)
+    let evm_txs: Vec<EvmTransaction> = raw_txs
+        .iter()
+        .map(|t| EvmTransaction {
+            from: [0u8; 20],
+            to: t.to,
+            value: t.value,
+            data: t.data.clone(),
+            gas_limit: t.gas_limit,
+            gas_price: t.gas_price.max(fields.base_fee),
+            nonce: t.nonce,
+        })
+        .collect();
+
+    let result = {
+        let mut evm = evm.write().await;
+        // Pre-fund zero address so gas deduction succeeds for all txs
+        evm.set_balance([0u8; 20], u128::MAX / 2);
+        evm.execute_block(&evm_txs, &ctx)
+    };
+
+    match result {
+        Ok(block_result) => {
+            debug!(
+                "C-Chain #{}: executed {} txs, {} gas used",
+                fields.number, block_result.tx_count, block_result.gas_used
+            );
+
+            // Persist receipts: key = block_height (8 BE) + tx_index (4 BE)
+            for (idx, receipt) in block_result.receipts.iter().enumerate() {
+                // Compact binary receipt: [success(1), gas_used(8LE), logs_count(4LE)]
+                let mut rec_bytes = Vec::with_capacity(13);
+                rec_bytes.push(receipt.success as u8);
+                rec_bytes.extend_from_slice(&receipt.gas_used.to_le_bytes());
+                rec_bytes.extend_from_slice(&(receipt.logs.len() as u32).to_le_bytes());
+                if let Err(e) = db.put_receipt(fields.number, idx as u32, &rec_bytes) {
+                    debug!("receipt store failed for block #{} tx {}: {}", fields.number, idx, e);
+                }
+            }
+
+            let mut m = metrics.write().await;
+            if fields.number > m.tip_height {
+                m.tip_height = fields.number;
+            }
+        }
+        Err(e) => {
+            debug!("C-Chain #{} EVM execution error: {}", fields.number, e);
         }
     }
 }
