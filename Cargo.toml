@@ -85,6 +85,9 @@ prometheus = "0.13"
 parking_lot = "0.12"
 lru = "0.12"
 
+# Mainnet hardening (Phase 11)
+libc = "0.2"
+
 # Lazy statics
 once_cell = "1.19"
 

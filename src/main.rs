@@ -117,6 +117,14 @@ struct Cli {
     /// Block LRU cache size.
     #[arg(long, default_value = "1024", env = "AVAX_BLOCK_CACHE_SIZE")]
     block_cache_size: usize,
+
+    /// Maximum RPC request body size in bytes (default 5MB).
+    #[arg(long, default_value = "5242880", env = "AVAX_RPC_MAX_BODY_SIZE")]
+    rpc_max_body_size: usize,
+
+    /// Maximum memory usage in MB (0 = unlimited). Rejects new connections when near limit.
+    #[arg(long, default_value = "0", env = "AVAX_MAX_MEMORY_MB")]
+    max_memory_mb: u64,
 }
 
 // ---------------------------------------------------------------------------
