@@ -157,6 +157,130 @@ impl EvmExecutor {
             .unwrap_or(0)
     }
 
+    /// Get account code bytes.
+    pub fn get_code(&self, address: [u8; 20]) -> Vec<u8> {
+        let addr = Address::from(address);
+        self.db
+            .accounts
+            .get(&addr)
+            .and_then(|a| a.info.code.as_ref())
+            .map(|c| c.bytes().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Get storage value at a slot for an account.
+    pub fn get_storage_at(&self, address: [u8; 20], slot: [u8; 32]) -> [u8; 32] {
+        let addr = Address::from(address);
+        let slot_u256 = U256::from_be_bytes(slot);
+        self.db
+            .accounts
+            .get(&addr)
+            .and_then(|a| a.storage.get(&slot_u256))
+            .map(|v| v.to_be_bytes())
+            .unwrap_or([0u8; 32])
+    }
+
+    /// Execute a call without committing state changes (eth_call).
+    pub fn execute_call(
+        &self,
+        tx: &EvmTransaction,
+        block: &BlockContext,
+    ) -> Result<Vec<u8>, EvmError> {
+        let mut db_clone = self.db.clone();
+        let tx_kind = match tx.to {
+            Some(addr) => TxKind::Call(Address::from(addr)),
+            None => TxKind::Create,
+        };
+
+        let chain_id = self.chain_id;
+        let mut evm = Evm::builder()
+            .with_db(&mut db_clone)
+            .modify_cfg_env(|cfg| {
+                cfg.chain_id = chain_id;
+            })
+            .modify_block_env(|b| {
+                b.number = U256::from(block.number);
+                b.timestamp = U256::from(block.timestamp);
+                b.coinbase = Address::from(block.coinbase);
+                b.gas_limit = U256::from(block.gas_limit);
+                b.basefee = U256::from(block.base_fee);
+            })
+            .modify_tx_env(|t| {
+                t.caller = Address::from(tx.from);
+                t.transact_to = tx_kind;
+                t.value = U256::from(tx.value);
+                t.data = Bytes::from(tx.data.clone());
+                t.gas_limit = tx.gas_limit;
+                t.gas_price = U256::from(tx.gas_price);
+                t.nonce = Some(tx.nonce);
+            })
+            .build();
+
+        let result = evm
+            .transact_commit()
+            .map_err(|e| EvmError::ExecutionFailed(format!("{:?}", e)))?;
+
+        match result {
+            ExecutionResult::Success { output, .. } => match output {
+                Output::Call(data) => Ok(data.to_vec()),
+                Output::Create(data, _) => Ok(data.to_vec()),
+            },
+            ExecutionResult::Revert { output, .. } => {
+                Err(EvmError::ExecutionFailed(format!("revert: 0x{}", hex::encode(&output))))
+            }
+            ExecutionResult::Halt { reason, .. } => {
+                Err(EvmError::ExecutionFailed(format!("halt: {:?}", reason)))
+            }
+        }
+    }
+
+    /// Estimate gas for a transaction (eth_estimateGas).
+    pub fn estimate_gas(
+        &self,
+        tx: &EvmTransaction,
+        block: &BlockContext,
+    ) -> Result<u64, EvmError> {
+        let mut db_clone = self.db.clone();
+        let tx_kind = match tx.to {
+            Some(addr) => TxKind::Call(Address::from(addr)),
+            None => TxKind::Create,
+        };
+
+        let chain_id = self.chain_id;
+        let mut evm = Evm::builder()
+            .with_db(&mut db_clone)
+            .modify_cfg_env(|cfg| {
+                cfg.chain_id = chain_id;
+            })
+            .modify_block_env(|b| {
+                b.number = U256::from(block.number);
+                b.timestamp = U256::from(block.timestamp);
+                b.coinbase = Address::from(block.coinbase);
+                b.gas_limit = U256::from(block.gas_limit);
+                b.basefee = U256::from(block.base_fee);
+            })
+            .modify_tx_env(|t| {
+                t.caller = Address::from(tx.from);
+                t.transact_to = tx_kind;
+                t.value = U256::from(tx.value);
+                t.data = Bytes::from(tx.data.clone());
+                t.gas_limit = block.gas_limit; // use block gas limit for estimation
+                t.gas_price = U256::from(tx.gas_price);
+                t.nonce = Some(tx.nonce);
+            })
+            .build();
+
+        let result = evm
+            .transact_commit()
+            .map_err(|e| EvmError::ExecutionFailed(format!("{:?}", e)))?;
+
+        match result {
+            ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
+            ExecutionResult::Revert { gas_used, .. } => Ok(gas_used),
+            ExecutionResult::Halt { gas_used, .. } => Ok(gas_used),
+        }
+    }
+
     /// Execute a single transaction.
     pub fn execute_tx(
         &mut self,
@@ -719,6 +843,65 @@ mod tests {
         exec.set_account(addr, 1000, 5, vec![0x60, 0x00]);
         assert_eq!(exec.get_balance(addr), 1000);
         assert_eq!(exec.get_nonce(addr), 5);
+    }
+
+    #[test]
+    fn test_get_code() {
+        let mut exec = EvmExecutor::new(43114);
+        let addr = [0xBB; 20];
+        let code = vec![0x60, 0x42, 0x60, 0x00, 0x52];
+        exec.set_account(addr, 0, 0, code.clone());
+        assert_eq!(exec.get_code(addr), code);
+    }
+
+    #[test]
+    fn test_get_code_empty() {
+        let exec = EvmExecutor::new(43114);
+        assert!(exec.get_code([0xFF; 20]).is_empty());
+    }
+
+    #[test]
+    fn test_get_storage_at_empty() {
+        let exec = EvmExecutor::new(43114);
+        assert_eq!(exec.get_storage_at([0x01; 20], [0u8; 32]), [0u8; 32]);
+    }
+
+    #[test]
+    fn test_execute_call_simple_transfer() {
+        let mut exec = EvmExecutor::new(43114);
+        let sender = [0x01; 20];
+        exec.set_balance(sender, 10_000_000_000_000_000_000u128);
+        let block = test_block();
+        let tx = EvmTransaction {
+            from: sender,
+            to: Some([0x02; 20]),
+            value: 0,
+            data: vec![],
+            gas_limit: 21_000,
+            gas_price: 25_000_000_000,
+            nonce: 0,
+        };
+        let result = exec.execute_call(&tx, &block);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_estimate_gas_transfer() {
+        let mut exec = EvmExecutor::new(43114);
+        let sender = [0x01; 20];
+        exec.set_balance(sender, 10_000_000_000_000_000_000u128);
+        let block = test_block();
+        let tx = EvmTransaction {
+            from: sender,
+            to: Some([0x02; 20]),
+            value: 1_000_000_000,
+            data: vec![],
+            gas_limit: 21_000,
+            gas_price: 25_000_000_000,
+            nonce: 0,
+        };
+        let gas = exec.estimate_gas(&tx, &block).unwrap();
+        assert_eq!(gas, 21_000);
     }
 
     #[test]

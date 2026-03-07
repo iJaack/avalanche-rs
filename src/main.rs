@@ -2444,6 +2444,75 @@ async fn handle_rpc_connection(
     let _ = stream.write_all(http_response.as_bytes()).await;
 }
 
+/// Parse a hex string (with or without 0x prefix) to bytes.
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(s).ok()
+}
+
+/// Parse a hex string to a 20-byte address.
+fn parse_hex_address(s: &str) -> Option<[u8; 20]> {
+    let bytes = parse_hex_bytes(s)?;
+    if bytes.len() != 20 { return None; }
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Parse a hex string to a 32-byte hash.
+fn parse_hex_hash(s: &str) -> Option<[u8; 32]> {
+    let bytes = parse_hex_bytes(s)?;
+    if bytes.len() != 32 { return None; }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Parse a hex block number or "latest"/"earliest"/"pending" tag.
+fn parse_block_number(val: &serde_json::Value, node: &NodeState) -> u64 {
+    match val.as_str() {
+        Some("latest") | Some("pending") | None => {
+            node.db.last_accepted_height().unwrap_or(None).unwrap_or(0)
+        }
+        Some("earliest") => 0,
+        Some(hex_str) => {
+            let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+            u64::from_str_radix(s, 16).unwrap_or(0)
+        }
+    }
+}
+
+/// JSON-RPC error response helper.
+fn rpc_error(code: i32, message: &str, id: &serde_json::Value) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":{},\"message\":\"{}\"}},\"id\":{}}}",
+        code, message, id
+    )
+}
+
+/// JSON-RPC success response helper.
+fn rpc_ok(result: &str, id: &serde_json::Value) -> String {
+    format!("{{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":{}}}", result, id)
+}
+
+/// In-memory log filter for eth_newFilter/getFilterChanges/uninstallFilter.
+struct LogFilter {
+    from_block: u64,
+    to_block: Option<u64>,
+    addresses: Vec<[u8; 20]>,
+    topics: Vec<Option<[u8; 32]>>,
+    last_polled_block: u64,
+}
+
+/// Global filter state — use a simple counter + HashMap behind RwLock.
+static NEXT_FILTER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+use std::collections::HashMap as StdHashMap;
+use once_cell::sync::Lazy;
+
+static FILTERS: Lazy<RwLock<StdHashMap<u64, LogFilter>>> =
+    Lazy::new(|| RwLock::new(StdHashMap::new()));
+
 async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
     let req: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
@@ -2454,50 +2523,455 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
     };
 
     let method = req["method"].as_str().unwrap_or("");
+    let params = &req["params"];
     let id = &req["id"];
 
-    let result = match method {
+    match method {
+        // -----------------------------------------------------------------
+        // Existing methods
+        // -----------------------------------------------------------------
         "eth_chainId" => {
-            format!("\"0x{:x}\"", node.config.chain_id)
+            rpc_ok(&format!("\"0x{:x}\"", node.config.chain_id), id)
         }
         "eth_blockNumber" => {
             let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
-            format!("\"0x{:x}\"", height)
+            rpc_ok(&format!("\"0x{:x}\"", height), id)
         }
         "net_version" => {
-            format!("\"{}\"", node.config.network_id)
+            rpc_ok(&format!("\"{}\"", node.config.network_id), id)
         }
         "web3_clientVersion" => {
-            "\"avalanche-rs/0.1.0\"".to_string()
+            rpc_ok("\"avalanche-rs/0.1.0\"", id)
         }
         "eth_syncing" => {
             let phase = node.sync_engine.phase().await;
             if phase == SyncPhase::Synced || phase == SyncPhase::Following {
-                "false".to_string()
+                rpc_ok("false", id)
             } else {
                 let stats = node.sync_engine.stats().await;
-                format!(
-                    "{{\"startingBlock\":\"0x0\",\"currentBlock\":\"0x{:x}\",\"highestBlock\":\"0x{:x}\"}}",
-                    stats.last_block_height,
-                    stats.target_height
+                rpc_ok(
+                    &format!(
+                        "{{\"startingBlock\":\"0x0\",\"currentBlock\":\"0x{:x}\",\"highestBlock\":\"0x{:x}\"}}",
+                        stats.last_block_height,
+                        stats.target_height
+                    ),
+                    id,
                 )
             }
         }
         "avax_getNodeID" => {
-            format!("\"{}\"", node.identity.node_id)
+            rpc_ok(&format!("\"{}\"", node.identity.node_id), id)
         }
         "avax_getNodeVersion" => {
-            "\"avalanche-rs/0.1.0\"".to_string()
+            rpc_ok("\"avalanche-rs/0.1.0\"", id)
         }
-        _ => {
-            return format!(
-                "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32601,\"message\":\"method not found: {}\"}},\"id\":{}}}",
-                method, id
-            );
-        }
-    };
 
-    format!("{{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":{}}}", result, id)
+        // -----------------------------------------------------------------
+        // eth_getBalance
+        // -----------------------------------------------------------------
+        "eth_getBalance" => {
+            let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_address(addr_str) {
+                Some(addr) => {
+                    let evm = node.evm.read().await;
+                    let balance = evm.get_balance(addr);
+                    rpc_ok(&format!("\"0x{:x}\"", balance), id)
+                }
+                None => rpc_error(-32602, "invalid address", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getTransactionCount
+        // -----------------------------------------------------------------
+        "eth_getTransactionCount" => {
+            let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_address(addr_str) {
+                Some(addr) => {
+                    let evm = node.evm.read().await;
+                    let nonce = evm.get_nonce(addr);
+                    rpc_ok(&format!("\"0x{:x}\"", nonce), id)
+                }
+                None => rpc_error(-32602, "invalid address", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getCode
+        // -----------------------------------------------------------------
+        "eth_getCode" => {
+            let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_address(addr_str) {
+                Some(addr) => {
+                    let evm = node.evm.read().await;
+                    let code = evm.get_code(addr);
+                    rpc_ok(&format!("\"0x{}\"", hex::encode(&code)), id)
+                }
+                None => rpc_error(-32602, "invalid address", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getStorageAt
+        // -----------------------------------------------------------------
+        "eth_getStorageAt" => {
+            let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let slot_str = params.get(1).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match (parse_hex_address(addr_str), parse_hex_hash(slot_str)) {
+                (Some(addr), Some(slot)) => {
+                    let evm = node.evm.read().await;
+                    let value = evm.get_storage_at(addr, slot);
+                    rpc_ok(&format!("\"0x{}\"", hex::encode(value)), id)
+                }
+                _ => rpc_error(-32602, "invalid params", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_call
+        // -----------------------------------------------------------------
+        "eth_call" => {
+            let tx_obj = params.get(0);
+            if tx_obj.is_none() {
+                return rpc_error(-32602, "missing transaction object", id);
+            }
+            let tx_obj = tx_obj.unwrap();
+            let from = tx_obj["from"].as_str().and_then(parse_hex_address).unwrap_or([0u8; 20]);
+            let to = tx_obj["to"].as_str().and_then(parse_hex_address);
+            let data = tx_obj["data"].as_str().or(tx_obj["input"].as_str())
+                .and_then(parse_hex_bytes).unwrap_or_default();
+            let value_str = tx_obj["value"].as_str().unwrap_or("0x0");
+            let value = u128::from_str_radix(
+                value_str.strip_prefix("0x").unwrap_or(value_str), 16
+            ).unwrap_or(0);
+            let gas_str = tx_obj["gas"].as_str().unwrap_or("0x1c9c380"); // 30M default
+            let gas = u64::from_str_radix(
+                gas_str.strip_prefix("0x").unwrap_or(gas_str), 16
+            ).unwrap_or(30_000_000);
+
+            let evm = node.evm.read().await;
+            let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+            let block_ctx = avalanche_rs::evm::BlockContext {
+                number: height,
+                timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                coinbase: [0u8; 20],
+                gas_limit: 30_000_000,
+                base_fee: 25_000_000_000,
+                difficulty: 0,
+                chain_id: node.config.chain_id,
+            };
+            let tx = avalanche_rs::evm::EvmTransaction {
+                from,
+                to,
+                value,
+                data,
+                gas_limit: gas,
+                gas_price: 25_000_000_000,
+                nonce: evm.get_nonce(from),
+            };
+            match evm.execute_call(&tx, &block_ctx) {
+                Ok(output) => rpc_ok(&format!("\"0x{}\"", hex::encode(&output)), id),
+                Err(e) => rpc_error(-32000, &format!("{}", e), id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_estimateGas
+        // -----------------------------------------------------------------
+        "eth_estimateGas" => {
+            let tx_obj = params.get(0);
+            if tx_obj.is_none() {
+                return rpc_error(-32602, "missing transaction object", id);
+            }
+            let tx_obj = tx_obj.unwrap();
+            let from = tx_obj["from"].as_str().and_then(parse_hex_address).unwrap_or([0u8; 20]);
+            let to = tx_obj["to"].as_str().and_then(parse_hex_address);
+            let data = tx_obj["data"].as_str().or(tx_obj["input"].as_str())
+                .and_then(parse_hex_bytes).unwrap_or_default();
+            let value_str = tx_obj["value"].as_str().unwrap_or("0x0");
+            let value = u128::from_str_radix(
+                value_str.strip_prefix("0x").unwrap_or(value_str), 16
+            ).unwrap_or(0);
+
+            let evm = node.evm.read().await;
+            let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+            let block_ctx = avalanche_rs::evm::BlockContext {
+                number: height,
+                timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                coinbase: [0u8; 20],
+                gas_limit: 30_000_000,
+                base_fee: 25_000_000_000,
+                difficulty: 0,
+                chain_id: node.config.chain_id,
+            };
+            let tx = avalanche_rs::evm::EvmTransaction {
+                from,
+                to,
+                value,
+                data,
+                gas_limit: 30_000_000,
+                gas_price: 25_000_000_000,
+                nonce: evm.get_nonce(from),
+            };
+            match evm.estimate_gas(&tx, &block_ctx) {
+                Ok(gas) => rpc_ok(&format!("\"0x{:x}\"", gas), id),
+                Err(e) => rpc_error(-32000, &format!("{}", e), id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_gasPrice
+        // -----------------------------------------------------------------
+        "eth_gasPrice" => {
+            rpc_ok("\"0x5d21dba00\"", id) // 25 gwei
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getTransactionByHash
+        // -----------------------------------------------------------------
+        "eth_getTransactionByHash" => {
+            let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_hash(tx_hash_str) {
+                Some(tx_hash) => {
+                    match node.db.get_tx_index(&tx_hash) {
+                        Ok(Some((block_height, tx_index))) => {
+                            rpc_ok(
+                                &format!(
+                                    "{{\"hash\":\"0x{}\",\"blockNumber\":\"0x{:x}\",\"transactionIndex\":\"0x{:x}\"}}",
+                                    hex::encode(tx_hash), block_height, tx_index
+                                ),
+                                id,
+                            )
+                        }
+                        _ => rpc_ok("null", id),
+                    }
+                }
+                None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getTransactionReceipt
+        // -----------------------------------------------------------------
+        "eth_getTransactionReceipt" => {
+            let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_hash(tx_hash_str) {
+                Some(tx_hash) => {
+                    match node.db.get_tx_index(&tx_hash) {
+                        Ok(Some((block_height, tx_index))) => {
+                            match node.db.get_receipt(block_height, tx_index) {
+                                Ok(Some(receipt_data)) => {
+                                    let receipt_json = String::from_utf8_lossy(&receipt_data);
+                                    rpc_ok(&receipt_json, id)
+                                }
+                                _ => {
+                                    // Return minimal receipt from index data
+                                    rpc_ok(
+                                        &format!(
+                                            "{{\"transactionHash\":\"0x{}\",\"blockNumber\":\"0x{:x}\",\"transactionIndex\":\"0x{:x}\",\"status\":\"0x1\"}}",
+                                            hex::encode(tx_hash), block_height, tx_index
+                                        ),
+                                        id,
+                                    )
+                                }
+                            }
+                        }
+                        _ => rpc_ok("null", id),
+                    }
+                }
+                None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getBlockByNumber
+        // -----------------------------------------------------------------
+        "eth_getBlockByNumber" => {
+            let block_num = parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            match node.db.get_block(block_num) {
+                Ok(Some(block_data)) => {
+                    let hash_bytes = {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&block_data);
+                        hasher.finalize()
+                    };
+                    rpc_ok(
+                        &format!(
+                            "{{\"number\":\"0x{:x}\",\"hash\":\"0x{}\",\"size\":\"0x{:x}\",\"transactions\":[]}}",
+                            block_num, hex::encode(&hash_bytes), block_data.len()
+                        ),
+                        id,
+                    )
+                }
+                _ => rpc_ok("null", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getBlockByHash
+        // -----------------------------------------------------------------
+        "eth_getBlockByHash" => {
+            let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_hash(hash_str) {
+                Some(block_hash) => {
+                    // Look up block by hash in blocks CF (hash key format: "c:" prefix for C-chain)
+                    let mut key = Vec::with_capacity(34);
+                    key.extend_from_slice(b"c:");
+                    key.extend_from_slice(&block_hash);
+                    match node.db.get_cf(avalanche_rs::db::CF_BLOCKS, &key) {
+                        Ok(Some(block_data)) => {
+                            rpc_ok(
+                                &format!(
+                                    "{{\"hash\":\"0x{}\",\"size\":\"0x{:x}\",\"transactions\":[]}}",
+                                    hex::encode(block_hash), block_data.len()
+                                ),
+                                id,
+                            )
+                        }
+                        _ => rpc_ok("null", id),
+                    }
+                }
+                None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getLogs
+        // -----------------------------------------------------------------
+        "eth_getLogs" => {
+            // Returns empty array — log indexing requires full state sync
+            rpc_ok("[]", id)
+        }
+
+        // -----------------------------------------------------------------
+        // eth_newFilter
+        // -----------------------------------------------------------------
+        "eth_newFilter" => {
+            let filter_obj = params.get(0).unwrap_or(&serde_json::Value::Null);
+            let from_block = filter_obj["fromBlock"].as_str()
+                .map(|s| {
+                    let s = s.strip_prefix("0x").unwrap_or(s);
+                    u64::from_str_radix(s, 16).unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let to_block = filter_obj["toBlock"].as_str()
+                .map(|s| {
+                    let s = s.strip_prefix("0x").unwrap_or(s);
+                    u64::from_str_radix(s, 16).ok()
+                })
+                .flatten();
+            let addresses: Vec<[u8; 20]> = match &filter_obj["address"] {
+                serde_json::Value::String(s) => parse_hex_address(s).into_iter().collect(),
+                serde_json::Value::Array(arr) => arr.iter()
+                    .filter_map(|v| v.as_str().and_then(parse_hex_address))
+                    .collect(),
+                _ => vec![],
+            };
+            let topics: Vec<Option<[u8; 32]>> = match &filter_obj["topics"] {
+                serde_json::Value::Array(arr) => arr.iter()
+                    .map(|v| v.as_str().and_then(parse_hex_hash))
+                    .collect(),
+                _ => vec![],
+            };
+
+            let filter_id = NEXT_FILTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let current_height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+            let filter = LogFilter {
+                from_block,
+                to_block,
+                addresses,
+                topics,
+                last_polled_block: current_height,
+            };
+            FILTERS.write().await.insert(filter_id, filter);
+            rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getFilterChanges
+        // -----------------------------------------------------------------
+        "eth_getFilterChanges" => {
+            let filter_id_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let filter_id = u64::from_str_radix(
+                filter_id_str.strip_prefix("0x").unwrap_or(filter_id_str), 16
+            ).unwrap_or(0);
+            let mut filters = FILTERS.write().await;
+            match filters.get_mut(&filter_id) {
+                Some(filter) => {
+                    let current_height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+                    filter.last_polled_block = current_height;
+                    rpc_ok("[]", id) // log indexing not yet available
+                }
+                None => rpc_error(-32000, "filter not found", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_uninstallFilter
+        // -----------------------------------------------------------------
+        "eth_uninstallFilter" => {
+            let filter_id_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let filter_id = u64::from_str_radix(
+                filter_id_str.strip_prefix("0x").unwrap_or(filter_id_str), 16
+            ).unwrap_or(0);
+            let removed = FILTERS.write().await.remove(&filter_id).is_some();
+            rpc_ok(if removed { "true" } else { "false" }, id)
+        }
+
+        // -----------------------------------------------------------------
+        // Platform RPC methods (routed via /ext/bc/P in AvalancheGo)
+        // -----------------------------------------------------------------
+        "platform.getCurrentValidators" => {
+            let validators: Vec<String> = node.validators.iter().map(|(node_id, info)| {
+                format!(
+                    "{{\"nodeID\":\"{}\",\"weight\":\"{}\",\"startTime\":\"{}\",\"endTime\":\"{}\"}}",
+                    node_id, info.weight, info.start_time, info.end_time
+                )
+            }).collect();
+            rpc_ok(&format!("{{\"validators\":[{}]}}", validators.join(",")), id)
+        }
+
+        "platform.getPendingValidators" => {
+            rpc_ok("{\"validators\":[]}", id)
+        }
+
+        "platform.getHeight" => {
+            let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+            rpc_ok(&format!("\"{}\"", height), id)
+        }
+
+        "platform.getBlock" => {
+            let height_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0");
+            let height = height_str.parse::<u64>().unwrap_or(0);
+            match node.db.get_block(height) {
+                Ok(Some(data)) => {
+                    rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id)
+                }
+                _ => rpc_error(-32000, "block not found", id),
+            }
+        }
+
+        "platform.getSubnets" => {
+            rpc_ok("{\"subnets\":[{\"id\":\"11111111111111111111111111111111LpoYY\",\"controlKeys\":[],\"threshold\":\"0\"}]}", id)
+        }
+
+        "platform.getStake" => {
+            let total: u64 = node.validators.values().map(|v| v.weight).sum();
+            rpc_ok(&format!("{{\"staked\":\"{}\"}}", total), id)
+        }
+
+        "platform.getMinStake" => {
+            // Mainnet: 2000 AVAX for validators, 25 AVAX for delegators
+            rpc_ok("{\"minValidatorStake\":\"2000000000000\",\"minDelegatorStake\":\"25000000000\"}", id)
+        }
+
+        // -----------------------------------------------------------------
+        // Unknown method
+        // -----------------------------------------------------------------
+        _ => {
+            rpc_error(-32601, &format!("method not found: {}", method), id)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

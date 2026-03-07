@@ -79,6 +79,9 @@ alloy-rlp = "0.3"
 # Metrics (Phase 6)
 prometheus = "0.13"
 
+# Lazy statics
+once_cell = "1.19"
+
 # Used by db::open_temp()
 tempfile = "3.10"
 
