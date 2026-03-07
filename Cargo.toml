@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/avalanche-core", "crates/avalanche-wasm"]
+exclude = ["fuzz"]
 
 [package]
 name = "avalanche-rs"

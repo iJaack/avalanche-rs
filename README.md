@@ -222,6 +222,27 @@ cargo build --release
 - **8.6 MB** release binary (LTO + strip)
 - **36 MB** RSS at steady state (49.6× less than AvalancheGo)
 
+## Fuzz Testing
+
+Fuzz targets for security-critical parsing using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz):
+
+```bash
+# Install cargo-fuzz (requires nightly)
+cargo install cargo-fuzz
+
+# List targets
+cargo fuzz list
+
+# Run a specific target (e.g., 30 seconds)
+cargo +nightly fuzz run protobuf_parse -- -max_total_time=30
+cargo +nightly fuzz run block_parse -- -max_total_time=30
+cargo +nightly fuzz run rpc_input -- -max_total_time=30
+cargo +nightly fuzz run bloom_parse -- -max_total_time=30
+cargo +nightly fuzz run rlp_decode -- -max_total_time=30
+```
+
+Targets: `protobuf_parse`, `block_parse`, `rpc_input`, `bloom_parse`, `rlp_decode`
+
 ## The Bloom Filter Bug 🐛
 
 The handshake was rejected for hours because AvalancheGo's `bloom.Parse()` expects a structured format:

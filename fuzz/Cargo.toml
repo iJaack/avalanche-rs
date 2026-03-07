@@ -1,0 +1,39 @@
+[package]
+name = "avalanche-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+avalanche-rs = { path = "..", features = ["full"] }
+prost = "0.12"
+serde_json = "1.0"
+
+[[bin]]
+name = "protobuf_parse"
+path = "fuzz_targets/protobuf_parse.rs"
+doc = false
+
+[[bin]]
+name = "block_parse"
+path = "fuzz_targets/block_parse.rs"
+doc = false
+
+[[bin]]
+name = "rpc_input"
+path = "fuzz_targets/rpc_input.rs"
+doc = false
+
+[[bin]]
+name = "bloom_parse"
+path = "fuzz_targets/bloom_parse.rs"
+doc = false
+
+[[bin]]
+name = "rlp_decode"
+path = "fuzz_targets/rlp_decode.rs"
+doc = false
