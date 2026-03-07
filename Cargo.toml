@@ -109,6 +109,30 @@ harness = false
 name = "consensus_bench"
 harness = false
 
+[[bench]]
+name = "block_parsing"
+harness = false
+
+[[bench]]
+name = "trie_ops"
+harness = false
+
+[[bench]]
+name = "p2p_codec"
+harness = false
+
+[[bench]]
+name = "rpc_handling"
+harness = false
+
+[[bench]]
+name = "bls_verify"
+harness = false
+
+[[bench]]
+name = "bloom_filter"
+harness = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
