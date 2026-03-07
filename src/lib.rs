@@ -32,6 +32,7 @@ pub mod hardening;
 pub mod identity;
 pub mod light;
 pub mod metrics;
+pub mod observability;
 pub mod proto;
 pub mod snap;
 pub mod subnet;

@@ -1,0 +1,54 @@
+groups:
+  - name: avalanche-rs-alerts
+    rules:
+      - alert: NodeBehind
+        expr: |
+          avalanche_tip_height - avalanche_blocks_synced > 100
+          and
+          changes(avalanche_tip_height[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Avalanche node is behind"
+          description: >-
+            Tip height has not increased in the last 5 minutes and the node is
+            more than 100 blocks behind. Current tip: {{ $value }}.
+
+      - alert: LowPeerCount
+        expr: avalanche_peer_count < 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low peer count"
+          description: >-
+            Peer count is {{ $value }}, below the minimum threshold of 3.
+            The node may be partitioned from the network.
+
+      - alert: HighDiskUsage
+        expr: |
+          (
+            (node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"})
+            / node_filesystem_size_bytes{mountpoint="/"}
+          ) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High disk usage"
+          description: >-
+            Disk usage is above 90% ({{ $value | printf "%.1f" }}%).
+            Consider pruning chain data or expanding storage.
+
+      - alert: HighMemoryUsage
+        expr: |
+          (process_resident_memory_bytes / process_virtual_memory_max_bytes) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: >-
+            Memory usage is above 80% of the configured limit
+            ({{ $value | printf "%.1f" }}%). The node may become unstable.

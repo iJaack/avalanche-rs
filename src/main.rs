@@ -125,6 +125,14 @@ struct Cli {
     /// Maximum memory usage in MB (0 = unlimited). Rejects new connections when near limit.
     #[arg(long, default_value = "0", env = "AVAX_MAX_MEMORY_MB")]
     max_memory_mb: u64,
+
+    /// Maximum log file size in MiB before rotation (default 100).
+    #[arg(long, default_value = "100", env = "AVAX_LOG_MAX_SIZE")]
+    log_max_size: u64,
+
+    /// Maximum number of rotated log files to keep (default 10).
+    #[arg(long, default_value = "10", env = "AVAX_LOG_MAX_FILES")]
+    log_max_files: u32,
 }
 
 // ---------------------------------------------------------------------------
