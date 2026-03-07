@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml)
 
-A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 23.8K lines of Rust, 518 tests, 8.6 MB binary.
+A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 27.8K lines of Rust, 597 tests, 8.6 MB binary.
 
 ## Benchmarks vs AvalancheGo 1.14.1
 
@@ -47,9 +47,12 @@ avalanche-rs completes full P-Chain + C-Chain bootstrap in **~25 seconds**, then
 - Light client mode (headers-only, merkle proof verification)
 
 ### RPC Server
-- **eth_*** — 14 methods: getBalance, getTransactionCount, getCode, getStorageAt, call, estimateGas, gasPrice, getTransactionByHash, getTransactionReceipt, getBlockByNumber, getBlockByHash, getLogs, newFilter, getFilterChanges
+- **eth_*** — 21 methods: getBalance, getTransactionCount, getCode, getStorageAt, call, estimateGas, gasPrice, getTransactionByHash, getTransactionReceipt, getBlockByNumber, getBlockByHash, getLogs, newFilter, getFilterChanges, getBlobByHash, subscribe, unsubscribe
+- **txpool_*** — 3 methods: status, content, inspect
+- **debug_*** — 3 methods: traceTransaction, traceBlockByNumber, getBlockByNumber
 - **platform.*** — 7 methods: getCurrentValidators, getPendingValidators, getHeight, getBlock, getSubnets, getStake, getMinStake
 - **net_***, **web3_***, **avax_*** — version, clientVersion, syncing, nodeID
+- WebSocket subscriptions: newHeads, logs, newPendingTransactions
 - Prometheus metrics at `/metrics`
 - Health endpoint matching AvalancheGo format
 
@@ -58,8 +61,24 @@ avalanche-rs completes full P-Chain + C-Chain bootstrap in **~25 seconds**, then
 - P-Chain: UTXO tracking from genesis, double-spend detection
 - C-Chain: full EVM execution via revm
 - C-Chain: receipt root & gas accounting verification
+- EIP-4844 blob transaction parsing & KZG commitment verification
+- EIP-1559 aware transaction pool with priority queue & nonce gap detection
+
+### Debug & Trace
+- debug_traceTransaction with structLogs format (pc, op, gas, gasCost, depth, stack, memory)
+- debug_traceBlockByNumber — trace all txs in a block
+- Configurable tracers: structLogger (default), callTracer
+
+### Performance
+- LRU block cache (--block-cache-size, default 1024)
+- LRU account state cache (reduce trie lookups)
+- parking_lot::RwLock for non-async hot paths
+- RocksDB WriteBatch for atomic block storage
+- Connection pooling (min 10, max 50)
 
 ### Advanced
+- Archive node mode (--archive, keep ALL historical state)
+- Snap/1 sync protocol (10x fewer round trips for state download)
 - Subnet support (--tracked-subnets, per-chain sync state)
 - MEV engine (V2/V4 AMM math, sandwich sim, arbitrage detection)
 - WASM build target (avalanche-core → wasm32)
@@ -107,23 +126,30 @@ cargo build --release
 avalanche-rs/
 ├── src/
 │   ├── main.rs          # Node daemon, P2P, handshake, message loop, RPC server
+│   ├── archive/         # Archive node mode (historical state queries)
+│   ├── blob/            # EIP-4844 blob transactions & KZG verification
 │   ├── block/           # Block parsing (Apricot + Banff), chain graph
+│   ├── cache/           # LRU caches (blocks, accounts), connection pooling
 │   ├── consensus/       # Snowman consensus (alpha/beta, chits, confidence)
-│   ├── identity/        # TLS cert generation, IP signing, BLS keys
-│   ├── proto/           # Protobuf codec (p2p.proto)
-│   ├── network/         # P2P networking, persistent peer management
-│   ├── sync/            # State sync, bootstrap, chain following
+│   ├── db/              # RocksDB storage (12 column families + pruning)
+│   ├── debug/           # Debug & trace APIs (structLogs, callTracer)
 │   ├── evm/             # C-Chain EVM execution via revm
-│   ├── db/              # RocksDB storage (10 column families + pruning)
-│   ├── rpc/             # JSON-RPC client
-│   ├── tx/              # Transaction types, UTXO validation
-│   ├── validator/       # Validator set tracking, signature verification
-│   ├── warp/            # Avalanche Warp Messaging (AWM)
-│   ├── subnet/          # Subnet discovery & chain management
-│   ├── metrics/         # Prometheus metrics & health endpoint
+│   ├── identity/        # TLS cert generation, IP signing, BLS keys
 │   ├── light/           # Light client (headers-only, proof requests)
 │   ├── mempool/         # Transaction mempool
+│   ├── metrics/         # Prometheus metrics & health endpoint
 │   ├── mev/             # MEV engine (V2/V4 AMM, sandwich, arb)
+│   ├── network/         # P2P networking, persistent peer management
+│   ├── proto/           # Protobuf codec (p2p.proto)
+│   ├── rpc/             # JSON-RPC client
+│   ├── snap/            # Snap/1 sync protocol (fast state download)
+│   ├── subnet/          # Subnet discovery & chain management
+│   ├── sync/            # State sync, bootstrap, chain following
+│   ├── tx/              # Transaction types, UTXO validation
+│   ├── txpool/          # Transaction pool (EIP-1559 priority queue)
+│   ├── validator/       # Validator set tracking, signature verification
+│   ├── warp/            # Avalanche Warp Messaging (AWM)
+│   ├── websocket/       # WebSocket subscriptions (newHeads, logs)
 │   ├── types/           # Core types
 │   └── codec/           # Serialization helpers
 ├── crates/
