@@ -13,10 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options,
-    WriteBatch,
-};
+use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
 
 /// Column family names.
 pub const CF_BLOCKS: &str = "blocks";
@@ -219,7 +216,11 @@ impl Database {
     }
 
     /// Get receipt data by block height + tx index.
-    pub fn get_receipt(&self, block_height: u64, tx_index: u32) -> Result<Option<Vec<u8>>, DbError> {
+    pub fn get_receipt(
+        &self,
+        block_height: u64,
+        tx_index: u32,
+    ) -> Result<Option<Vec<u8>>, DbError> {
         let mut key = Vec::with_capacity(12);
         key.extend_from_slice(&block_height.to_be_bytes());
         key.extend_from_slice(&tx_index.to_be_bytes());
@@ -303,9 +304,7 @@ impl Database {
         let cf = self.cf_handle(cf_name);
         self.db
             .iterator_cf(&cf, rocksdb::IteratorMode::Start)
-            .filter_map(|item| {
-                item.ok().map(|(k, v)| (k.to_vec(), v.to_vec()))
-            })
+            .filter_map(|item| item.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
             .collect()
     }
 }
@@ -365,8 +364,8 @@ impl StateTrie {
     /// Uses alloy-trie's `state_root_unsorted` so the result matches the state
     /// root produced by geth / AvalancheGo coreth for the same account set.
     pub fn root_hash(&self) -> [u8; 32] {
-        use alloy_trie::{root::state_root_unsorted, TrieAccount, EMPTY_ROOT_HASH, KECCAK_EMPTY};
         use alloy_primitives::{keccak256, B256, U256};
+        use alloy_trie::{root::state_root_unsorted, TrieAccount, EMPTY_ROOT_HASH, KECCAK_EMPTY};
 
         let entries: Vec<(B256, TrieAccount)> = self
             .accounts
@@ -497,7 +496,9 @@ fn decode_account_rlp(rlp: &[u8]) -> AccountState {
     let mut pos = 0usize;
 
     // Skip list header
-    if pos >= rlp.len() { return AccountState::default(); }
+    if pos >= rlp.len() {
+        return AccountState::default();
+    }
     let first = rlp[pos];
     if first >= 0xf8 {
         let len_bytes = (first - 0xf7) as usize;
@@ -507,13 +508,23 @@ fn decode_account_rlp(rlp: &[u8]) -> AccountState {
     }
 
     fn read_uint_field(data: &[u8], pos: &mut usize) -> u128 {
-        if *pos >= data.len() { return 0; }
+        if *pos >= data.len() {
+            return 0;
+        }
         let b = data[*pos];
-        if b == 0x80 { *pos += 1; return 0; }
-        if b < 0x80 { *pos += 1; return b as u128; }
+        if b == 0x80 {
+            *pos += 1;
+            return 0;
+        }
+        if b < 0x80 {
+            *pos += 1;
+            return b as u128;
+        }
         let len = (b - 0x80) as usize;
         *pos += 1;
-        if *pos + len > data.len() { return 0; }
+        if *pos + len > data.len() {
+            return 0;
+        }
         let mut val = 0u128;
         for &byte in &data[*pos..*pos + len] {
             val = (val << 8) | byte as u128;
@@ -523,7 +534,9 @@ fn decode_account_rlp(rlp: &[u8]) -> AccountState {
     }
 
     fn read_bytes32(data: &[u8], pos: &mut usize) -> [u8; 32] {
-        if *pos >= data.len() { return [0u8; 32]; }
+        if *pos >= data.len() {
+            return [0u8; 32];
+        }
         let b = data[*pos];
         let len = if b >= 0x80 && b < 0xb8 {
             *pos += 1;
@@ -544,12 +557,22 @@ fn decode_account_rlp(rlp: &[u8]) -> AccountState {
     let storage_root = read_bytes32(rlp, &mut pos);
     let code_hash = read_bytes32(rlp, &mut pos);
 
-    AccountState { nonce, balance, storage_root, code_hash }
+    AccountState {
+        nonce,
+        balance,
+        storage_root,
+        code_hash,
+    }
 }
 
 impl Default for AccountState {
     fn default() -> Self {
-        Self { nonce: 0, balance: 0, storage_root: [0u8; 32], code_hash: [0u8; 32] }
+        Self {
+            nonce: 0,
+            balance: 0,
+            storage_root: [0u8; 32],
+            code_hash: [0u8; 32],
+        }
     }
 }
 
@@ -909,7 +932,8 @@ mod tests {
     fn test_many_blocks() {
         let (db, _dir) = Database::open_temp().unwrap();
         for i in 0..100u64 {
-            db.put_block(i, &format!("block_{}", i).into_bytes()).unwrap();
+            db.put_block(i, &format!("block_{}", i).into_bytes())
+                .unwrap();
         }
         for i in 0..100u64 {
             let data = db.get_block(i).unwrap().unwrap();
@@ -925,10 +949,9 @@ mod tests {
         let root = trie.root_hash();
         // Empty MPT root (alloy-trie EMPTY_ROOT_HASH)
         let expected = [
-            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
-            0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
-            0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
-            0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0,
+            0xf8, 0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5,
+            0xe3, 0x63, 0xb4, 0x21,
         ];
         assert_eq!(root, expected);
     }
@@ -939,12 +962,15 @@ mod tests {
         let addr = [0x42u8; 20];
 
         let root_before = trie.root_hash();
-        trie.insert(addr, &AccountState {
-            nonce: 1,
-            balance: 1_000_000,
-            storage_root: [0u8; 32],
-            code_hash: [0u8; 32],
-        });
+        trie.insert(
+            addr,
+            &AccountState {
+                nonce: 1,
+                balance: 1_000_000,
+                storage_root: [0u8; 32],
+                code_hash: [0u8; 32],
+            },
+        );
         let root_after = trie.root_hash();
 
         assert_ne!(root_before, root_after);
@@ -1022,11 +1048,14 @@ mod tests {
         let (db, _dir) = Database::open_temp().unwrap();
 
         // Insert state root at genesis (height 0)
-        db.put_cf(CF_STATE_ROOTS, &0u64.to_be_bytes(), b"genesis_root").unwrap();
+        db.put_cf(CF_STATE_ROOTS, &0u64.to_be_bytes(), b"genesis_root")
+            .unwrap();
         // Insert state root at height 5
-        db.put_cf(CF_STATE_ROOTS, &5u64.to_be_bytes(), b"old_root").unwrap();
+        db.put_cf(CF_STATE_ROOTS, &5u64.to_be_bytes(), b"old_root")
+            .unwrap();
         // Insert state root at height 50
-        db.put_cf(CF_STATE_ROOTS, &50u64.to_be_bytes(), b"recent_root").unwrap();
+        db.put_cf(CF_STATE_ROOTS, &50u64.to_be_bytes(), b"recent_root")
+            .unwrap();
 
         // Prune with current=100, finalized=100, depth=10 → cutoff=90
         let (pruned, _) = pruner.prune_once(&db, 100, 100);
@@ -1035,7 +1064,10 @@ mod tests {
         assert!(pruned >= 1);
 
         // Genesis should still exist
-        assert!(db.get_cf(CF_STATE_ROOTS, &0u64.to_be_bytes()).unwrap().is_some());
+        assert!(db
+            .get_cf(CF_STATE_ROOTS, &0u64.to_be_bytes())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1044,14 +1076,18 @@ mod tests {
         let (db, _dir) = Database::open_temp().unwrap();
 
         // Insert state root at finalized height
-        db.put_cf(CF_STATE_ROOTS, &50u64.to_be_bytes(), b"finalized_root").unwrap();
+        db.put_cf(CF_STATE_ROOTS, &50u64.to_be_bytes(), b"finalized_root")
+            .unwrap();
 
         // Prune with current=100, finalized=50, depth=10 → cutoff=90
         let (pruned, _) = pruner.prune_once(&db, 100, 50);
         assert_eq!(pruned, 0); // finalized height protected
 
         // Should still exist
-        assert!(db.get_cf(CF_STATE_ROOTS, &50u64.to_be_bytes()).unwrap().is_some());
+        assert!(db
+            .get_cf(CF_STATE_ROOTS, &50u64.to_be_bytes())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1060,7 +1096,8 @@ mod tests {
         let (db, _dir) = Database::open_temp().unwrap();
 
         for h in 1u64..20 {
-            db.put_cf(CF_STATE_ROOTS, &h.to_be_bytes(), b"root_data").unwrap();
+            db.put_cf(CF_STATE_ROOTS, &h.to_be_bytes(), b"root_data")
+                .unwrap();
         }
 
         let (pruned, bytes) = pruner.prune_once(&db, 100, 100);

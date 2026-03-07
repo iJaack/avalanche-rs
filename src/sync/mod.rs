@@ -100,7 +100,11 @@ impl StateSummary {
         block_hash.copy_from_slice(&data[8..40]);
         let mut state_root = [0u8; 32];
         state_root.copy_from_slice(&data[40..72]);
-        Some(StateSummary { height, block_hash, state_root })
+        Some(StateSummary {
+            height,
+            block_hash,
+            state_root,
+        })
     }
 }
 
@@ -270,10 +274,7 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
 
     /// Begin the state sync process. Returns messages to send to the given peers.
-    pub async fn start_state_sync(
-        &self,
-        peers: &[NodeId],
-    ) -> Vec<(NodeId, NetworkMessage)> {
+    pub async fn start_state_sync(&self, peers: &[NodeId]) -> Vec<(NodeId, NetworkMessage)> {
         let mut phase = self.phase.write().await;
         *phase = SyncPhase::StateSummaryFrontier;
 
@@ -309,10 +310,7 @@ impl SyncEngine {
     }
 
     /// Begin block bootstrapping. Returns GetAcceptedFrontier messages.
-    pub async fn start_bootstrap(
-        &self,
-        peers: &[NodeId],
-    ) -> Vec<(NodeId, NetworkMessage)> {
+    pub async fn start_bootstrap(&self, peers: &[NodeId]) -> Vec<(NodeId, NetworkMessage)> {
         let mut phase = self.phase.write().await;
         *phase = SyncPhase::AcceptedFrontier;
 
@@ -378,11 +376,7 @@ impl SyncEngine {
     }
 
     /// Handle block data received (Put / Ancestors).
-    pub async fn handle_block_data(
-        &self,
-        block_height: u64,
-        block_data: Vec<u8>,
-    ) {
+    pub async fn handle_block_data(&self, block_height: u64, block_data: Vec<u8>) {
         let mut stats = self.stats.write().await;
         stats.blocks_downloaded += 1;
         stats.bytes_downloaded += block_data.len() as u64;
@@ -396,10 +390,7 @@ impl SyncEngine {
     }
 
     /// Generate GetAncestors requests for needed blocks.
-    pub async fn generate_fetch_requests(
-        &self,
-        peers: &[NodeId],
-    ) -> Vec<(NodeId, NetworkMessage)> {
+    pub async fn generate_fetch_requests(&self, peers: &[NodeId]) -> Vec<(NodeId, NetworkMessage)> {
         if peers.is_empty() {
             return vec![];
         }
@@ -558,7 +549,9 @@ impl StateSyncEngine {
         }
         let mut counts: HashMap<[u8; 32], (usize, StateSummary)> = HashMap::new();
         for summary in summaries.values() {
-            let entry = counts.entry(summary.state_root).or_insert((0, summary.clone()));
+            let entry = counts
+                .entry(summary.state_root)
+                .or_insert((0, summary.clone()));
             entry.0 += 1;
         }
         counts
@@ -678,7 +671,7 @@ impl StateSyncEngine {
     /// Verify that the reconstructed trie matches the target state root
     /// using alloy-trie MPT computation.
     pub async fn verify_state_root(&self) -> bool {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let target = match *self.state_root.read().await {
             Some(root) => root,
@@ -750,11 +743,7 @@ mod tests {
     }
 
     fn test_peers() -> Vec<NodeId> {
-        vec![
-            NodeId([1u8; 20]),
-            NodeId([2u8; 20]),
-            NodeId([3u8; 20]),
-        ]
+        vec![NodeId([1u8; 20]), NodeId([2u8; 20]), NodeId([3u8; 20])]
     }
 
     #[tokio::test]
@@ -781,7 +770,10 @@ mod tests {
         assert_eq!(engine.phase().await, SyncPhase::StateSummaryFrontier);
 
         for (_, msg) in &messages {
-            assert!(matches!(msg, NetworkMessage::GetStateSummaryFrontier { .. }));
+            assert!(matches!(
+                msg,
+                NetworkMessage::GetStateSummaryFrontier { .. }
+            ));
         }
     }
 
@@ -830,9 +822,7 @@ mod tests {
         let config = SyncConfig::default();
         let engine = SyncEngine::new(config);
 
-        engine
-            .handle_block_data(100, vec![0xDE; 256])
-            .await;
+        engine.handle_block_data(100, vec![0xDE; 256]).await;
 
         let stats = engine.stats().await;
         assert_eq!(stats.blocks_downloaded, 1);
@@ -903,8 +893,14 @@ mod tests {
         assert_eq!(format!("{}", SyncPhase::Executing), "executing");
         assert_eq!(format!("{}", SyncPhase::Synced), "synced");
         assert_eq!(format!("{}", SyncPhase::Following), "following");
-        assert_eq!(format!("{}", SyncPhase::DownloadingTrieNodes), "downloading_trie_nodes");
-        assert_eq!(format!("{}", SyncPhase::VerifyingStateRoot), "verifying_state_root");
+        assert_eq!(
+            format!("{}", SyncPhase::DownloadingTrieNodes),
+            "downloading_trie_nodes"
+        );
+        assert_eq!(
+            format!("{}", SyncPhase::VerifyingStateRoot),
+            "verifying_state_root"
+        );
     }
 
     #[tokio::test]
@@ -962,9 +958,7 @@ mod tests {
         let engine = SyncEngine::new(config);
 
         let peer = NodeId([1; 20]);
-        engine
-            .handle_accepted(&peer, &[BlockId([1; 32])])
-            .await;
+        engine.handle_accepted(&peer, &[BlockId([1; 32])]).await;
 
         let messages = engine.generate_fetch_requests(&[]).await;
         assert!(messages.is_empty());
@@ -1031,7 +1025,10 @@ mod tests {
     #[tokio::test]
     async fn test_state_sync_engine_creation() {
         let engine = StateSyncEngine::new();
-        assert_eq!(engine.current_phase().await, SyncPhase::StateSummaryFrontier);
+        assert_eq!(
+            engine.current_phase().await,
+            SyncPhase::StateSummaryFrontier
+        );
         assert!(engine.state_root().await.is_none());
         assert!(!engine.is_complete().await);
     }
@@ -1061,7 +1058,10 @@ mod tests {
         engine.set_target_state_root(state_root).await;
 
         assert_eq!(engine.state_root().await, Some(state_root));
-        assert_eq!(engine.current_phase().await, SyncPhase::AcceptedStateSummary);
+        assert_eq!(
+            engine.current_phase().await,
+            SyncPhase::AcceptedStateSummary
+        );
     }
 
     #[tokio::test]
@@ -1090,9 +1090,15 @@ mod tests {
         };
 
         // 2 peers agree on summary_a, 1 on summary_b
-        engine.handle_state_summary(NodeId([1; 20]), summary_a.clone()).await;
-        engine.handle_state_summary(NodeId([2; 20]), summary_a.clone()).await;
-        engine.handle_state_summary(NodeId([3; 20]), summary_b).await;
+        engine
+            .handle_state_summary(NodeId([1; 20]), summary_a.clone())
+            .await;
+        engine
+            .handle_state_summary(NodeId([2; 20]), summary_a.clone())
+            .await;
+        engine
+            .handle_state_summary(NodeId([3; 20]), summary_b)
+            .await;
 
         let best = engine.best_summary().await.unwrap();
         assert_eq!(best.state_root, [0xAA; 32]);
@@ -1121,7 +1127,10 @@ mod tests {
         let messages = engine.generate_trie_requests(&peers, &chain_id, 10).await;
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(engine.current_phase().await, SyncPhase::DownloadingTrieNodes);
+        assert_eq!(
+            engine.current_phase().await,
+            SyncPhase::DownloadingTrieNodes
+        );
 
         for (_, msg) in &messages {
             assert!(matches!(msg, NetworkMessage::AppRequest { .. }));
@@ -1147,7 +1156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_sync_verify_trie_node_hashes() {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let engine = StateSyncEngine::new();
         engine.set_target_state_root([0xFF; 32]).await;
@@ -1175,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_sync_flush_to_db() {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let engine = StateSyncEngine::new();
 
@@ -1216,10 +1225,16 @@ mod tests {
         let node_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let node_hash = [0x42u8; 32];
 
-        engine.store_trie_node_persistent(node_hash, node_bytes.clone(), &db).await.unwrap();
+        engine
+            .store_trie_node_persistent(node_hash, node_bytes.clone(), &db)
+            .await
+            .unwrap();
 
         // Check both in-memory and DB
-        assert_eq!(engine.get_trie_node(&node_hash).await, Some(node_bytes.clone()));
+        assert_eq!(
+            engine.get_trie_node(&node_hash).await,
+            Some(node_bytes.clone())
+        );
         assert_eq!(db.get_trie_node(&node_hash).unwrap().unwrap(), node_bytes);
     }
 

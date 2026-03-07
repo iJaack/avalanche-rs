@@ -29,7 +29,7 @@ impl Id {
 
     /// Compute the SHA-256 hash of the given data and return as an ID.
     pub fn from_sha256(data: &[u8]) -> Self {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash = Sha256::digest(data);
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&hash);

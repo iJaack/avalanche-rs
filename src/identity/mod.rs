@@ -11,12 +11,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use k256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
-use k256::ecdsa::signature::Verifier;
-use rand::Rng;
 use blst::min_pk::SecretKey as BlsSecretKey;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use k256::ecdsa::signature::Verifier;
+use k256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
+use rand::Rng;
 use ring::rand::SystemRandom;
+use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use sha2::{Digest, Sha256};
 
 use crate::network::NodeId;
@@ -64,7 +64,8 @@ impl NodeIdentity {
         let params = rcgen::CertificateParams::new(vec!["avalanche-node".into()])
             .map_err(|e| IdentityError::CertGeneration(e.to_string()))?;
 
-        let cert = params.self_signed(&rcgen_key)
+        let cert = params
+            .self_signed(&rcgen_key)
             .map_err(|e| IdentityError::CertGeneration(e.to_string()))?;
 
         let cert_der = cert.der().to_vec();
@@ -75,8 +76,8 @@ impl NodeIdentity {
         // Generate BLS key for proof-of-possession
         let mut bls_ikm = [0u8; 32];
         rand::thread_rng().fill(&mut bls_ikm);
-        let bls_sk = BlsSecretKey::key_gen(&bls_ikm, &[])
-            .expect("BLS key generation should not fail");
+        let bls_sk =
+            BlsSecretKey::key_gen(&bls_ikm, &[]).expect("BLS key generation should not fail");
         let bls_secret_key = bls_sk.to_bytes().to_vec();
 
         Ok(Self {
@@ -91,10 +92,9 @@ impl NodeIdentity {
 
     /// Load identity from PEM cert + key files on disk.
     pub fn load_from_files(cert_path: &Path, key_path: &Path) -> Result<Self, IdentityError> {
-        let cert_pem = std::fs::read(cert_path)
-            .map_err(|e| IdentityError::IoError(e.to_string()))?;
-        let key_pem = std::fs::read(key_path)
-            .map_err(|e| IdentityError::IoError(e.to_string()))?;
+        let cert_pem =
+            std::fs::read(cert_path).map_err(|e| IdentityError::IoError(e.to_string()))?;
+        let key_pem = std::fs::read(key_path).map_err(|e| IdentityError::IoError(e.to_string()))?;
 
         Self::load_from_pem(&cert_pem, &key_pem)
     }
@@ -125,8 +125,7 @@ impl NodeIdentity {
 
         let mut bls_ikm = [0u8; 32];
         rand::thread_rng().fill(&mut bls_ikm);
-        let bls_sk = BlsSecretKey::key_gen(&bls_ikm, &[])
-            .expect("BLS key generation");
+        let bls_sk = BlsSecretKey::key_gen(&bls_ikm, &[]).expect("BLS key generation");
         let bls_secret_key = bls_sk.to_bytes().to_vec();
 
         Ok(Self {
@@ -177,23 +176,22 @@ impl NodeIdentity {
 
         // Sign the hash with the TLS ECDSA P-256 key using ring
         let rng = SystemRandom::new();
-        let key_pair = EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_ASN1_SIGNING,
-            &self.tls_key_pkcs8,
-            &rng,
-        ).expect("valid TLS key");
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &self.tls_key_pkcs8, &rng)
+                .expect("valid TLS key");
 
         // ring's sign() takes the raw message and does SHA-256 internally,
         // but AvalancheGo signs SHA-256(bytes) directly.
         // We need to sign the hash, not the original bytes.
-        // Use ECDSA_P256_SHA256_FIXED_SIGNING to sign pre-hashed data... 
+        // Use ECDSA_P256_SHA256_FIXED_SIGNING to sign pre-hashed data...
         // Actually, ring doesn't support signing pre-hashed data easily.
         // AvalancheGo: hashing.ComputeHash256(ipBytes) then signs the hash.
         // Go's ecdsa.Sign uses SHA-256 internally on the hash again? No.
         // Go's ecdsa.SignASN1(rand, privKey, hash) signs the hash directly.
         // ring's key_pair.sign(msg) does hash(msg) then signs.
         // So we need to pass the raw bytes to ring, not the hash!
-        key_pair.sign(&rng, &bytes)
+        key_pair
+            .sign(&rng, &bytes)
             .expect("signing should not fail")
             .as_ref()
             .to_vec()
@@ -214,8 +212,7 @@ impl NodeIdentity {
         bytes.extend_from_slice(&port.to_be_bytes());
         bytes.extend_from_slice(&timestamp.to_be_bytes());
 
-        let sk = BlsSecretKey::from_bytes(&self.bls_secret_key)
-            .expect("valid BLS secret key");
+        let sk = BlsSecretKey::from_bytes(&self.bls_secret_key).expect("valid BLS secret key");
         // AvalancheGo uses CiphersuiteProofOfPossession DST for ip_bls_sig
         let sig = sk.sign(&bytes, b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_", &[]);
         sig.compress().to_vec()
@@ -225,10 +222,13 @@ impl NodeIdentity {
     ///
     /// Used by validators to sign newly built blocks before broadcasting.
     pub fn sign_block_bls(&self, block_id: &[u8]) -> Vec<u8> {
-        let sk = BlsSecretKey::from_bytes(&self.bls_secret_key)
-            .expect("valid BLS secret key");
+        let sk = BlsSecretKey::from_bytes(&self.bls_secret_key).expect("valid BLS secret key");
         // Use the standard DST for message signing (distinct from proof-of-possession)
-        let sig = sk.sign(block_id, b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_", &[]);
+        let sig = sk.sign(
+            block_id,
+            b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_",
+            &[],
+        );
         sig.compress().to_vec()
     }
 
@@ -273,8 +273,10 @@ impl NodeIdentity {
     /// Uses dangerous verifier that accepts any cert (we verify NodeID ourselves).
     #[cfg(feature = "p2p")]
     pub fn tls_client_config(&self) -> Result<Arc<rustls::ClientConfig>, IdentityError> {
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-        use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
         use rustls::{DigitallySignedStruct, SignatureScheme};
 
         // Custom verifier: accept any cert (we verify NodeID ourselves after handshake)

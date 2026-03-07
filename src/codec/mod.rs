@@ -9,7 +9,8 @@ pub fn encode<T: serde::Serialize>(data: &T) -> crate::Result<Vec<u8>> {
 
 /// Decode bytes to type
 pub fn decode<T: for<'de> serde::Deserialize<'de>>(data: &[u8]) -> crate::Result<T> {
-    serde_json::from_slice(data).map_err(|e| crate::AvalancheError::DeserializationError(e.to_string()))
+    serde_json::from_slice(data)
+        .map_err(|e| crate::AvalancheError::DeserializationError(e.to_string()))
 }
 
 #[cfg(test)]

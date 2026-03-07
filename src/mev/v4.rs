@@ -27,23 +27,37 @@ pub mod v4_selectors {
     pub const EXECUTE_WITH_DEADLINE: [u8; 4] = [0x36, 0x93, 0xd8, 0xa0];
 
     pub fn is_v4_swap(selector: &[u8]) -> bool {
-        if selector.len() < 4 { return false; }
+        if selector.len() < 4 {
+            return false;
+        }
         let sel = [selector[0], selector[1], selector[2], selector[3]];
         matches!(sel, SWAP | EXECUTE | EXECUTE_WITH_DEADLINE)
     }
 
     pub fn is_v4_liquidity(selector: &[u8]) -> bool {
-        if selector.len() < 4 { return false; }
+        if selector.len() < 4 {
+            return false;
+        }
         let sel = [selector[0], selector[1], selector[2], selector[3]];
         matches!(sel, MODIFY_LIQUIDITY | DONATE)
     }
 
     pub fn is_v4_action(selector: &[u8]) -> bool {
-        if selector.len() < 4 { return false; }
+        if selector.len() < 4 {
+            return false;
+        }
         let sel = [selector[0], selector[1], selector[2], selector[3]];
-        matches!(sel,
-            INITIALIZE | SWAP | MODIFY_LIQUIDITY | DONATE |
-            TAKE | SETTLE | LOCK | EXECUTE | EXECUTE_WITH_DEADLINE
+        matches!(
+            sel,
+            INITIALIZE
+                | SWAP
+                | MODIFY_LIQUIDITY
+                | DONATE
+                | TAKE
+                | SETTLE
+                | LOCK
+                | EXECUTE
+                | EXECUTE_WITH_DEADLINE
         )
     }
 }
@@ -58,9 +72,9 @@ pub mod v4_selectors {
 pub struct PoolKey {
     pub currency0: String,
     pub currency1: String,
-    pub fee: u32,          // fee in hundredths of a bip (e.g., 3000 = 0.30%)
+    pub fee: u32, // fee in hundredths of a bip (e.g., 3000 = 0.30%)
     pub tick_spacing: i32,
-    pub hooks: String,     // hook contract address (0x0 = no hooks)
+    pub hooks: String, // hook contract address (0x0 = no hooks)
 }
 
 impl PoolKey {
@@ -69,7 +83,13 @@ impl PoolKey {
         let t0 = token0.to_lowercase();
         let t1 = token1.to_lowercase();
         let (c0, c1) = if t0 < t1 { (t0, t1) } else { (t1, t0) };
-        Self { currency0: c0, currency1: c1, fee, tick_spacing, hooks: hooks.to_string() }
+        Self {
+            currency0: c0,
+            currency1: c1,
+            fee,
+            tick_spacing,
+            hooks: hooks.to_string(),
+        }
     }
 
     /// No hooks attached
@@ -118,24 +138,24 @@ impl HookFlags {
     /// Decode flags from hook contract address (V4 encodes permissions in address bits)
     pub fn from_address(addr: &str) -> Self {
         let addr_clean = addr.trim_start_matches("0x");
-        let flags_byte = u16::from_str_radix(&addr_clean[..4.min(addr_clean.len())], 16)
-            .unwrap_or(0);
+        let flags_byte =
+            u16::from_str_radix(&addr_clean[..4.min(addr_clean.len())], 16).unwrap_or(0);
 
         Self {
-            before_initialize:                    flags_byte & (1 << 13) != 0,
-            after_initialize:                     flags_byte & (1 << 12) != 0,
-            before_add_liquidity:                 flags_byte & (1 << 11) != 0,
-            after_add_liquidity:                  flags_byte & (1 << 10) != 0,
-            before_remove_liquidity:              flags_byte & (1 << 9)  != 0,
-            after_remove_liquidity:               flags_byte & (1 << 8)  != 0,
-            before_swap:                          flags_byte & (1 << 7)  != 0,
-            after_swap:                           flags_byte & (1 << 6)  != 0,
-            before_donate:                        flags_byte & (1 << 5)  != 0,
-            after_donate:                         flags_byte & (1 << 4)  != 0,
-            before_swap_returns_delta:            flags_byte & (1 << 3)  != 0,
-            after_swap_returns_delta:             flags_byte & (1 << 2)  != 0,
-            after_add_liquidity_returns_delta:    flags_byte & (1 << 1)  != 0,
-            after_remove_liquidity_returns_delta: flags_byte & 1         != 0,
+            before_initialize: flags_byte & (1 << 13) != 0,
+            after_initialize: flags_byte & (1 << 12) != 0,
+            before_add_liquidity: flags_byte & (1 << 11) != 0,
+            after_add_liquidity: flags_byte & (1 << 10) != 0,
+            before_remove_liquidity: flags_byte & (1 << 9) != 0,
+            after_remove_liquidity: flags_byte & (1 << 8) != 0,
+            before_swap: flags_byte & (1 << 7) != 0,
+            after_swap: flags_byte & (1 << 6) != 0,
+            before_donate: flags_byte & (1 << 5) != 0,
+            after_donate: flags_byte & (1 << 4) != 0,
+            before_swap_returns_delta: flags_byte & (1 << 3) != 0,
+            after_swap_returns_delta: flags_byte & (1 << 2) != 0,
+            after_add_liquidity_returns_delta: flags_byte & (1 << 1) != 0,
+            after_remove_liquidity_returns_delta: flags_byte & 1 != 0,
         }
     }
 
@@ -167,13 +187,20 @@ impl HookFlags {
     /// Count active hooks
     pub fn active_count(&self) -> u32 {
         let bools = [
-            self.before_initialize, self.after_initialize,
-            self.before_add_liquidity, self.after_add_liquidity,
-            self.before_remove_liquidity, self.after_remove_liquidity,
-            self.before_swap, self.after_swap,
-            self.before_donate, self.after_donate,
-            self.before_swap_returns_delta, self.after_swap_returns_delta,
-            self.after_add_liquidity_returns_delta, self.after_remove_liquidity_returns_delta,
+            self.before_initialize,
+            self.after_initialize,
+            self.before_add_liquidity,
+            self.after_add_liquidity,
+            self.before_remove_liquidity,
+            self.after_remove_liquidity,
+            self.before_swap,
+            self.after_swap,
+            self.before_donate,
+            self.after_donate,
+            self.before_swap_returns_delta,
+            self.after_swap_returns_delta,
+            self.after_add_liquidity_returns_delta,
+            self.after_remove_liquidity_returns_delta,
         ];
         bools.iter().filter(|&&b| b).count() as u32
     }
@@ -241,23 +268,19 @@ impl HookArchetype {
             return HookArchetype::MevCapture;
         }
         // Dynamic fee: before_swap (adjusts fee) without delta
-        if flags.before_swap && !flags.before_swap_returns_delta
-            && !flags.after_swap {
+        if flags.before_swap && !flags.before_swap_returns_delta && !flags.after_swap {
             return HookArchetype::DynamicFee;
         }
         // Oracle: after_swap only (updates price)
-        if flags.after_swap && !flags.before_swap
-            && !flags.after_swap_returns_delta {
+        if flags.after_swap && !flags.before_swap && !flags.after_swap_returns_delta {
             return HookArchetype::Oracle;
         }
         // TWAMM: both before and after swap + liquidity hooks
-        if flags.before_swap && flags.after_swap
-            && flags.before_add_liquidity {
+        if flags.before_swap && flags.after_swap && flags.before_add_liquidity {
             return HookArchetype::Twamm;
         }
         // Limit order: after_swap + modify liquidity hooks
-        if flags.after_swap && flags.after_add_liquidity
-            && flags.after_remove_liquidity {
+        if flags.after_swap && flags.after_add_liquidity && flags.after_remove_liquidity {
             return HookArchetype::LimitOrder;
         }
         HookArchetype::Custom(hook_address.to_string())
@@ -266,13 +289,13 @@ impl HookArchetype {
     /// How does this archetype affect sandwich profitability?
     pub fn sandwich_modifier(&self) -> f64 {
         match self {
-            HookArchetype::DynamicFee => 0.7,    // fee may spike, reduce expected profit
-            HookArchetype::Twamm => 0.9,          // minor interference from pending orders
-            HookArchetype::LimitOrder => 0.85,     // limit orders can absorb price impact
-            HookArchetype::Oracle => 1.0,          // no effect on execution
-            HookArchetype::MevCapture => 0.1,      // hook captures most of our profit
-            HookArchetype::NoHook => 1.0,          // no hooks = full pass-through
-            HookArchetype::Custom(_) => 0.5,       // unknown = assume 50% reduction
+            HookArchetype::DynamicFee => 0.7, // fee may spike, reduce expected profit
+            HookArchetype::Twamm => 0.9,      // minor interference from pending orders
+            HookArchetype::LimitOrder => 0.85, // limit orders can absorb price impact
+            HookArchetype::Oracle => 1.0,     // no effect on execution
+            HookArchetype::MevCapture => 0.1, // hook captures most of our profit
+            HookArchetype::NoHook => 1.0,     // no hooks = full pass-through
+            HookArchetype::Custom(_) => 0.5,  // unknown = assume 50% reduction
         }
     }
 }
@@ -308,9 +331,13 @@ impl V4PoolState {
         let hook_flags = HookFlags::from_address(&key.hooks);
         let hook_archetype = HookArchetype::classify(&hook_flags, &key.hooks);
         Self {
-            key, sqrt_price_x96, liquidity, tick,
+            key,
+            sqrt_price_x96,
+            liquidity,
+            tick,
             fee_protocol: 0,
-            hook_flags, hook_archetype,
+            hook_flags,
+            hook_archetype,
             last_updated: Instant::now(),
             active_ticks: vec![],
         }
@@ -368,15 +395,21 @@ impl V4PoolState {
     fn would_cross_tick(&self, new_sqrt_price: f64, zero_for_one: bool) -> bool {
         let new_tick = self.sqrt_price_to_tick(new_sqrt_price);
         if zero_for_one {
-            self.active_ticks.iter().any(|t| t.tick <= self.tick && t.tick > new_tick)
+            self.active_ticks
+                .iter()
+                .any(|t| t.tick <= self.tick && t.tick > new_tick)
         } else {
-            self.active_ticks.iter().any(|t| t.tick > self.tick && t.tick <= new_tick)
+            self.active_ticks
+                .iter()
+                .any(|t| t.tick > self.tick && t.tick <= new_tick)
         }
     }
 
     fn sqrt_price_to_tick(&self, sqrt_price: f64) -> i32 {
         // tick = log(sqrt_price^2) / log(1.0001)
-        if sqrt_price <= 0.0 { return i32::MIN; }
+        if sqrt_price <= 0.0 {
+            return i32::MIN;
+        }
         let price = sqrt_price * sqrt_price;
         (price.ln() / 1.0001f64.ln()) as i32
     }
@@ -417,19 +450,18 @@ impl V4PoolState {
 
         // Step 3: Simulate pool state after frontrun (update sqrt price)
         let mut pool_after_frontrun = self.clone();
-        pool_after_frontrun.sqrt_price_x96 = U256::from_u128(
-            (frontrun_est.new_sqrt_price * 2.0f64.powi(96)) as u128
-        );
-        pool_after_frontrun.tick = pool_after_frontrun.sqrt_price_to_tick(frontrun_est.new_sqrt_price);
+        pool_after_frontrun.sqrt_price_x96 =
+            U256::from_u128((frontrun_est.new_sqrt_price * 2.0f64.powi(96)) as u128);
+        pool_after_frontrun.tick =
+            pool_after_frontrun.sqrt_price_to_tick(frontrun_est.new_sqrt_price);
 
         // Step 4: Victim swap at worse price
         let victim_est = pool_after_frontrun.estimate_output(victim_amount, zero_for_one);
 
         // Step 5: Pool state after victim
         let mut pool_after_victim = pool_after_frontrun.clone();
-        pool_after_victim.sqrt_price_x96 = U256::from_u128(
-            (victim_est.new_sqrt_price * 2.0f64.powi(96)) as u128
-        );
+        pool_after_victim.sqrt_price_x96 =
+            U256::from_u128((victim_est.new_sqrt_price * 2.0f64.powi(96)) as u128);
         pool_after_victim.tick = pool_after_victim.sqrt_price_to_tick(victim_est.new_sqrt_price);
 
         // Step 6: Backrun (reverse direction)
@@ -440,9 +472,7 @@ impl V4PoolState {
 
         // Apply hook modifier to final profit
         let hook_mod = self.hook_archetype.sandwich_modifier();
-        let adjusted_profit = U256::from_u128(
-            (profit.to_f64() * hook_mod).max(0.0) as u128
-        );
+        let adjusted_profit = U256::from_u128((profit.to_f64() * hook_mod).max(0.0) as u128);
 
         V4SandwichResult {
             profitable: !adjusted_profit.is_zero(),
@@ -533,14 +563,19 @@ impl V4PoolScanner {
             self.hooks_mev_capture += 1;
         }
 
-        self.classified_hooks.insert(key.hooks.clone(), (flags.clone(), archetype.clone()));
-        self.pools.insert(key.clone(), V4PoolState::new(key, sqrt_price_x96, liquidity, tick));
+        self.classified_hooks
+            .insert(key.hooks.clone(), (flags.clone(), archetype.clone()));
+        self.pools.insert(
+            key.clone(),
+            V4PoolState::new(key, sqrt_price_x96, liquidity, tick),
+        );
         self.pools_scanned += 1;
     }
 
     /// Get all pools safe for sandwich MEV
     pub fn sandwich_safe_pools(&self) -> Vec<&V4PoolState> {
-        self.pools.values()
+        self.pools
+            .values()
             .filter(|p| p.is_sandwich_safe())
             .collect()
     }
@@ -551,31 +586,51 @@ impl V4PoolScanner {
         let t1 = token1.to_lowercase();
         let (c0, c1) = if t0 < t1 { (t0, t1) } else { (t1, t0) };
 
-        self.pools.values()
+        self.pools
+            .values()
             .filter(|p| p.key.currency0 == c0 && p.key.currency1 == c1)
             .collect()
     }
 
     /// Find best arbitrage between V4 pools (same pair, different fees/hooks)
-    pub fn find_v4_arb(&self, token0: &str, token1: &str, amount: U256) -> Option<V4ArbOpportunity> {
+    pub fn find_v4_arb(
+        &self,
+        token0: &str,
+        token1: &str,
+        amount: U256,
+    ) -> Option<V4ArbOpportunity> {
         let pools = self.pools_for_pair(token0, token1);
-        if pools.len() < 2 { return None; }
+        if pools.len() < 2 {
+            return None;
+        }
 
         let mut best_buy: Option<(&V4PoolState, f64)> = None;
         let mut best_sell: Option<(&V4PoolState, f64)> = None;
 
         for pool in &pools {
-            if !pool.is_sandwich_safe() { continue; }
+            if !pool.is_sandwich_safe() {
+                continue;
+            }
             let price = pool.price();
-            if price <= 0.0 { continue; }
+            if price <= 0.0 {
+                continue;
+            }
 
             match &best_buy {
                 None => best_buy = Some((pool, price)),
-                Some((_, bp)) => if price < *bp { best_buy = Some((pool, price)); }
+                Some((_, bp)) => {
+                    if price < *bp {
+                        best_buy = Some((pool, price));
+                    }
+                }
             }
             match &best_sell {
                 None => best_sell = Some((pool, price)),
-                Some((_, sp)) => if price > *sp { best_sell = Some((pool, price)); }
+                Some((_, sp)) => {
+                    if price > *sp {
+                        best_sell = Some((pool, price));
+                    }
+                }
             }
         }
 
@@ -587,7 +642,9 @@ impl V4PoolScanner {
         }
 
         let spread_bps = ((sell_price - buy_price) / buy_price) * 10_000.0;
-        if spread_bps < 10.0 { return None; } // min 10 bps
+        if spread_bps < 10.0 {
+            return None;
+        } // min 10 bps
 
         let est_profit = amount.to_f64() * (spread_bps / 10_000.0);
 
@@ -631,7 +688,9 @@ mod tests {
     fn test_v4_swap_selectors() {
         assert!(v4_selectors::is_v4_swap(&v4_selectors::SWAP));
         assert!(v4_selectors::is_v4_swap(&v4_selectors::EXECUTE));
-        assert!(v4_selectors::is_v4_swap(&v4_selectors::EXECUTE_WITH_DEADLINE));
+        assert!(v4_selectors::is_v4_swap(
+            &v4_selectors::EXECUTE_WITH_DEADLINE
+        ));
         assert!(!v4_selectors::is_v4_swap(&v4_selectors::INITIALIZE));
         assert!(!v4_selectors::is_v4_swap(&v4_selectors::DONATE));
         assert!(!v4_selectors::is_v4_swap(&[0, 0, 0])); // too short
@@ -639,7 +698,9 @@ mod tests {
 
     #[test]
     fn test_v4_liquidity_selectors() {
-        assert!(v4_selectors::is_v4_liquidity(&v4_selectors::MODIFY_LIQUIDITY));
+        assert!(v4_selectors::is_v4_liquidity(
+            &v4_selectors::MODIFY_LIQUIDITY
+        ));
         assert!(v4_selectors::is_v4_liquidity(&v4_selectors::DONATE));
         assert!(!v4_selectors::is_v4_liquidity(&v4_selectors::SWAP));
     }
@@ -647,14 +708,22 @@ mod tests {
     #[test]
     fn test_v4_all_actions() {
         let actions = [
-            v4_selectors::INITIALIZE, v4_selectors::SWAP,
-            v4_selectors::MODIFY_LIQUIDITY, v4_selectors::DONATE,
-            v4_selectors::TAKE, v4_selectors::SETTLE,
-            v4_selectors::LOCK, v4_selectors::EXECUTE,
+            v4_selectors::INITIALIZE,
+            v4_selectors::SWAP,
+            v4_selectors::MODIFY_LIQUIDITY,
+            v4_selectors::DONATE,
+            v4_selectors::TAKE,
+            v4_selectors::SETTLE,
+            v4_selectors::LOCK,
+            v4_selectors::EXECUTE,
             v4_selectors::EXECUTE_WITH_DEADLINE,
         ];
         for a in &actions {
-            assert!(v4_selectors::is_v4_action(a), "Should be a V4 action: {:?}", a);
+            assert!(
+                v4_selectors::is_v4_action(a),
+                "Should be a V4 action: {:?}",
+                a
+            );
         }
         assert!(!v4_selectors::is_v4_action(&[0xFF, 0xFF, 0xFF, 0xFF]));
     }
@@ -670,7 +739,13 @@ mod tests {
 
     #[test]
     fn test_pool_key_no_hooks() {
-        let k = PoolKey::new("A", "B", 3000, 60, "0x0000000000000000000000000000000000000000");
+        let k = PoolKey::new(
+            "A",
+            "B",
+            3000,
+            60,
+            "0x0000000000000000000000000000000000000000",
+        );
         assert!(!k.has_hooks());
         let k2 = PoolKey::new("A", "B", 3000, 60, "0x0");
         assert!(!k2.has_hooks());
@@ -693,7 +768,10 @@ mod tests {
     fn test_pool_key_native() {
         let k = PoolKey::new(
             "0x0000000000000000000000000000000000000000",
-            tokens::USDC, 3000, 60, "0x0",
+            tokens::USDC,
+            3000,
+            60,
+            "0x0",
         );
         assert!(k.is_native_pair());
     }
@@ -906,13 +984,23 @@ mod tests {
         let mut scanner = V4PoolScanner::new();
 
         // Pool with before_swap hook
-        let key1 = PoolKey::new(tokens::WAVAX, tokens::USDC, 3000, 60,
-            "0x0080000000000000000000000000000000000000");
+        let key1 = PoolKey::new(
+            tokens::WAVAX,
+            tokens::USDC,
+            3000,
+            60,
+            "0x0080000000000000000000000000000000000000",
+        );
         scanner.add_pool(key1, U256::from_u128(1_000_000), 1_000_000, 0);
 
         // Pool with MEV capture hook
-        let key2 = PoolKey::new(tokens::WAVAX, tokens::USDC, 500, 10,
-            "0x0088000000000000000000000000000000000000");
+        let key2 = PoolKey::new(
+            tokens::WAVAX,
+            tokens::USDC,
+            500,
+            10,
+            "0x0088000000000000000000000000000000000000",
+        );
         scanner.add_pool(key2, U256::from_u128(1_000_000), 1_000_000, 0);
 
         // No-hook pool
@@ -933,8 +1021,13 @@ mod tests {
         scanner.add_pool(k1, U256::from_u128(1_000_000), 1_000_000, 0);
 
         // Unsafe pool (MEV capture)
-        let k2 = PoolKey::new(tokens::WAVAX, tokens::USDC, 500, 10,
-            "0x0088000000000000000000000000000000000000");
+        let k2 = PoolKey::new(
+            tokens::WAVAX,
+            tokens::USDC,
+            500,
+            10,
+            "0x0088000000000000000000000000000000000000",
+        );
         scanner.add_pool(k2, U256::from_u128(1_000_000), 1_000_000, 0);
 
         let safe = scanner.sandwich_safe_pools();
@@ -988,7 +1081,11 @@ mod tests {
         scanner.add_pool(k1, sqrt, 1_000_000_000_000_000_000, 0);
         scanner.add_pool(k2, sqrt, 1_000_000_000_000_000_000, 0);
 
-        let arb = scanner.find_v4_arb(tokens::WAVAX, tokens::USDC, U256::from_u128(10 * 10u128.pow(18)));
+        let arb = scanner.find_v4_arb(
+            tokens::WAVAX,
+            tokens::USDC,
+            U256::from_u128(10 * 10u128.pow(18)),
+        );
         assert!(arb.is_none(), "Same price pools should yield no arb");
     }
 
@@ -1003,7 +1100,11 @@ mod tests {
         scanner.add_pool(k1, sqrt_low, 1_000_000_000_000_000_000, 0);
         scanner.add_pool(k2, sqrt_high, 1_000_000_000_000_000_000, 0);
 
-        let arb = scanner.find_v4_arb(tokens::WAVAX, tokens::USDC, U256::from_u128(10 * 10u128.pow(18)));
+        let arb = scanner.find_v4_arb(
+            tokens::WAVAX,
+            tokens::USDC,
+            U256::from_u128(10 * 10u128.pow(18)),
+        );
         assert!(arb.is_some(), "Different price pools should yield arb");
         let arb = arb.unwrap();
         assert!(arb.spread_bps > 10.0);
@@ -1014,14 +1115,38 @@ mod tests {
     fn test_find_v4_arb_skips_unsafe_pools() {
         let mut scanner = V4PoolScanner::new();
         // Both pools have MEV capture hooks — no safe pools
-        let k1 = PoolKey::new(tokens::WAVAX, tokens::USDC, 3000, 60,
-            "0x0088000000000000000000000000000000000000");
-        let k2 = PoolKey::new(tokens::WAVAX, tokens::USDC, 500, 10,
-            "0x0088000000000000000000000000000000000001");
-        scanner.add_pool(k1, U256::from_u128(300_000_000_000_000_000_000_000_000_000u128), 1_000_000_000_000_000_000, 0);
-        scanner.add_pool(k2, U256::from_u128(400_000_000_000_000_000_000_000_000_000u128), 1_000_000_000_000_000_000, 0);
+        let k1 = PoolKey::new(
+            tokens::WAVAX,
+            tokens::USDC,
+            3000,
+            60,
+            "0x0088000000000000000000000000000000000000",
+        );
+        let k2 = PoolKey::new(
+            tokens::WAVAX,
+            tokens::USDC,
+            500,
+            10,
+            "0x0088000000000000000000000000000000000001",
+        );
+        scanner.add_pool(
+            k1,
+            U256::from_u128(300_000_000_000_000_000_000_000_000_000u128),
+            1_000_000_000_000_000_000,
+            0,
+        );
+        scanner.add_pool(
+            k2,
+            U256::from_u128(400_000_000_000_000_000_000_000_000_000u128),
+            1_000_000_000_000_000_000,
+            0,
+        );
 
-        let arb = scanner.find_v4_arb(tokens::WAVAX, tokens::USDC, U256::from_u128(10 * 10u128.pow(18)));
+        let arb = scanner.find_v4_arb(
+            tokens::WAVAX,
+            tokens::USDC,
+            U256::from_u128(10 * 10u128.pow(18)),
+        );
         assert!(arb.is_none(), "Should skip unsafe pools");
     }
 
@@ -1029,9 +1154,18 @@ mod tests {
     fn test_find_v4_arb_single_pool() {
         let mut scanner = V4PoolScanner::new();
         let k = PoolKey::new(tokens::WAVAX, tokens::USDC, 3000, 60, "0x0");
-        scanner.add_pool(k, U256::from_u128(354_400_000_000_000_000_000_000_000_000u128), 1_000_000_000_000_000_000, 0);
+        scanner.add_pool(
+            k,
+            U256::from_u128(354_400_000_000_000_000_000_000_000_000u128),
+            1_000_000_000_000_000_000,
+            0,
+        );
 
-        let arb = scanner.find_v4_arb(tokens::WAVAX, tokens::USDC, U256::from_u128(10 * 10u128.pow(18)));
+        let arb = scanner.find_v4_arb(
+            tokens::WAVAX,
+            tokens::USDC,
+            U256::from_u128(10 * 10u128.pow(18)),
+        );
         assert!(arb.is_none(), "Need at least 2 pools for arb");
     }
 
@@ -1046,8 +1180,14 @@ mod tests {
         let est_1to0 = pool.estimate_output(amount, false);
 
         // Both should produce non-zero output
-        assert!(!est_0to1.amount_out.is_zero(), "0→1 output should be non-zero");
-        assert!(!est_1to0.amount_out.is_zero(), "1→0 output should be non-zero");
+        assert!(
+            !est_0to1.amount_out.is_zero(),
+            "0→1 output should be non-zero"
+        );
+        assert!(
+            !est_1to0.amount_out.is_zero(),
+            "1→0 output should be non-zero"
+        );
         // Price impact should be positive
         assert!(est_0to1.price_impact_bps > 0.0);
         assert!(est_1to0.price_impact_bps > 0.0);
@@ -1075,8 +1215,16 @@ mod tests {
             100, // current tick = 100
         );
         pool.active_ticks = vec![
-            TickInfo { tick: 50, liquidity_net: 1000, liquidity_gross: 1000 },
-            TickInfo { tick: 150, liquidity_net: -1000, liquidity_gross: 1000 },
+            TickInfo {
+                tick: 50,
+                liquidity_net: 1000,
+                liquidity_gross: 1000,
+            },
+            TickInfo {
+                tick: 150,
+                liquidity_net: -1000,
+                liquidity_gross: 1000,
+            },
         ];
 
         // Small swap shouldn't cross tick
@@ -1090,8 +1238,14 @@ mod tests {
 
     #[test]
     fn test_dex_alias() {
-        assert_eq!(DexProtocol::LFJ.is_alias_of(), Some(DexProtocol::TraderJoeV2));
-        assert_eq!(DexProtocol::PangolinV2.is_alias_of(), Some(DexProtocol::Pangolin));
+        assert_eq!(
+            DexProtocol::LFJ.is_alias_of(),
+            Some(DexProtocol::TraderJoeV2)
+        );
+        assert_eq!(
+            DexProtocol::PangolinV2.is_alias_of(),
+            Some(DexProtocol::Pangolin)
+        );
         assert_eq!(DexProtocol::TraderJoe.is_alias_of(), None);
     }
 
@@ -1115,7 +1269,9 @@ mod tests {
             let _ = flags.mev_risk_level();
             let _ = HookArchetype::classify(&flags, &addr);
         }
-        assert!(start.elapsed().as_millis() < 50,
-            "10K hook classifications should take <50ms");
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "10K hook classifications should take <50ms"
+        );
     }
 }

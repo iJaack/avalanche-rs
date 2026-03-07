@@ -3,11 +3,11 @@
 //! Connects to an Avalanche node's WebSocket endpoint and subscribes
 //! to `newPendingTransactions` for real-time MEV opportunity detection.
 
-use crate::mev::{PendingTx, U256, MempoolMonitor, MempoolConfig, MevOpportunity, DecodedSwap};
+use crate::mev::{DecodedSwap, MempoolConfig, MempoolMonitor, MevOpportunity, PendingTx, U256};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, mpsc, Mutex};
-use serde::{Serialize, Deserialize};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 // ============================================================================
 // MEMPOOL SUBSCRIBER
@@ -149,7 +149,8 @@ impl MempoolSubscriber {
             "id": id,
             "method": "eth_subscribe",
             "params": ["newPendingTransactions"]
-        }).to_string()
+        })
+        .to_string()
     }
 
     /// Build a transaction fetch request
@@ -159,7 +160,8 @@ impl MempoolSubscriber {
             "id": id,
             "method": "eth_getTransactionByHash",
             "params": [tx_hash]
-        }).to_string()
+        })
+        .to_string()
     }
 
     /// Parse a pending transaction from JSON-RPC response
@@ -168,21 +170,24 @@ impl MempoolSubscriber {
 
         let hash = result.get("hash")?.as_str()?.to_string();
         let from = result.get("from")?.as_str()?.to_string();
-        let to = result.get("to").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let to = result
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let value_hex = result.get("value")?.as_str().unwrap_or("0x0");
         let value = U256::from_hex(value_hex).unwrap_or(U256::ZERO);
 
-        let gas_price_hex = result.get("gasPrice")
+        let gas_price_hex = result
+            .get("gasPrice")
             .or_else(|| result.get("maxFeePerGas"))
             .and_then(|v| v.as_str())
             .unwrap_or("0x0");
         let gas_price = U256::from_hex(gas_price_hex).unwrap_or(U256::ZERO);
 
         let gas_limit_hex = result.get("gas")?.as_str().unwrap_or("0x0");
-        let gas_limit = u64::from_str_radix(
-            gas_limit_hex.trim_start_matches("0x"), 16
-        ).unwrap_or(0);
+        let gas_limit =
+            u64::from_str_radix(gas_limit_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
         let input_hex = result.get("input")?.as_str().unwrap_or("0x");
         let input_clean = input_hex.trim_start_matches("0x");
@@ -198,12 +203,17 @@ impl MempoolSubscriber {
             .collect();
 
         let nonce_hex = result.get("nonce")?.as_str().unwrap_or("0x0");
-        let nonce = u64::from_str_radix(
-            nonce_hex.trim_start_matches("0x"), 16
-        ).unwrap_or(0);
+        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
         Some(PendingTx {
-            hash, from, to, value, gas_price, gas_limit, input, nonce,
+            hash,
+            from,
+            to,
+            value,
+            gas_price,
+            gas_limit,
+            input,
+            nonce,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -292,7 +302,10 @@ mod tests {
 
         let tx = MempoolSubscriber::parse_pending_tx(&json).unwrap();
         assert_eq!(tx.hash, "0xdeadbeef");
-        assert_eq!(tx.to, Some("0x60ae616a2155ee3d9a68541ba4544862310933d4".to_string()));
+        assert_eq!(
+            tx.to,
+            Some("0x60ae616a2155ee3d9a68541ba4544862310933d4".to_string())
+        );
         assert!(!tx.value.is_zero()); // 1 AVAX
         assert_eq!(tx.gas_limit, 21000); // 0x5208
         assert_eq!(tx.nonce, 5);

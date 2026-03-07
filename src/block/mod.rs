@@ -151,12 +151,18 @@ impl BlockHeader {
 
         // Validate public key format (BLS pubkey is 48 bytes compressed)
         if pub_key_bytes.len() != 48 {
-            return Err(format!("invalid public key size: {} (expected 48)", pub_key_bytes.len()));
+            return Err(format!(
+                "invalid public key size: {} (expected 48)",
+                pub_key_bytes.len()
+            ));
         }
 
         // Validate signature format (BLS G2 compressed is 96 bytes)
         if sig_bytes.len() != 96 {
-            return Err(format!("invalid signature size: {} (expected 96)", sig_bytes.len()));
+            return Err(format!(
+                "invalid signature size: {} (expected 96)",
+                sig_bytes.len()
+            ));
         }
 
         // Try to parse as BLS objects to validate structure
@@ -399,8 +405,7 @@ fn parse_cchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
 ///   bloom(6) difficulty(7) number(8) gasLimit(9) gasUsed(10) timestamp(11) …
 fn parse_cchain_rlp(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
     // Outer list: [header, uncles, txs]
-    let (_, header_start) =
-        rlp_list_start(raw, 0).map_err(|e| format!("outer list: {}", e))?;
+    let (_, header_start) = rlp_list_start(raw, 0).map_err(|e| format!("outer list: {}", e))?;
 
     // Inner header list
     let (_, fields_start) =
@@ -445,10 +450,7 @@ fn rlp_list_start(data: &[u8], pos: usize) -> Result<(usize, usize), String> {
     }
     let first = data[pos];
     if first < 0xc0 {
-        return Err(format!(
-            "expected list at pos {}, got 0x{:02x}",
-            pos, first
-        ));
+        return Err(format!("expected list at pos {}, got 0x{:02x}", pos, first));
     }
     if first <= 0xf7 {
         let payload_len = (first - 0xc0) as usize;
@@ -686,50 +688,93 @@ pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
     /// Skip a field, returning `false` if out of bounds (graceful end).
     fn skip(data: &[u8], pos: &mut usize) -> bool {
         match rlp_skip(data, *pos) {
-            Ok(next) => { *pos = next; true }
+            Ok(next) => {
+                *pos = next;
+                true
+            }
             Err(_) => false,
         }
     }
 
     // field 0: parentHash – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 1: sha3Uncles – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 2: miner (20 bytes, 0x94 prefix)
     let miner = rlp_read_address(rlp, pos).unwrap_or([0u8; 20]);
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 3: stateRoot – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 4: txRoot – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 5: receiptRoot – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 6: bloom – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 7: difficulty – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 8: number
     let number = rlp_read_u64(rlp, pos).unwrap_or(0);
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 9: gasLimit
     let gas_limit = rlp_read_u64(rlp, pos).unwrap_or(30_000_000);
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 10: gasUsed – skip
-    if !skip(rlp, &mut pos) { return None; }
+    if !skip(rlp, &mut pos) {
+        return None;
+    }
     // field 11: timestamp
     let timestamp = rlp_read_u64(rlp, pos).unwrap_or(0);
     // Fields 12+ are optional in synthetic/test blocks
     // field 12: extraData
     if !skip(rlp, &mut pos) {
-        return Some(CChainBlockFields { number, timestamp, gas_limit, base_fee: 25_000_000_000, miner });
+        return Some(CChainBlockFields {
+            number,
+            timestamp,
+            gas_limit,
+            base_fee: 25_000_000_000,
+            miner,
+        });
     }
     // field 13: mixHash
     if !skip(rlp, &mut pos) {
-        return Some(CChainBlockFields { number, timestamp, gas_limit, base_fee: 25_000_000_000, miner });
+        return Some(CChainBlockFields {
+            number,
+            timestamp,
+            gas_limit,
+            base_fee: 25_000_000_000,
+            miner,
+        });
     }
     // field 14: nonce
     if !skip(rlp, &mut pos) {
-        return Some(CChainBlockFields { number, timestamp, gas_limit, base_fee: 25_000_000_000, miner });
+        return Some(CChainBlockFields {
+            number,
+            timestamp,
+            gas_limit,
+            base_fee: 25_000_000_000,
+            miner,
+        });
     }
     // field 15: baseFeePerGas (EIP-1559; absent in pre-London blocks)
     let base_fee = if pos < rlp.len() {
@@ -738,7 +783,13 @@ pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
         25_000_000_000 // 25 gwei default
     };
 
-    Some(CChainBlockFields { number, timestamp, gas_limit, base_fee, miner })
+    Some(CChainBlockFields {
+        number,
+        timestamp,
+        gas_limit,
+        base_fee,
+        miner,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +820,15 @@ fn parse_legacy_tx(data: &[u8], pos: usize) -> Option<CChainRawTx> {
     let value = rlp_read_u128(data, fp).unwrap_or(0);
     fp = rlp_skip(data, fp).ok()?;
     let tx_data = rlp_read_bytes_vec(data, fp).unwrap_or_default();
-    Some(CChainRawTx { tx_type: 0, nonce, gas_price, gas_limit, to, value, data: tx_data })
+    Some(CChainRawTx {
+        tx_type: 0,
+        nonce,
+        gas_price,
+        gas_limit,
+        to,
+        value,
+        data: tx_data,
+    })
 }
 
 /// Parse an EIP-2718 typed transaction. `raw` is `[type_byte || rlp_payload]`.
@@ -799,7 +858,15 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
             let value = rlp_read_u128(payload, fp).unwrap_or(0);
             fp = rlp_skip(payload, fp).ok()?;
             let data = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
-            Some(CChainRawTx { tx_type: 1, nonce, gas_price, gas_limit, to, value, data })
+            Some(CChainRawTx {
+                tx_type: 1,
+                nonce,
+                gas_price,
+                gas_limit,
+                to,
+                value,
+                data,
+            })
         }
         0x02 => {
             // EIP-1559: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, ...]
@@ -816,7 +883,15 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
             let value = rlp_read_u128(payload, fp).unwrap_or(0);
             fp = rlp_skip(payload, fp).ok()?;
             let data = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
-            Some(CChainRawTx { tx_type: 2, nonce, gas_price, gas_limit, to, value, data })
+            Some(CChainRawTx {
+                tx_type: 2,
+                nonce,
+                gas_price,
+                gas_limit,
+                to,
+                value,
+                data,
+            })
         }
         _ => None,
     }
@@ -865,7 +940,10 @@ fn rlp_read_u128(data: &[u8], pos: usize) -> Result<u128, String> {
         }
         return Ok(value);
     }
-    Err(format!("unexpected RLP prefix 0x{:02x} for u128 at pos {}", first, pos))
+    Err(format!(
+        "unexpected RLP prefix 0x{:02x} for u128 at pos {}",
+        first, pos
+    ))
 }
 
 /// Read an RLP byte string at `pos`, returning `(content, next_pos)`.
@@ -1016,14 +1094,11 @@ mod tests {
     /// Build a minimal Banff block (typeID 30/31/32).
     /// Layout: [0..2]=version=0, [2..6]=type_id, [6..14]=timestamp,
     ///         [14..46]=parent_id, [46..54]=height.
-    fn make_banff_block(
-        type_id: u32,
-        parent_id: [u8; 32],
-        height: u64,
-        timestamp: u64,
-    ) -> Vec<u8> {
-        assert!(type_id == 30 || type_id == 31 || type_id == 32,
-            "use make_banff_proposal_block for typeID 29");
+    fn make_banff_block(type_id: u32, parent_id: [u8; 32], height: u64, timestamp: u64) -> Vec<u8> {
+        assert!(
+            type_id == 30 || type_id == 31 || type_id == 32,
+            "use make_banff_proposal_block for typeID 29"
+        );
         let mut raw = vec![0u8; 54];
         raw[2..6].copy_from_slice(&type_id.to_be_bytes());
         raw[6..14].copy_from_slice(&timestamp.to_be_bytes());
@@ -1035,11 +1110,7 @@ mod tests {
     /// Build a minimal BanffProposalBlock (typeID 29).
     /// Layout: [0..2]=version, [2..6]=29, [6..14]=timestamp, [14..18]=txs_len=0,
     ///         [18..50]=parent_id, [50..58]=height.
-    fn make_banff_proposal_block(
-        parent_id: [u8; 32],
-        height: u64,
-        timestamp: u64,
-    ) -> Vec<u8> {
+    fn make_banff_proposal_block(parent_id: [u8; 32], height: u64, timestamp: u64) -> Vec<u8> {
         let mut raw = vec![0u8; 58];
         raw[2..6].copy_from_slice(&29u32.to_be_bytes());
         raw[6..14].copy_from_slice(&timestamp.to_be_bytes());
@@ -1286,7 +1357,7 @@ mod tests {
         encode_rlp_u64(&mut header_payload, 8_000_000);
         // 10: gasUsed
         header_payload.push(0x80); // 0
-        // 11: timestamp
+                                   // 11: timestamp
         encode_rlp_u64(&mut header_payload, timestamp);
 
         // Wrap header in a list
@@ -1489,8 +1560,14 @@ mod tests {
 
     /// Build a minimal legacy Ethereum transaction RLP item.
     /// Format: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
-    fn make_legacy_tx_rlp(nonce: u64, gas_price: u128, gas_limit: u64,
-                           to: Option<[u8; 20]>, value: u128, data: &[u8]) -> Vec<u8> {
+    fn make_legacy_tx_rlp(
+        nonce: u64,
+        gas_price: u128,
+        gas_limit: u64,
+        to: Option<[u8; 20]>,
+        value: u128,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut fields: Vec<u8> = Vec::new();
         encode_rlp_u64(&mut fields, nonce);
         // gasPrice as u128
@@ -1537,8 +1614,12 @@ mod tests {
     }
 
     /// Build a C-Chain block with one legacy transaction.
-    fn make_cchain_block_with_tx(parent: [u8; 32], number: u64, timestamp: u64,
-                                  tx: Vec<u8>) -> Vec<u8> {
+    fn make_cchain_block_with_tx(
+        parent: [u8; 32],
+        number: u64,
+        timestamp: u64,
+        tx: Vec<u8>,
+    ) -> Vec<u8> {
         let mut header_payload: Vec<u8> = Vec::new();
         header_payload.push(0xa0);
         header_payload.extend_from_slice(&parent);
@@ -1564,7 +1645,7 @@ mod tests {
         header_payload.push(0x80); // extraData
         header_payload.push(0xa0); // mixHash
         header_payload.extend_from_slice(&[0u8; 32]);
-        header_payload.extend_from_slice(&[0x88, 0,0,0,0,0,0,0,0]); // nonce (8 bytes)
+        header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]); // nonce (8 bytes)
 
         let header_list = rlp_list(header_payload);
         let empty = 0xc0u8; // empty uncles
@@ -1591,12 +1672,12 @@ mod tests {
     fn test_extract_cchain_transactions_with_one_tx() {
         let to_addr = [0x42u8; 20];
         let tx = make_legacy_tx_rlp(
-            5,                      // nonce
-            25_000_000_000u128,     // gasPrice (25 gwei)
-            21_000,                 // gasLimit
-            Some(to_addr),          // to
+            5,                             // nonce
+            25_000_000_000u128,            // gasPrice (25 gwei)
+            21_000,                        // gasLimit
+            Some(to_addr),                 // to
             1_000_000_000_000_000_000u128, // value (1 ETH)
-            &[],                    // data
+            &[],                           // data
         );
         let raw = make_cchain_block_with_tx([0u8; 32], 100, 1_700_000_000, tx);
         let txs = extract_cchain_transactions(&raw);
@@ -1612,9 +1693,12 @@ mod tests {
     #[test]
     fn test_extract_cchain_transactions_contract_creation() {
         let tx = make_legacy_tx_rlp(
-            0, 25_000_000_000, 100_000,
+            0,
+            25_000_000_000,
+            100_000,
             None, // no to = contract creation
-            0, &[0x60, 0x00], // init code
+            0,
+            &[0x60, 0x00], // init code
         );
         let raw = make_cchain_block_with_tx([0u8; 32], 1, 1_700_000_000, tx);
         let txs = extract_cchain_transactions(&raw);

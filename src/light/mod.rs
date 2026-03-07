@@ -150,15 +150,12 @@ impl LightClient {
     ///
     /// Uses a simplified verification: hash the proof nodes and check
     /// they form a valid path to the state root.
-    pub fn verify_merkle_proof(
-        state_root: &[u8; 32],
-        proof: &MerkleProof,
-    ) -> bool {
+    pub fn verify_merkle_proof(state_root: &[u8; 32], proof: &MerkleProof) -> bool {
         if proof.proof_nodes.is_empty() {
             return false;
         }
 
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         // Verify proof chain: hash each node with its sibling to reconstruct root
         let mut current_hash = {
@@ -236,7 +233,8 @@ impl LightClient {
             return;
         }
         let cutoff = self.tip_height - keep_recent;
-        self.headers.retain(|height, _| *height == 0 || *height > cutoff);
+        self.headers
+            .retain(|height, _| *height == 0 || *height > cutoff);
     }
 }
 
@@ -253,7 +251,7 @@ impl Default for LightClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     fn make_light_header(height: u64, parent_hash: [u8; 32]) -> LightHeader {
         let mut hasher = Sha256::new();
@@ -448,7 +446,11 @@ mod tests {
         let mut state_root = [0u8; 32];
         state_root.copy_from_slice(&root);
 
-        let proof = MerkleProof { key, value, proof_nodes: vec![node] };
+        let proof = MerkleProof {
+            key,
+            value,
+            proof_nodes: vec![node],
+        };
         assert!(lc.handle_balance_proof(addr, 1000, &proof, &state_root));
         assert_eq!(lc.get_cached_balance(&addr), Some(1000));
     }

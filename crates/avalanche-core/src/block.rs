@@ -1,7 +1,7 @@
 //! Block type definitions, compatible with no_std.
 
-use serde::{Deserialize, Serialize};
 use crate::types::{BlockId, Id};
+use serde::{Deserialize, Serialize};
 
 /// Avalanche block types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +104,10 @@ mod tests {
         assert_eq!(BlockType::from_type_id(0), BlockType::ApricotProposal);
         assert_eq!(BlockType::from_type_id(29), BlockType::BanffProposal);
         assert_eq!(BlockType::from_type_id(32), BlockType::BanffStandard);
-        assert!(matches!(BlockType::from_type_id(99), BlockType::Unknown(99)));
+        assert!(matches!(
+            BlockType::from_type_id(99),
+            BlockType::Unknown(99)
+        ));
     }
 
     #[test]

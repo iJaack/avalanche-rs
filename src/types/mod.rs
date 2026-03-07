@@ -8,8 +8,8 @@
 //! - Serialization (serde + custom codecs)
 //! - Comprehensive unit tests
 
-use sha2::{Sha256, Digest};
-use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 // ============================================================================
@@ -257,7 +257,12 @@ impl Transaction {
 
 impl fmt::Display for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Transaction {{ id: {}, chain: {} }}", self.id().0, self.chain_type())
+        write!(
+            f,
+            "Transaction {{ id: {}, chain: {} }}",
+            self.id().0,
+            self.chain_type()
+        )
     }
 }
 
@@ -502,8 +507,14 @@ mod tests {
     #[test]
     fn test_id_hex_roundtrip() {
         let mut arr = [0u8; 32];
-        arr[0] = 0x12; arr[1] = 0x34; arr[2] = 0x56; arr[3] = 0x78;
-        arr[4] = 0xab; arr[5] = 0xcd; arr[6] = 0xef; arr[7] = 0x00;
+        arr[0] = 0x12;
+        arr[1] = 0x34;
+        arr[2] = 0x56;
+        arr[3] = 0x78;
+        arr[4] = 0xab;
+        arr[5] = 0xcd;
+        arr[6] = 0xef;
+        arr[7] = 0x00;
         let original = ID::new(arr);
         let hex = original.to_hex();
         let decoded = ID::from_hex(&hex).unwrap();
@@ -654,7 +665,10 @@ mod tests {
 
         let computed_id = block.compute_id();
         let recomputed_id = block.compute_id();
-        assert_eq!(computed_id, recomputed_id, "compute_id should be deterministic");
+        assert_eq!(
+            computed_id, recomputed_id,
+            "compute_id should be deterministic"
+        );
     }
 
     // Serialization Tests
@@ -732,8 +746,14 @@ mod tests {
     #[test]
     fn test_hex_codec_encode_decode() {
         let mut arr = [0u8; 32];
-        arr[0] = 0x12; arr[1] = 0x34; arr[2] = 0x56; arr[3] = 0x78;
-        arr[4] = 0xab; arr[5] = 0xcd; arr[6] = 0xef; arr[7] = 0x00;
+        arr[0] = 0x12;
+        arr[1] = 0x34;
+        arr[2] = 0x56;
+        arr[3] = 0x78;
+        arr[4] = 0xab;
+        arr[5] = 0xcd;
+        arr[6] = 0xef;
+        arr[7] = 0x00;
         let id = ID::new(arr);
         let hex = HexCodec::encode(&id);
         let decoded = HexCodec::decode(&hex).unwrap();
@@ -771,10 +791,10 @@ pub mod errors {
 }
 
 pub mod types {
-    pub use super::{ID, NodeID, BlockID, TransactionID, ChainID, Transaction, UTXO, Block};
-    pub use super::{BLOCKCHAIN_X, BLOCKCHAIN_C, BLOCKCHAIN_P};
+    pub use super::{Block, BlockID, ChainID, NodeID, Transaction, TransactionID, ID, UTXO};
+    pub use super::{BLOCKCHAIN_C, BLOCKCHAIN_P, BLOCKCHAIN_X};
 }
 
 pub mod codec {
-    pub use super::{JsonCodec, HexCodec};
+    pub use super::{HexCodec, JsonCodec};
 }

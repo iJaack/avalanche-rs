@@ -9,8 +9,7 @@
 use revm::{
     db::CacheDB,
     primitives::{
-        AccountInfo, Address, Bytecode, Bytes, ExecutionResult, Output, TxKind,
-        U256, KECCAK_EMPTY,
+        AccountInfo, Address, Bytecode, Bytes, ExecutionResult, Output, TxKind, KECCAK_EMPTY, U256,
     },
     Evm,
 };
@@ -225,9 +224,10 @@ impl EvmExecutor {
                 Output::Call(data) => Ok(data.to_vec()),
                 Output::Create(data, _) => Ok(data.to_vec()),
             },
-            ExecutionResult::Revert { output, .. } => {
-                Err(EvmError::ExecutionFailed(format!("revert: 0x{}", hex::encode(&output))))
-            }
+            ExecutionResult::Revert { output, .. } => Err(EvmError::ExecutionFailed(format!(
+                "revert: 0x{}",
+                hex::encode(&output)
+            ))),
             ExecutionResult::Halt { reason, .. } => {
                 Err(EvmError::ExecutionFailed(format!("halt: {:?}", reason)))
             }
@@ -235,11 +235,7 @@ impl EvmExecutor {
     }
 
     /// Estimate gas for a transaction (eth_estimateGas).
-    pub fn estimate_gas(
-        &self,
-        tx: &EvmTransaction,
-        block: &BlockContext,
-    ) -> Result<u64, EvmError> {
+    pub fn estimate_gas(&self, tx: &EvmTransaction, block: &BlockContext) -> Result<u64, EvmError> {
         let mut db_clone = self.db.clone();
         let tx_kind = match tx.to {
             Some(addr) => TxKind::Call(Address::from(addr)),
@@ -389,7 +385,11 @@ impl EvmExecutor {
 
         let raw_txs = extract_cchain_transactions(raw_block);
         if raw_txs.is_empty() {
-            return Ok(BlockResult { receipts: vec![], gas_used: 0, tx_count: 0 });
+            return Ok(BlockResult {
+                receipts: vec![],
+                gas_used: 0,
+                tx_count: 0,
+            });
         }
 
         // Pre-fund the zero address (placeholder sender) so gas deduction succeeds.
@@ -771,29 +771,44 @@ mod tests {
         //                txRoot(32), receiptRoot(32), bloom(256), difficulty(1),
         //                number, gasLimit, gasUsed(0), timestamp, ...
         let mut hp: Vec<u8> = Vec::new();
-        hp.push(0xa0); hp.extend_from_slice(&[0u8; 32]); // parentHash
-        hp.push(0xa0); hp.extend_from_slice(&[0x1du8; 32]); // sha3Uncles
-        hp.push(0x94); hp.extend_from_slice(&[0u8; 20]); // miner
-        hp.push(0xa0); hp.extend_from_slice(&[0u8; 32]); // stateRoot
-        hp.push(0xa0); hp.extend_from_slice(&[0u8; 32]); // txRoot
-        hp.push(0xa0); hp.extend_from_slice(&[0u8; 32]); // receiptRoot
-        hp.push(0xb9); hp.push(0x01); hp.push(0x00); hp.extend_from_slice(&[0u8; 256]); // bloom
+        hp.push(0xa0);
+        hp.extend_from_slice(&[0u8; 32]); // parentHash
+        hp.push(0xa0);
+        hp.extend_from_slice(&[0x1du8; 32]); // sha3Uncles
+        hp.push(0x94);
+        hp.extend_from_slice(&[0u8; 20]); // miner
+        hp.push(0xa0);
+        hp.extend_from_slice(&[0u8; 32]); // stateRoot
+        hp.push(0xa0);
+        hp.extend_from_slice(&[0u8; 32]); // txRoot
+        hp.push(0xa0);
+        hp.extend_from_slice(&[0u8; 32]); // receiptRoot
+        hp.push(0xb9);
+        hp.push(0x01);
+        hp.push(0x00);
+        hp.extend_from_slice(&[0u8; 256]); // bloom
         hp.push(0x80); // difficulty = 0
-        // number
-        if number == 0 { hp.push(0x80); } else {
+                       // number
+        if number == 0 {
+            hp.push(0x80);
+        } else {
             let b = number.to_be_bytes();
             let s = b.iter().position(|&x| x != 0).unwrap_or(7);
-            hp.push(0x80 + (8 - s) as u8); hp.extend_from_slice(&b[s..]);
+            hp.push(0x80 + (8 - s) as u8);
+            hp.extend_from_slice(&b[s..]);
         }
         let gl = 30_000_000u64;
         let gb = gl.to_be_bytes();
         let gs = gb.iter().position(|&x| x != 0).unwrap_or(7);
-        hp.push(0x80 + (8 - gs) as u8); hp.extend_from_slice(&gb[gs..]); // gasLimit
+        hp.push(0x80 + (8 - gs) as u8);
+        hp.extend_from_slice(&gb[gs..]); // gasLimit
         hp.push(0x80); // gasUsed = 0
-        hp.push(0x84); hp.extend_from_slice(&1_700_000_000u32.to_be_bytes()); // timestamp
+        hp.push(0x84);
+        hp.extend_from_slice(&1_700_000_000u32.to_be_bytes()); // timestamp
         hp.push(0x80); // extraData (empty)
-        hp.push(0xa0); hp.extend_from_slice(&[0u8; 32]); // mixHash
-        hp.extend_from_slice(&[0x88, 0,0,0,0,0,0,0,0]); // nonce (8 bytes)
+        hp.push(0xa0);
+        hp.extend_from_slice(&[0u8; 32]); // mixHash
+        hp.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]); // nonce (8 bytes)
 
         fn wrap_list(payload: Vec<u8>) -> Vec<u8> {
             let len = payload.len();
@@ -803,9 +818,11 @@ mod tests {
             } else {
                 let lb = len.to_be_bytes();
                 let ls = lb.iter().position(|&x| x != 0).unwrap_or(7);
-                out.push(0xf7 + (8 - ls) as u8); out.extend_from_slice(&lb[ls..]);
+                out.push(0xf7 + (8 - ls) as u8);
+                out.extend_from_slice(&lb[ls..]);
             }
-            out.extend(payload); out
+            out.extend(payload);
+            out
         }
 
         let header = wrap_list(hp);
@@ -822,7 +839,11 @@ mod tests {
         // A block with no transactions should succeed with zero gas used
         let block = make_test_cchain_block_rlp(1);
         let result = exec.execute_cchain_block_raw(&block, 43114);
-        assert!(result.is_ok(), "should execute empty block: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "should execute empty block: {:?}",
+            result.err()
+        );
         let r = result.unwrap();
         assert_eq!(r.tx_count, 0);
         assert_eq!(r.gas_used, 0);
@@ -924,10 +945,9 @@ mod tests {
         let root = exec.compute_state_root_mpt();
         // alloy_trie::EMPTY_ROOT_HASH = 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
         let expected = [
-            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
-            0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
-            0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
-            0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0,
+            0xf8, 0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5,
+            0xe3, 0x63, 0xb4, 0x21,
         ];
         assert_eq!(root, expected);
     }
@@ -945,7 +965,10 @@ mod tests {
         exec2.set_balance(addr_a, 1_000_000);
         exec2.set_balance(addr_b, 2_000_000);
 
-        assert_eq!(exec1.compute_state_root_mpt(), exec2.compute_state_root_mpt());
+        assert_eq!(
+            exec1.compute_state_root_mpt(),
+            exec2.compute_state_root_mpt()
+        );
     }
 
     #[test]
@@ -995,6 +1018,9 @@ mod tests {
             exec2.set_balance(*addr, 1000);
         }
 
-        assert_eq!(exec1.compute_state_root_mpt(), exec2.compute_state_root_mpt());
+        assert_eq!(
+            exec1.compute_state_root_mpt(),
+            exec2.compute_state_root_mpt()
+        );
     }
 }

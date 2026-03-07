@@ -4,7 +4,7 @@
 //! and legacy transactions. Designed for MEV bundle construction.
 
 use k256::ecdsa::{SigningKey, VerifyingKey};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // ============================================================================
@@ -28,18 +28,25 @@ impl fmt::Debug for Wallet {
 impl Wallet {
     /// Create wallet from raw 32-byte private key
     pub fn from_bytes(key: &[u8; 32], chain_id: u64) -> Result<Self, TxError> {
-        let signing_key = SigningKey::from_bytes(key.into())
-            .map_err(|e| TxError::InvalidKey(e.to_string()))?;
+        let signing_key =
+            SigningKey::from_bytes(key.into()).map_err(|e| TxError::InvalidKey(e.to_string()))?;
 
         let address = Self::derive_address(&signing_key);
-        Ok(Self { signing_key, address, chain_id })
+        Ok(Self {
+            signing_key,
+            address,
+            chain_id,
+        })
     }
 
     /// Create wallet from hex private key (with or without 0x prefix)
     pub fn from_hex(hex_key: &str, chain_id: u64) -> Result<Self, TxError> {
         let clean = hex_key.trim_start_matches("0x");
         if clean.len() != 64 {
-            return Err(TxError::InvalidKey(format!("Expected 64 hex chars, got {}", clean.len())));
+            return Err(TxError::InvalidKey(format!(
+                "Expected 64 hex chars, got {}",
+                clean.len()
+            )));
         }
 
         let mut key_bytes = [0u8; 32];
@@ -53,7 +60,11 @@ impl Wallet {
     pub fn random(chain_id: u64) -> Self {
         let signing_key = SigningKey::random(&mut rand::thread_rng());
         let address = Self::derive_address(&signing_key);
-        Self { signing_key, address, chain_id }
+        Self {
+            signing_key,
+            address,
+            chain_id,
+        }
     }
 
     /// Get the address as 0x-prefixed hex string
@@ -93,7 +104,8 @@ impl Wallet {
 
     /// Sign a raw message hash (32 bytes)
     pub fn sign_hash(&self, hash: &[u8; 32]) -> Result<EcdsaSignature, TxError> {
-        let (sig, recovery_id) = self.signing_key
+        let (sig, recovery_id) = self
+            .signing_key
             .sign_prehash_recoverable(hash)
             .map_err(|e| TxError::SigningFailed(e.to_string()))?;
 
@@ -241,7 +253,11 @@ struct Rlp {
 }
 
 impl Rlp {
-    fn new() -> Self { Self { buf: Vec::with_capacity(256) } }
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(256),
+        }
+    }
 
     fn encode_u64(&mut self, v: u64) {
         self.encode_uint(&v.to_be_bytes());
@@ -305,17 +321,26 @@ impl Rlp {
             let len_bytes = Self::encode_length_bytes(content_len);
             // Need to insert length bytes — shift content right
             let header = vec![0xf7 + len_bytes.len() as u8];
-            self.buf.splice(start..start + 1, header.into_iter().chain(len_bytes.into_iter()));
+            self.buf.splice(
+                start..start + 1,
+                header.into_iter().chain(len_bytes.into_iter()),
+            );
         }
     }
 
     fn encode_length_bytes(len: usize) -> Vec<u8> {
-        if len < 256 { vec![len as u8] }
-        else if len < 65536 { vec![(len >> 8) as u8, len as u8] }
-        else { vec![(len >> 16) as u8, (len >> 8) as u8, len as u8] }
+        if len < 256 {
+            vec![len as u8]
+        } else if len < 65536 {
+            vec![(len >> 8) as u8, len as u8]
+        } else {
+            vec![(len >> 16) as u8, (len >> 8) as u8, len as u8]
+        }
     }
 
-    fn finish(self) -> Vec<u8> { self.buf }
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
 }
 
 impl Eip1559Tx {
@@ -451,8 +476,11 @@ impl PoolReserves {
     /// Decode getReserves() return data (3 x uint256, but we use uint112 + uint32)
     pub fn decode(data: &str) -> Result<Self, TxError> {
         let clean = data.trim_start_matches("0x");
-        if clean.len() < 192 { // 3 * 64 hex chars
-            return Err(TxError::DecodeFailed("getReserves response too short".into()));
+        if clean.len() < 192 {
+            // 3 * 64 hex chars
+            return Err(TxError::DecodeFailed(
+                "getReserves response too short".into(),
+            ));
         }
 
         let reserve0 = u128::from_str_radix(&clean[0..64].trim_start_matches('0').max("0"), 16)
@@ -462,7 +490,11 @@ impl PoolReserves {
         let ts = u32::from_str_radix(&clean[128..192].trim_start_matches('0').max("0"), 16)
             .map_err(|e| TxError::DecodeFailed(e.to_string()))?;
 
-        Ok(Self { reserve0, reserve1, block_timestamp_last: ts })
+        Ok(Self {
+            reserve0,
+            reserve1,
+            block_timestamp_last: ts,
+        })
     }
 }
 
@@ -528,40 +560,67 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 /// Keccak-f[1600] permutation (24 rounds)
 fn keccak_f1600(state: &mut [u64; 25]) {
     const RC: [u64; 24] = [
-        0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
-        0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-        0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
-        0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
-        0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
-        0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+        0x0000000000000001,
+        0x0000000000008082,
+        0x800000000000808a,
+        0x8000000080008000,
+        0x000000000000808b,
+        0x0000000080000001,
+        0x8000000080008081,
+        0x8000000000008009,
+        0x000000000000008a,
+        0x0000000000000088,
+        0x0000000080008009,
+        0x000000008000000a,
+        0x000000008000808b,
+        0x800000000000008b,
+        0x8000000000008089,
+        0x8000000000008003,
+        0x8000000000008002,
+        0x8000000000000080,
+        0x000000000000800a,
+        0x800000008000000a,
+        0x8000000080008081,
+        0x8000000000008080,
+        0x0000000080000001,
+        0x8000000080008008,
     ];
 
     for rc in &RC {
         // θ step
         let mut c = [0u64; 5];
-        for x in 0..5 { c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20]; }
+        for x in 0..5 {
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        }
         let mut d = [0u64; 5];
-        for x in 0..5 { d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1); }
-        for x in 0..5 { for y in 0..5 { state[x + 5 * y] ^= d[x]; } }
+        for x in 0..5 {
+            d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+        }
+        for x in 0..5 {
+            for y in 0..5 {
+                state[x + 5 * y] ^= d[x];
+            }
+        }
 
         // ρ and π steps
         let mut b = [0u64; 25];
         const ROTATIONS: [u32; 25] = [
-            0, 1, 62, 28, 27, 36, 44, 6, 55, 20,
-            3, 10, 43, 25, 39, 41, 45, 15, 21, 8,
-            18, 2, 61, 56, 14,
+            0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61,
+            56, 14,
         ];
         const PI: [usize; 25] = [
-            0, 10, 20, 5, 15, 16, 1, 11, 21, 6,
-            7, 17, 2, 12, 22, 23, 8, 18, 3, 13,
-            14, 24, 9, 19, 4,
+            0, 10, 20, 5, 15, 16, 1, 11, 21, 6, 7, 17, 2, 12, 22, 23, 8, 18, 3, 13, 14, 24, 9, 19,
+            4,
         ];
-        for i in 0..25 { b[PI[i]] = state[i].rotate_left(ROTATIONS[i]); }
+        for i in 0..25 {
+            b[PI[i]] = state[i].rotate_left(ROTATIONS[i]);
+        }
 
         // χ step
         for y in 0..5 {
             for x in 0..5 {
-                state[x + 5 * y] = b[x + 5 * y] ^ ((!b[(x + 1) % 5 + 5 * y]) & b[(x + 2) % 5 + 5 * y]);
+                state[x + 5 * y] =
+                    b[x + 5 * y] ^ ((!b[(x + 1) % 5 + 5 * y]) & b[(x + 2) % 5 + 5 * y]);
             }
         }
 
@@ -613,16 +672,20 @@ mod tests {
     fn test_keccak256_empty() {
         let hash = keccak256(&[]);
         // keccak256("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
-        assert_eq!(faster_hex::hex_string(&hash),
-            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+        assert_eq!(
+            faster_hex::hex_string(&hash),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
     }
 
     #[test]
     fn test_keccak256_hello() {
         // keccak256("hello") = 1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8
         let hash = keccak256(b"hello");
-        assert_eq!(faster_hex::hex_string(&hash),
-            "1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8");
+        assert_eq!(
+            faster_hex::hex_string(&hash),
+            "1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
+        );
     }
 
     #[test]
@@ -695,7 +758,7 @@ mod tests {
         let tx = Eip1559Tx {
             nonce: 0,
             max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-            max_fee_per_gas: 30_000_000_000,          // 30 gwei
+            max_fee_per_gas: 30_000_000_000,         // 30 gwei
             gas_limit: 21_000,
             to: [0u8; 20],
             value: 1_000_000_000_000_000_000, // 1 AVAX
@@ -740,12 +803,10 @@ mod tests {
             to: [0xBB; 20],
             value: 0,
             data: vec![0x38, 0xed, 0x17, 0x39], // swapExactTokensForTokens
-            access_list: vec![
-                AccessListEntry {
-                    address: [0xCC; 20],
-                    storage_keys: vec![[0xDD; 32]],
-                },
-            ],
+            access_list: vec![AccessListEntry {
+                address: [0xCC; 20],
+                storage_keys: vec![[0xDD; 32]],
+            }],
         };
 
         let signed = w.sign_eip1559(&tx).unwrap();
@@ -798,7 +859,10 @@ mod tests {
     #[test]
     fn test_decode_reserves() {
         // Simulated getReserves response: reserve0=1000000, reserve1=2000000, ts=12345
-        let data = format!("0x{:064x}{:064x}{:064x}", 1_000_000u128, 2_000_000u128, 12345u32);
+        let data = format!(
+            "0x{:064x}{:064x}{:064x}",
+            1_000_000u128, 2_000_000u128, 12345u32
+        );
         let reserves = PoolReserves::decode(&data).unwrap();
         assert_eq!(reserves.reserve0, 1_000_000);
         assert_eq!(reserves.reserve1, 2_000_000);
@@ -834,8 +898,11 @@ mod tests {
             let _ = keccak256(&i.to_be_bytes());
         }
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 5000,
-            "100K keccak256 hashes should take <5s in debug mode, took {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 5000,
+            "100K keccak256 hashes should take <5s in debug mode, took {:?}",
+            elapsed
+        );
     }
 
     // --- Signing stress ---
@@ -858,17 +925,20 @@ mod tests {
             let _ = w.sign_eip1559(&tx).unwrap();
         }
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 5_000,
-            "1K EIP-1559 signings should take <5s, took {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 5_000,
+            "1K EIP-1559 signings should take <5s, took {:?}",
+            elapsed
+        );
     }
 
     // --- Different chain IDs ---
 
     #[test]
     fn test_different_chain_ids() {
-        let w1 = Wallet::random(43114);  // Avalanche mainnet
-        let w2 = Wallet::random(43113);  // Fuji testnet
-        let w3 = Wallet::random(1);      // Ethereum mainnet
+        let w1 = Wallet::random(43114); // Avalanche mainnet
+        let w2 = Wallet::random(43113); // Fuji testnet
+        let w3 = Wallet::random(1); // Ethereum mainnet
 
         let tx = Eip1559Tx {
             nonce: 0,

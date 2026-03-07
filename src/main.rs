@@ -17,18 +17,22 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use sha2::{Digest, Sha256};
 use bs58;
+use sha2::{Digest, Sha256};
 
-use avalanche_rs::block::{BlockHeader, Chain, ChainGraph, extract_cchain_block_fields, extract_cchain_transactions};
+use avalanche_rs::block::{
+    extract_cchain_block_fields, extract_cchain_transactions, BlockHeader, Chain, ChainGraph,
+};
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
 use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction};
 use avalanche_rs::identity::{self, NodeIdentity};
-use avalanche_rs::network::{BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, PeerInfo, PeerManager, Peer, PeerState};
+use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
+use avalanche_rs::network::{
+    BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, Peer, PeerInfo, PeerManager, PeerState,
+};
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
 use avalanche_rs::sync::{SyncConfig, SyncEngine, SyncPhase};
-use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -36,7 +40,11 @@ use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
 
 /// Avalanche full node written in Rust.
 #[derive(Parser, Debug)]
-#[command(name = "avalanche-rs", version = "0.1.0", about = "Production Avalanche full node")]
+#[command(
+    name = "avalanche-rs",
+    version = "0.1.0",
+    about = "Production Avalanche full node"
+)]
 struct Cli {
     /// Network ID (1 = mainnet, 5 = fuji)
     #[arg(long, default_value = "1", env = "AVAX_NETWORK_ID")]
@@ -122,7 +130,11 @@ enum BootstrapState {
     WaitingFrontier(u32),
     WaitingAccepted(u32),
     WaitingAncestors(u32),
-    FetchingAncestors { req: u32, depth: u32, total_blocks: u32 },
+    FetchingAncestors {
+        req: u32,
+        depth: u32,
+        total_blocks: u32,
+    },
     Done,
 }
 
@@ -135,7 +147,11 @@ enum CChainBootstrapState {
     Idle,
     WaitingAccepted(u32),
     WaitingAncestors(u32),
-    FetchingAncestors { req: u32, depth: u32, total_blocks: u32 },
+    FetchingAncestors {
+        req: u32,
+        depth: u32,
+        total_blocks: u32,
+    },
     Done,
 }
 
@@ -191,8 +207,7 @@ struct ValidatorInfo {
 fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
     info!(
         "Chain walk: starting from tip {:02x}{:02x}{:02x}{:02x}…{:02x}{:02x}{:02x}{:02x}",
-        tip_id[0], tip_id[1], tip_id[2], tip_id[3],
-        tip_id[28], tip_id[29], tip_id[30], tip_id[31]
+        tip_id[0], tip_id[1], tip_id[2], tip_id[3], tip_id[28], tip_id[29], tip_id[30], tip_id[31]
     );
 
     // Check immediately whether the tip is in the DB at all.
@@ -200,8 +215,14 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
         Ok(None) => {
             info!(
                 "TIP ID NOT IN STORED BLOCKS: {:02x}{:02x}{:02x}{:02x}…{:02x}{:02x}{:02x}{:02x}",
-                tip_id[0], tip_id[1], tip_id[2], tip_id[3],
-                tip_id[28], tip_id[29], tip_id[30], tip_id[31]
+                tip_id[0],
+                tip_id[1],
+                tip_id[2],
+                tip_id[3],
+                tip_id[28],
+                tip_id[29],
+                tip_id[30],
+                tip_id[31]
             );
             return (0, 0, 0);
         }
@@ -210,7 +231,10 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
             return (0, 0, 0);
         }
         Ok(Some(_)) => {
-            info!("Found tip in DB: {:02x}{:02x}{:02x}{:02x}…", tip_id[0], tip_id[1], tip_id[2], tip_id[3]);
+            info!(
+                "Found tip in DB: {:02x}{:02x}{:02x}{:02x}…",
+                tip_id[0], tip_id[1], tip_id[2], tip_id[3]
+            );
         }
     }
 
@@ -225,16 +249,24 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
                 count += 1;
 
                 // Parse the full block to extract height (for tip and genesis reporting).
-                if let Ok(hdr) = avalanche_rs::block::BlockHeader::parse(&block_data, avalanche_rs::block::Chain::PChain) {
+                if let Ok(hdr) = avalanche_rs::block::BlockHeader::parse(
+                    &block_data,
+                    avalanche_rs::block::Chain::PChain,
+                ) {
                     if count == 1 {
                         tip_height = hdr.height;
-                        info!("Chain walk tip block: height={}, type={:?}", tip_height, hdr.block_type);
+                        info!(
+                            "Chain walk tip block: height={}, type={:?}",
+                            tip_height, hdr.block_type
+                        );
                     }
                     if hdr.is_genesis() {
                         genesis_height = hdr.height;
                         info!(
                             "Genesis block height: {} (type={:?}, {} bytes)",
-                            genesis_height, hdr.block_type, block_data.len()
+                            genesis_height,
+                            hdr.block_type,
+                            block_data.len()
                         );
                     }
                 }
@@ -248,7 +280,11 @@ fn verify_block_chain(db: &Database, tip_id: [u8; 32]) -> (u64, u64, u64) {
                         current = parent;
                     }
                     None => {
-                        info!("Chain walk: block too short ({} bytes) at depth {}", block_data.len(), count);
+                        info!(
+                            "Chain walk: block too short ({} bytes) at depth {}",
+                            block_data.len(),
+                            count
+                        );
                         break;
                     }
                 }
@@ -394,7 +430,11 @@ async fn main() {
         }
     };
 
-    info!("NodeID: {}, cert_size={} bytes", identity.node_id, identity.cert_der.len());
+    info!(
+        "NodeID: {}, cert_size={} bytes",
+        identity.node_id,
+        identity.cert_der.len()
+    );
 
     // 2. Initialize database
     let db_path = cli.data_dir.join("db");
@@ -409,12 +449,18 @@ async fn main() {
     });
 
     let last_height = db.last_accepted_height().unwrap_or(None).unwrap_or(0);
-    info!("Database opened at {:?}, last accepted height: {}", db_path, last_height);
+    info!(
+        "Database opened at {:?}, last accepted height: {}",
+        db_path, last_height
+    );
 
     // Phase 8: verify block chain integrity on startup
     let (ok, bad) = integrity_check_pchain(&db);
     if bad > 0 {
-        warn!("Chain integrity: {} blocks OK, {} MISMATCHES — block storage format issue!", ok, bad);
+        warn!(
+            "Chain integrity: {} blocks OK, {} MISMATCHES — block storage format issue!",
+            ok, bad
+        );
     } else if ok > 0 {
         info!("Chain integrity: {} blocks verified, all match", ok);
     }
@@ -424,14 +470,21 @@ async fn main() {
         let dump_len = genesis_raw.len().min(200);
         info!(
             "P-Chain genesis found: id={:02x}{:02x}{:02x}{:02x}…, {} bytes total",
-            genesis_id[0], genesis_id[1], genesis_id[2], genesis_id[3],
+            genesis_id[0],
+            genesis_id[1],
+            genesis_id[2],
+            genesis_id[3],
             genesis_raw.len()
         );
         info!(
             "P-Chain genesis: first {} bytes = {:02x?}",
-            dump_len, &genesis_raw[..dump_len]
+            dump_len,
+            &genesis_raw[..dump_len]
         );
-        if let Ok(hdr) = avalanche_rs::block::BlockHeader::parse(&genesis_raw, avalanche_rs::block::Chain::PChain) {
+        if let Ok(hdr) = avalanche_rs::block::BlockHeader::parse(
+            &genesis_raw,
+            avalanche_rs::block::Chain::PChain,
+        ) {
             info!(
                 "P-Chain genesis parsed: height={}, type={:?}, timestamp={}",
                 hdr.height, hdr.block_type, hdr.timestamp
@@ -489,7 +542,10 @@ async fn main() {
             end_time: u64::MAX,
         },
     );
-    info!("Validator set initialized with {} known Fuji validators", validators.len());
+    info!(
+        "Validator set initialized with {} known Fuji validators",
+        validators.len()
+    );
 
     let node = Arc::new(NodeState {
         identity,
@@ -554,7 +610,10 @@ async fn main() {
                 "P-Chain: {} blocks synced, height {}→{}, chain length {}",
                 p.blocks_synced, p.genesis_height, p.tip_height, p.chain_length
             );
-            let state_root_count = metrics_node.db.iter_cf_owned(avalanche_rs::db::CF_STATE_ROOTS).len();
+            let state_root_count = metrics_node
+                .db
+                .iter_cf_owned(avalanche_rs::db::CF_STATE_ROOTS)
+                .len();
             info!(
                 "C-Chain: {} blocks synced, {} stateRoot mappings",
                 c.blocks_synced, state_root_count
@@ -562,7 +621,10 @@ async fn main() {
 
             // MEV engine stats
             let mev_stats = metrics_node.mev_engine.stats().await;
-            if mev_stats.txs_scanned > 0 || mev_stats.v2_pools_tracked > 0 || mev_stats.v4_pools_tracked > 0 {
+            if mev_stats.txs_scanned > 0
+                || mev_stats.v2_pools_tracked > 0
+                || mev_stats.v4_pools_tracked > 0
+            {
                 info!(
                     "MEV: {} txs scanned, {} swaps, {} arbs, {} sandwiches | {} V2 pools, {} V4 pools",
                     mev_stats.txs_scanned, mev_stats.swaps_detected,
@@ -583,7 +645,11 @@ async fn main() {
             interval.tick().await; // skip first tick
             loop {
                 interval.tick().await;
-                let current = prune_node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+                let current = prune_node
+                    .db
+                    .last_accepted_height()
+                    .unwrap_or(None)
+                    .unwrap_or(0);
                 // Use current height as finalized (conservative — protects tip)
                 let (pruned, bytes) = pruner.prune_once(&prune_node.db, current, current);
                 if pruned > 0 {
@@ -614,10 +680,7 @@ async fn main() {
     }
 
     let uptime = node.start_time.elapsed();
-    info!(
-        "Shutting down after {:.1}s uptime",
-        uptime.as_secs_f64()
-    );
+    info!("Shutting down after {:.1}s uptime", uptime.as_secs_f64());
 
     // Abort background tasks
     p2p_handle.abort();
@@ -678,20 +741,18 @@ async fn handle_inbound_connection(
     };
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let mut tls_stream = match tokio::time::timeout(
-        Duration::from_secs(10),
-        acceptor.accept(stream),
-    ).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn!("TLS accept from {} failed: {}", peer_addr, e);
-            return;
-        }
-        Err(_) => {
-            warn!("TLS accept from {} timed out", peer_addr);
-            return;
-        }
-    };
+    let mut tls_stream =
+        match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!("TLS accept from {} failed: {}", peer_addr, e);
+                return;
+            }
+            Err(_) => {
+                warn!("TLS accept from {} timed out", peer_addr);
+                return;
+            }
+        };
 
     // Extract peer NodeID from cert
     let peer_certs = tls_stream.get_ref().1.peer_certificates();
@@ -745,7 +806,10 @@ async fn handle_inbound_connection(
 async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
     let bootstrap_ips: Vec<String> = if node.config.bootstrap_ips.is_empty() {
         match node.config.network_id {
-            1 => MAINNET_BOOTSTRAP_IPS.iter().map(|s| s.to_string()).collect(),
+            1 => MAINNET_BOOTSTRAP_IPS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             5 => FUJI_BOOTSTRAP_IPS.iter().map(|s| s.to_string()).collect(),
             _ => {
                 warn!("No bootstrap IPs for network_id={}", node.config.network_id);
@@ -824,10 +888,13 @@ async fn read_one_message<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
     timeout_secs: u64,
 ) -> Result<NetworkMessage, Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(timeout_secs), stream.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| format!("read timeout from {}", addr))?
-        .map_err(|e| format!("read length from {}: {}", addr, e))?;
+    tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        stream.read_exact(&mut len_buf),
+    )
+    .await
+    .map_err(|_| format!("read timeout from {}", addr))?
+    .map_err(|e| format!("read length from {}: {}", addr, e))?;
 
     let msg_len = u32::from_be_bytes(len_buf) as usize;
     if msg_len > 16 * 1024 * 1024 {
@@ -835,10 +902,13 @@ async fn read_one_message<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
     }
 
     let mut msg_buf = vec![0u8; msg_len];
-    tokio::time::timeout(Duration::from_secs(timeout_secs), stream.read_exact(&mut msg_buf))
-        .await
-        .map_err(|_| format!("message read timeout from {}", addr))?
-        .map_err(|e| format!("read message from {}: {}", addr, e))?;
+    tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        stream.read_exact(&mut msg_buf),
+    )
+    .await
+    .map_err(|_| format!("message read timeout from {}", addr))?
+    .map_err(|e| format!("read message from {}: {}", addr, e))?;
 
     // Reconstruct length-prefixed buffer for decode_proto
     let mut full_buf = Vec::with_capacity(4 + msg_len);
@@ -854,7 +924,11 @@ async fn read_one_message<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
                 if let Some(ProtoOneOf::CompressedZstd(_)) = &proto_msg.message {
                     if let Ok(inner) = proto::decompress_message(&msg_buf) {
                         // Try to convert decompressed message
-                        debug!("Decompressed message from {}: {:?}", addr, std::mem::discriminant(&inner));
+                        debug!(
+                            "Decompressed message from {}: {:?}",
+                            addr,
+                            std::mem::discriminant(&inner)
+                        );
                     }
                 }
             }
@@ -883,7 +957,9 @@ async fn connect_and_handshake(
     info!("TCP connected to {}", addr);
 
     // 2. TLS upgrade
-    let tls_config = node.identity.tls_client_config()
+    let tls_config = node
+        .identity
+        .tls_client_config()
         .map_err(|e| format!("TLS config: {}", e))?;
 
     let connector = tokio_rustls::TlsConnector::from(tls_config);
@@ -903,7 +979,10 @@ async fn connect_and_handshake(
     let peer_node_id = if let Some(certs) = peer_certs {
         if let Some(cert) = certs.first() {
             let nid = identity::derive_node_id(cert.as_ref());
-            info!("TLS handshake complete with {} → peer NodeID: {}", addr, nid);
+            info!(
+                "TLS handshake complete with {} → peer NodeID: {}",
+                addr, nid
+            );
             nid
         } else {
             warn!("No peer certificate from {}", addr);
@@ -928,9 +1007,13 @@ async fn connect_and_handshake(
     };
 
     // Sign the IP with the TLS key in AvalancheGo format
-    let ip_sig = node.identity.sign_ip_with_tls_key(&my_ip, node.config.staking_port, now);
+    let ip_sig = node
+        .identity
+        .sign_ip_with_tls_key(&my_ip, node.config.staking_port, now);
     // Sign with BLS for proof-of-possession
-    let bls_sig = node.identity.sign_ip_bls(&my_ip, node.config.staking_port, now);
+    let bls_sig = node
+        .identity
+        .sign_ip_bls(&my_ip, node.config.staking_port, now);
 
     // Build protobuf Handshake directly (need BLS sig field)
     use avalanche_rs::proto::pb;
@@ -985,10 +1068,17 @@ async fn connect_and_handshake(
     encoded.extend_from_slice(&len);
     encoded.extend_from_slice(&raw);
 
-    info!("Handshake: network_id={}, ip={:02x?}, port={}, raw_msg={} bytes", 
-        node.config.network_id, &my_ip, node.config.staking_port, encoded.len());
+    info!(
+        "Handshake: network_id={}, ip={:02x?}, port={}, raw_msg={} bytes",
+        node.config.network_id,
+        &my_ip,
+        node.config.staking_port,
+        encoded.len()
+    );
 
-    tls_stream.write_all(&encoded).await
+    tls_stream
+        .write_all(&encoded)
+        .await
         .map_err(|e| format!("send handshake to {}: {}", addr, e))?;
     tls_stream.flush().await.ok();
 
@@ -1013,10 +1103,20 @@ async fn connect_and_handshake(
             }
         };
 
-        info!("Received {} from {} (msg #{})", msg.name(), addr, msg_idx + 1);
+        info!(
+            "Received {} from {} (msg #{})",
+            msg.name(),
+            addr,
+            msg_idx + 1
+        );
 
         match &msg {
-            NetworkMessage::Version { network_id, my_version, node_id, .. } => {
+            NetworkMessage::Version {
+                network_id,
+                my_version,
+                node_id,
+                ..
+            } => {
                 handshake_received = true;
                 info!(
                     "Peer {} handshake: network_id={}, version={}, node_id={}",
@@ -1138,9 +1238,11 @@ async fn connect_and_handshake(
             [0u8; 32]
         }
     };
-    info!("C-Chain ID for network_id={}: 0x{:08x}...",
+    info!(
+        "C-Chain ID for network_id={}: 0x{:08x}...",
         node.config.network_id,
-        u32::from_be_bytes(cchain_id[..4].try_into().unwrap_or([0u8; 4])));
+        u32::from_be_bytes(cchain_id[..4].try_into().unwrap_or([0u8; 4]))
+    );
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -1858,11 +1960,8 @@ async fn connect_and_handshake(
 // bootstrap_p_chain removed — bootstrap logic now lives inside the message loop as a state machine.
 // Keeping this dead code block here as a tombstone to avoid merge confusion.
 #[allow(dead_code)]
-async fn bootstrap_p_chain<S>(
-    stream: &mut S,
-    addr: std::net::SocketAddr,
-    request_id_base: u32,
-) where
+async fn bootstrap_p_chain<S>(stream: &mut S, addr: std::net::SocketAddr, request_id_base: u32)
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let p_chain_id = ChainId([0u8; 32]);
@@ -1876,20 +1975,31 @@ async fn bootstrap_p_chain<S>(
     };
     if let Ok(encoded) = req.encode_proto() {
         if let Err(e) = stream.write_all(&encoded).await {
-            warn!("bootstrap: failed to send GetAcceptedFrontier to {}: {}", addr, e);
+            warn!(
+                "bootstrap: failed to send GetAcceptedFrontier to {}: {}",
+                addr, e
+            );
             return;
         }
         let _ = stream.flush().await;
-        info!("bootstrap: sent GetAcceptedFrontier (req={}) to {}", request_id_base, addr);
+        info!(
+            "bootstrap: sent GetAcceptedFrontier (req={}) to {}",
+            request_id_base, addr
+        );
     }
 
     // Step 2: Wait for AcceptedFrontier
     let frontier_block_id = loop {
         match read_one_message(stream, addr, 30).await {
-            Ok(NetworkMessage::AcceptedFrontier { request_id, container_id, .. })
-                if request_id == request_id_base =>
-            {
-                info!("bootstrap: AcceptedFrontier from {} — tip={}", addr, container_id);
+            Ok(NetworkMessage::AcceptedFrontier {
+                request_id,
+                container_id,
+                ..
+            }) if request_id == request_id_base => {
+                info!(
+                    "bootstrap: AcceptedFrontier from {} — tip={}",
+                    addr, container_id
+                );
                 break container_id;
             }
             Ok(NetworkMessage::Ping { uptime }) => {
@@ -1901,17 +2011,26 @@ async fn bootstrap_p_chain<S>(
                 }
             }
             Ok(other) => {
-                debug!("bootstrap: ignoring {} while waiting for AcceptedFrontier", other.name());
+                debug!(
+                    "bootstrap: ignoring {} while waiting for AcceptedFrontier",
+                    other.name()
+                );
             }
             Err(e) => {
-                warn!("bootstrap: error waiting for AcceptedFrontier from {}: {}", addr, e);
+                warn!(
+                    "bootstrap: error waiting for AcceptedFrontier from {}: {}",
+                    addr, e
+                );
                 return;
             }
         }
     };
 
     if frontier_block_id.0 == [0u8; 32] {
-        info!("bootstrap: peer {} has empty frontier — nothing to bootstrap", addr);
+        info!(
+            "bootstrap: peer {} has empty frontier — nothing to bootstrap",
+            addr
+        );
         return;
     }
 
@@ -1928,16 +2047,26 @@ async fn bootstrap_p_chain<S>(
             return;
         }
         let _ = stream.flush().await;
-        info!("bootstrap: sent GetAccepted (req={}) to {}", request_id_base + 1, addr);
+        info!(
+            "bootstrap: sent GetAccepted (req={}) to {}",
+            request_id_base + 1,
+            addr
+        );
     }
 
     // Step 4: Wait for Accepted
     let accepted_ids = loop {
         match read_one_message(stream, addr, 30).await {
-            Ok(NetworkMessage::Accepted { request_id, container_ids, .. })
-                if request_id == request_id_base + 1 =>
-            {
-                info!("bootstrap: Accepted from {} — {} block IDs", addr, container_ids.len());
+            Ok(NetworkMessage::Accepted {
+                request_id,
+                container_ids,
+                ..
+            }) if request_id == request_id_base + 1 => {
+                info!(
+                    "bootstrap: Accepted from {} — {} block IDs",
+                    addr,
+                    container_ids.len()
+                );
                 break container_ids;
             }
             Ok(NetworkMessage::Ping { uptime }) => {
@@ -1948,7 +2077,10 @@ async fn bootstrap_p_chain<S>(
                 }
             }
             Ok(other) => {
-                debug!("bootstrap: ignoring {} while waiting for Accepted", other.name());
+                debug!(
+                    "bootstrap: ignoring {} while waiting for Accepted",
+                    other.name()
+                );
             }
             Err(e) => {
                 warn!("bootstrap: error waiting for Accepted from {}: {}", addr, e);
@@ -1977,15 +2109,22 @@ async fn bootstrap_p_chain<S>(
             return;
         }
         let _ = stream.flush().await;
-        info!("bootstrap: sent GetAncestors (req={}) for block {} to {}", request_id_base + 2, target, addr);
+        info!(
+            "bootstrap: sent GetAncestors (req={}) for block {} to {}",
+            request_id_base + 2,
+            target,
+            addr
+        );
     }
 
     // Step 6: Wait for Ancestors
     loop {
         match read_one_message(stream, addr, 30).await {
-            Ok(NetworkMessage::Ancestors { request_id, containers, .. })
-                if request_id == request_id_base + 2 =>
-            {
+            Ok(NetworkMessage::Ancestors {
+                request_id,
+                containers,
+                ..
+            }) if request_id == request_id_base + 2 => {
                 info!(
                     "bootstrap: Ancestors from {} — {} containers, total {} bytes",
                     addr,
@@ -2005,10 +2144,16 @@ async fn bootstrap_p_chain<S>(
                 }
             }
             Ok(other) => {
-                debug!("bootstrap: ignoring {} while waiting for Ancestors", other.name());
+                debug!(
+                    "bootstrap: ignoring {} while waiting for Ancestors",
+                    other.name()
+                );
             }
             Err(e) => {
-                warn!("bootstrap: error waiting for Ancestors from {}: {}", addr, e);
+                warn!(
+                    "bootstrap: error waiting for Ancestors from {}: {}",
+                    addr, e
+                );
                 break;
             }
         }
@@ -2081,7 +2226,10 @@ async fn run_block_builder(node: Arc<NodeState>) {
                 key.extend_from_slice(b"c:");
                 key.extend_from_slice(&block.id);
                 if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, &block.raw) {
-                    warn!("Block builder: failed to store block #{}: {}", block.number, e);
+                    warn!(
+                        "Block builder: failed to store block #{}: {}",
+                        block.number, e
+                    );
                     continue;
                 }
 
@@ -2097,7 +2245,10 @@ async fn run_block_builder(node: Arc<NodeState>) {
                 broadcast_block_to_peers(&node, &block).await;
             }
             Err(e) => {
-                debug!("Block builder: failed to build block #{}: {}", block_number, e);
+                debug!(
+                    "Block builder: failed to build block #{}: {}",
+                    block_number, e
+                );
             }
         }
     }
@@ -2152,7 +2303,8 @@ async fn build_cchain_block(
 
     let (block_result, state_root) = {
         let mut evm = node.evm.write().await;
-        let result = evm.execute_block(&txs, &ctx)
+        let result = evm
+            .execute_block(&txs, &ctx)
             .map_err(|e| format!("EVM execution: {}", e))?;
         // Compute a simple state root (will be refined by Feature 4)
         let state_root = evm.compute_state_root_simple();
@@ -2213,7 +2365,9 @@ fn encode_cchain_block_rlp(
         out
     }
     fn rlp_u64(v: u64) -> Vec<u8> {
-        if v == 0 { return vec![0x80]; }
+        if v == 0 {
+            return vec![0x80];
+        }
         let b = v.to_be_bytes();
         let s = b.iter().position(|&x| x != 0).unwrap_or(7);
         let sl = &b[s..];
@@ -2241,24 +2395,26 @@ fn encode_cchain_block_rlp(
     let empty256 = [0u8; 256];
 
     let mut header_payload: Vec<u8> = Vec::new();
-    header_payload.extend(rlp_bytes32(parent_hash));                  // parentHash
-    header_payload.extend(rlp_bytes32(&empty32));                      // sha3Uncles (empty)
-    header_payload.extend(rlp_bytes20(coinbase));                      // miner
-    header_payload.extend(rlp_bytes32(state_root));                    // stateRoot
-    header_payload.extend(rlp_bytes32(&empty32));                      // txsRoot (empty)
-    header_payload.extend(rlp_bytes32(&empty32));                      // receiptRoot (empty)
-    header_payload.push(0xb9); header_payload.push(0x01); header_payload.push(0x00);
-    header_payload.extend_from_slice(&empty256);                       // bloom (256 bytes)
-    header_payload.push(0x80);                                         // difficulty = 0
-    header_payload.extend(rlp_u64(number));                           // number
-    header_payload.extend(rlp_u64(gas_limit));                        // gasLimit
-    header_payload.extend(rlp_u64(gas_used));                         // gasUsed
-    header_payload.extend(rlp_u64(timestamp));                        // timestamp
-    header_payload.push(0x80);                                         // extraData (empty)
-    header_payload.extend(rlp_bytes32(&empty32));                      // mixHash
-    // nonce: 8 zero bytes = 0x8800000000000000
+    header_payload.extend(rlp_bytes32(parent_hash)); // parentHash
+    header_payload.extend(rlp_bytes32(&empty32)); // sha3Uncles (empty)
+    header_payload.extend(rlp_bytes20(coinbase)); // miner
+    header_payload.extend(rlp_bytes32(state_root)); // stateRoot
+    header_payload.extend(rlp_bytes32(&empty32)); // txsRoot (empty)
+    header_payload.extend(rlp_bytes32(&empty32)); // receiptRoot (empty)
+    header_payload.push(0xb9);
+    header_payload.push(0x01);
+    header_payload.push(0x00);
+    header_payload.extend_from_slice(&empty256); // bloom (256 bytes)
+    header_payload.push(0x80); // difficulty = 0
+    header_payload.extend(rlp_u64(number)); // number
+    header_payload.extend(rlp_u64(gas_limit)); // gasLimit
+    header_payload.extend(rlp_u64(gas_used)); // gasUsed
+    header_payload.extend(rlp_u64(timestamp)); // timestamp
+    header_payload.push(0x80); // extraData (empty)
+    header_payload.extend(rlp_bytes32(&empty32)); // mixHash
+                                                  // nonce: 8 zero bytes = 0x8800000000000000
     header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]); // nonce
-    header_payload.extend(rlp_u64(base_fee));                         // baseFeePerGas
+    header_payload.extend(rlp_u64(base_fee)); // baseFeePerGas
 
     let header = rlp_list(header_payload);
     let uncles = 0xc0u8; // empty uncles list
@@ -2316,7 +2472,8 @@ async fn broadcast_block_to_peers(node: &NodeState, block: &BuiltBlock) {
     if let Ok(encoded) = push_query.encode_proto() {
         info!(
             "Block builder: broadcasting block #{} to {} peers",
-            block.number, peers.len()
+            block.number,
+            peers.len()
         );
         for peer_addr in peers {
             // Non-blocking best-effort TCP send to the peer's staking port
@@ -2407,7 +2564,10 @@ async fn execute_cchain_block_and_store(
                 rec_bytes.extend_from_slice(&receipt.gas_used.to_le_bytes());
                 rec_bytes.extend_from_slice(&(receipt.logs.len() as u32).to_le_bytes());
                 if let Err(e) = db.put_receipt(fields.number, idx as u32, &rec_bytes) {
-                    debug!("receipt store failed for block #{} tx {}: {}", fields.number, idx, e);
+                    debug!(
+                        "receipt store failed for block #{} tx {}: {}",
+                        fields.number, idx, e
+                    );
                 }
             }
 
@@ -2495,7 +2655,9 @@ fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
 /// Parse a hex string to a 20-byte address.
 fn parse_hex_address(s: &str) -> Option<[u8; 20]> {
     let bytes = parse_hex_bytes(s)?;
-    if bytes.len() != 20 { return None; }
+    if bytes.len() != 20 {
+        return None;
+    }
     let mut arr = [0u8; 20];
     arr.copy_from_slice(&bytes);
     Some(arr)
@@ -2504,7 +2666,9 @@ fn parse_hex_address(s: &str) -> Option<[u8; 20]> {
 /// Parse a hex string to a 32-byte hash.
 fn parse_hex_hash(s: &str) -> Option<[u8; 32]> {
     let bytes = parse_hex_bytes(s)?;
-    if bytes.len() != 32 { return None; }
+    if bytes.len() != 32 {
+        return None;
+    }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Some(arr)
@@ -2534,7 +2698,10 @@ fn rpc_error(code: i32, message: &str, id: &serde_json::Value) -> String {
 
 /// JSON-RPC success response helper.
 fn rpc_ok(result: &str, id: &serde_json::Value) -> String {
-    format!("{{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":{}}}", result, id)
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":{}}}",
+        result, id
+    )
 }
 
 /// In-memory log filter for eth_newFilter/getFilterChanges/uninstallFilter.
@@ -2549,8 +2716,8 @@ struct LogFilter {
 /// Global filter state — use a simple counter + HashMap behind RwLock.
 static NEXT_FILTER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-use std::collections::HashMap as StdHashMap;
 use once_cell::sync::Lazy;
+use std::collections::HashMap as StdHashMap;
 
 static FILTERS: Lazy<RwLock<StdHashMap<u64, LogFilter>>> =
     Lazy::new(|| RwLock::new(StdHashMap::new()));
@@ -3087,7 +3254,11 @@ fn analyze_chain_graphs(node: &NodeState) {
 
     for (key, value) in &all_blocks {
         let is_cchain = key.len() == 34 && &key[..2] == c_prefix;
-        let chain = if is_cchain { Chain::CChain } else { Chain::PChain };
+        let chain = if is_cchain {
+            Chain::CChain
+        } else {
+            Chain::PChain
+        };
 
         match BlockHeader::parse(value, chain) {
             Ok(header) => {
@@ -3294,8 +3465,7 @@ mod integration_tests {
 fn init_logging(level: &str, format: &str) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     match format {
         "json" => {

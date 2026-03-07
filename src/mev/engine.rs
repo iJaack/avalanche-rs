@@ -1,13 +1,13 @@
 //! MEV Engine — integrates mempool monitoring, pool scanning, and opportunity detection
 //! into the live node pipeline.
 
+use super::v4::{PoolKey, V4ArbOpportunity, V4PoolScanner};
 use super::*;
-use super::v4::{V4PoolScanner, PoolKey, V4ArbOpportunity};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use serde::{Serialize, Deserialize};
 
 // ============================================================================
 // MEV ENGINE — unified interface for all MEV strategies
@@ -147,8 +147,17 @@ impl MevEngine {
     }
 
     /// Register a V4 pool
-    pub async fn register_v4_pool(&self, key: PoolKey, sqrt_price: U256, liquidity: u128, tick: i32) {
-        self.v4_scanner.write().await.add_pool(key, sqrt_price, liquidity, tick);
+    pub async fn register_v4_pool(
+        &self,
+        key: PoolKey,
+        sqrt_price: U256,
+        liquidity: u128,
+        tick: i32,
+    ) {
+        self.v4_scanner
+            .write()
+            .await
+            .add_pool(key, sqrt_price, liquidity, tick);
         self.stats.write().await.v4_pools_tracked += 1;
     }
 
@@ -167,7 +176,9 @@ impl MevEngine {
 
         // Find arbitrage between pools with same pair
         for ((t0, t1), pair) in &pair_pools {
-            if pair.len() < 2 { continue; }
+            if pair.len() < 2 {
+                continue;
+            }
 
             for i in 0..pair.len() {
                 for j in (i + 1)..pair.len() {
@@ -177,18 +188,23 @@ impl MevEngine {
                     // Calculate spot prices
                     let price_a = if !pool_a.reserve0.is_zero() {
                         pool_a.reserve1.to_f64() / pool_a.reserve0.to_f64()
-                    } else { continue };
+                    } else {
+                        continue;
+                    };
                     let price_b = if !pool_b.reserve0.is_zero() {
                         pool_b.reserve1.to_f64() / pool_b.reserve0.to_f64()
-                    } else { continue };
+                    } else {
+                        continue;
+                    };
 
                     // Use DEX protocol from pool addresses
                     let dex_a = DexProtocol::from_address(&pool_a.address);
                     let dex_b = DexProtocol::from_address(&pool_b.address);
 
-                    if let Some(opp) = self.monitor.evaluate_arbitrage(
-                        t0, t1, price_a, price_b, dex_a, dex_b,
-                    ) {
+                    if let Some(opp) = self
+                        .monitor
+                        .evaluate_arbitrage(t0, t1, price_a, price_b, dex_a, dex_b)
+                    {
                         let timed = TimedOpportunity {
                             opportunity: opp,
                             detected_at_ms: self.start_time.elapsed().as_millis() as u64,
@@ -204,9 +220,19 @@ impl MevEngine {
     }
 
     /// Check for V4 cross-pool arbitrage
-    pub async fn scan_v4_arbitrage(&self, token0: &str, token1: &str, amount: U256) -> Option<V4ArbOpportunity> {
-        if !self.config.enable_v4 { return None; }
-        self.v4_scanner.read().await.find_v4_arb(token0, token1, amount)
+    pub async fn scan_v4_arbitrage(
+        &self,
+        token0: &str,
+        token1: &str,
+        amount: U256,
+    ) -> Option<V4ArbOpportunity> {
+        if !self.config.enable_v4 {
+            return None;
+        }
+        self.v4_scanner
+            .read()
+            .await
+            .find_v4_arb(token0, token1, amount)
     }
 
     /// Process a confirmed block — extract pool state updates from swap events
@@ -296,8 +322,8 @@ impl MevEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tokens;
+    use super::*;
 
     #[tokio::test]
     async fn test_engine_creation() {
@@ -356,7 +382,10 @@ mod tests {
 
         engine.process_pending_tx(&tx, 100).await;
         let stats = engine.stats().await;
-        assert_eq!(stats.swaps_detected, 1, "Should detect 1 swap via MULTICALL fallback");
+        assert_eq!(
+            stats.swaps_detected, 1,
+            "Should detect 1 swap via MULTICALL fallback"
+        );
     }
 
     #[tokio::test]
@@ -379,7 +408,9 @@ mod tests {
     async fn test_engine_register_v4_pool() {
         let engine = MevEngine::new(MevEngineConfig::default());
         let key = PoolKey::new(tokens::WAVAX, tokens::USDC, 3000, 60, "0x0");
-        engine.register_v4_pool(key, U256::from_u128(1_000_000), 1_000_000, 0).await;
+        engine
+            .register_v4_pool(key, U256::from_u128(1_000_000), 1_000_000, 0)
+            .await;
         assert_eq!(engine.v4_pool_count().await, 1);
     }
 
@@ -417,7 +448,10 @@ mod tests {
 
         engine.scan_v2_arbitrage().await;
         let stats = engine.stats().await;
-        assert!(stats.arbitrages_found > 0, "Should find arbitrage between different-priced pools");
+        assert!(
+            stats.arbitrages_found > 0,
+            "Should find arbitrage between different-priced pools"
+        );
     }
 
     #[tokio::test]
@@ -430,9 +464,13 @@ mod tests {
         // Add an opportunity
         let opp = TimedOpportunity {
             opportunity: MevOpportunity::Arbitrage {
-                token_a: "A".into(), token_b: "B".into(),
-                buy_dex: DexProtocol::TraderJoe, sell_dex: DexProtocol::Pangolin,
-                buy_price: 1.0, sell_price: 1.1, spread_bps: 100.0,
+                token_a: "A".into(),
+                token_b: "B".into(),
+                buy_dex: DexProtocol::TraderJoe,
+                sell_dex: DexProtocol::Pangolin,
+                buy_price: 1.0,
+                sell_price: 1.1,
+                spread_bps: 100.0,
                 estimated_profit: U256::from_u64(100),
                 gas_cost: U256::from_u64(10),
                 net_profit: U256::from_u64(90),
@@ -447,7 +485,11 @@ mod tests {
         // Wait a tiny bit then prune
         tokio::time::sleep(Duration::from_millis(10)).await;
         engine.prune_stale().await;
-        assert_eq!(engine.top_opportunities(10).await.len(), 0, "Stale opportunities should be pruned");
+        assert_eq!(
+            engine.top_opportunities(10).await.len(),
+            0,
+            "Stale opportunities should be pruned"
+        );
     }
 
     #[tokio::test]
@@ -460,9 +502,13 @@ mod tests {
         for i in 0..5 {
             let opp = TimedOpportunity {
                 opportunity: MevOpportunity::Arbitrage {
-                    token_a: "A".into(), token_b: "B".into(),
-                    buy_dex: DexProtocol::TraderJoe, sell_dex: DexProtocol::Pangolin,
-                    buy_price: 1.0, sell_price: 1.1, spread_bps: 100.0,
+                    token_a: "A".into(),
+                    token_b: "B".into(),
+                    buy_dex: DexProtocol::TraderJoe,
+                    sell_dex: DexProtocol::Pangolin,
+                    buy_price: 1.0,
+                    sell_price: 1.1,
+                    spread_bps: 100.0,
                     estimated_profit: U256::from_u64(100 + i),
                     gas_cost: U256::from_u64(10),
                     net_profit: U256::from_u64(90 + i),
@@ -489,13 +535,17 @@ mod tests {
     #[tokio::test]
     async fn test_engine_process_block() {
         let engine = MevEngine::new(MevEngineConfig::default());
-        let txs = vec![
-            PendingTx {
-                hash: "0x1".into(), from: "0x".into(), to: Some("0x".into()),
-                value: U256::ZERO, gas_price: U256::from_u64(25_000_000_000),
-                gas_limit: 21000, input: vec![], nonce: 0, timestamp: 0,
-            },
-        ];
+        let txs = vec![PendingTx {
+            hash: "0x1".into(),
+            from: "0x".into(),
+            to: Some("0x".into()),
+            value: U256::ZERO,
+            gas_price: U256::from_u64(25_000_000_000),
+            gas_limit: 21000,
+            input: vec![],
+            nonce: 0,
+            timestamp: 0,
+        }];
         engine.process_block(100, &txs).await;
         let stats = engine.stats().await;
         assert_eq!(stats.blocks_scanned, 1);

@@ -57,5 +57,10 @@ fn bench_sha256(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_json_roundtrip, bench_hex_encoding, bench_sha256);
+criterion_group!(
+    benches,
+    bench_json_roundtrip,
+    bench_hex_encoding,
+    bench_sha256
+);
 criterion_main!(benches);

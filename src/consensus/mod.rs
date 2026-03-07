@@ -142,7 +142,11 @@ impl SnowmanConsensus {
 
     /// Create with custom alpha/beta parameters.
     pub fn with_params(alpha: u32, beta: u32) -> Self {
-        Self { alpha, beta, ..Default::default() }
+        Self {
+            alpha,
+            beta,
+            ..Default::default()
+        }
     }
 
     /// Accept a block, advancing `last_accepted` and clearing it from pending.
@@ -171,13 +175,14 @@ impl SnowmanConsensus {
 
     /// Get the decision status of a block.
     pub fn block_status(&self, block_id: &[u8; 32]) -> BlockStatus {
-        self.decisions.get(block_id).copied().unwrap_or(
-            if self.pending.contains_key(block_id) {
+        self.decisions
+            .get(block_id)
+            .copied()
+            .unwrap_or(if self.pending.contains_key(block_id) {
                 BlockStatus::Processing
             } else {
                 BlockStatus::Processing
-            }
-        )
+            })
     }
 
     /// Update the preferred tip (without finalizing).
@@ -227,7 +232,9 @@ impl SnowmanConsensus {
                     if current_pref == *block_id {
                         false // already preferred
                     } else {
-                        let current_conf = self.confidence.get(&current_pref)
+                        let current_conf = self
+                            .confidence
+                            .get(&current_pref)
                             .map(|c| c.consecutive)
                             .unwrap_or(0);
                         new_consecutive > current_conf
@@ -241,17 +248,19 @@ impl SnowmanConsensus {
 
                 // Check beta threshold for finality
                 if new_consecutive >= self.beta {
-                    let header = self.pending.get(block_id).cloned().unwrap_or_else(|| {
-                        BlockHeader {
-                            id: *block_id,
-                            parent_id: [0u8; 32],
-                            height: 0,
-                            timestamp: 0,
-                            block_type: crate::block::BlockType::Unknown(0),
-                            raw_size: 0,
-                            raw_bytes: Vec::new(),
-                        }
-                    });
+                    let header =
+                        self.pending
+                            .get(block_id)
+                            .cloned()
+                            .unwrap_or_else(|| BlockHeader {
+                                id: *block_id,
+                                parent_id: [0u8; 32],
+                                height: 0,
+                                timestamp: 0,
+                                block_type: crate::block::BlockType::Unknown(0),
+                                raw_size: 0,
+                                raw_bytes: Vec::new(),
+                            });
                     self.accept_block(&header);
                     accepted.push(*block_id);
                 }
@@ -379,7 +388,17 @@ mod tests {
         let mut sc = SnowmanConsensus::new();
 
         let headers: Vec<BlockHeader> = (0u64..5)
-            .map(|h| make_header([h as u8; 32], if h == 0 { [0u8; 32] } else { [(h - 1) as u8; 32] }, h))
+            .map(|h| {
+                make_header(
+                    [h as u8; 32],
+                    if h == 0 {
+                        [0u8; 32]
+                    } else {
+                        [(h - 1) as u8; 32]
+                    },
+                    h,
+                )
+            })
             .collect();
 
         for h in &headers {
@@ -422,7 +441,7 @@ mod tests {
         for _i in 0..19 {
             assert!(!consensus.record_vote(block_id)); // build up to 19 votes
         }
-        
+
         // 20th vote should trigger finality
         assert!(consensus.record_vote(block_id));
         // After acceptance, the block is no longer in pending but should be last_accepted

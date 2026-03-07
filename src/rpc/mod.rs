@@ -1,19 +1,19 @@
 //! Avalanche JSON-RPC Client
-//! 
+//!
 //! Production-grade async HTTP client for Avalanche node communication.
 //! Supports X-chain, C-chain, and P-chain methods with connection pooling,
 //! timeout handling, and automatic retry logic.
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, StatusCode, Uri};
+use hyper_tls::HttpsConnector;
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::TokioExecutor;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use serde_json::{json, Value};
-use serde::{Serialize, Deserialize};
-use hyper::{Request, StatusCode, Uri};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
-use hyper_tls::HttpsConnector;
-use http_body_util::{BodyExt, Full};
-use bytes::Bytes;
 
 // ============================================================================
 // ERROR TYPES
@@ -229,18 +229,17 @@ impl RpcClient {
 
     /// Generate next request ID
     fn next_id(&self) -> u64 {
-        let mut counter = self.request_id_counter.lock().expect("request_id_counter mutex poisoned");
+        let mut counter = self
+            .request_id_counter
+            .lock()
+            .expect("request_id_counter mutex poisoned");
         let id = *counter;
         *counter = counter.wrapping_add(1);
         id
     }
 
     /// Core RPC call method with retry logic
-    pub async fn call(
-        &self,
-        method: impl Into<String>,
-        params: Vec<Value>,
-    ) -> Result<Value> {
+    pub async fn call(&self, method: impl Into<String>, params: Vec<Value>) -> Result<Value> {
         let method = method.into();
         let mut last_error = None;
 
@@ -252,8 +251,7 @@ impl RpcClient {
 
                     if attempt < self.config.max_retries {
                         // Exponential backoff: 100ms * 2^attempt
-                        let backoff_ms =
-                            self.config.retry_backoff_ms * (2u64.pow(attempt));
+                        let backoff_ms = self.config.retry_backoff_ms * (2u64.pow(attempt));
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     }
                 }
@@ -266,11 +264,7 @@ impl RpcClient {
     }
 
     /// Internal call implementation (single attempt)
-    async fn call_internal(
-        &self,
-        method: &str,
-        params: Vec<Value>,
-    ) -> Result<Value> {
+    async fn call_internal(&self, method: &str, params: Vec<Value>) -> Result<Value> {
         let id = self.next_id();
 
         let request_body = JsonRpcRequest {
@@ -283,7 +277,9 @@ impl RpcClient {
         let body_str = serde_json::to_string(&request_body)
             .map_err(|e| RpcClientError::ParseError(e.to_string()))?;
 
-        let uri: Uri = self.endpoint.parse()
+        let uri: Uri = self
+            .endpoint
+            .parse()
             .map_err(|_| RpcClientError::InvalidParams("Invalid endpoint URI".to_string()))?;
 
         let request = Request::builder()
@@ -294,13 +290,12 @@ impl RpcClient {
             .map_err(|e: hyper::http::Error| RpcClientError::NetworkError(e.to_string()))?;
 
         // Execute request with timeout
-        let response = tokio::time::timeout(
-            self.config.timeout,
-            self.client.request(request),
-        )
-        .await
-        .map_err(|_: tokio::time::error::Elapsed| RpcClientError::TimeoutError)?
-        .map_err(|e: hyper_util::client::legacy::Error| RpcClientError::NetworkError(e.to_string()))?;
+        let response = tokio::time::timeout(self.config.timeout, self.client.request(request))
+            .await
+            .map_err(|_: tokio::time::error::Elapsed| RpcClientError::TimeoutError)?
+            .map_err(|e: hyper_util::client::legacy::Error| {
+                RpcClientError::NetworkError(e.to_string())
+            })?;
 
         if response.status() != StatusCode::OK {
             return Err(RpcClientError::NetworkError(format!(
@@ -311,7 +306,8 @@ impl RpcClient {
         }
 
         // Read response body
-        let body_bytes = response.into_body()
+        let body_bytes = response
+            .into_body()
             .collect()
             .await
             .map_err(|e: hyper::Error| RpcClientError::NetworkError(e.to_string()))?
@@ -341,15 +337,9 @@ impl RpcClient {
 impl RpcClient {
     /// Get balance for an address on X-chain
     pub async fn x_get_balance(&self, address: &str) -> Result<BalanceResponse> {
-        let result = self
-            .call(
-                "avm.getBalance",
-                vec![json!(address)],
-            )
-            .await?;
+        let result = self.call("avm.getBalance", vec![json!(address)]).await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get UTXOs for an address on X-chain
@@ -364,15 +354,9 @@ impl RpcClient {
 
     /// Send transaction on X-chain
     pub async fn x_send_transaction(&self, tx: &str) -> Result<TransactionResponse> {
-        let result = self
-            .call(
-                "avm.sendTx",
-                vec![json!(tx)],
-            )
-            .await?;
+        let result = self.call("avm.sendTx", vec![json!(tx)]).await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 }
 
@@ -383,25 +367,18 @@ impl RpcClient {
 impl RpcClient {
     /// Get block number on C-chain
     pub async fn c_block_number(&self) -> Result<String> {
-        let result = self
-            .call("eth_blockNumber", vec![])
-            .await?;
+        let result = self.call("eth_blockNumber", vec![]).await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get balance for an address on C-chain
     pub async fn c_get_balance(&self, address: &str, block: &str) -> Result<String> {
         let result = self
-            .call(
-                "eth_getBalance",
-                vec![json!(address), json!(block)],
-            )
+            .call("eth_getBalance", vec![json!(address), json!(block)])
             .await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get block by number on C-chain
@@ -413,21 +390,14 @@ impl RpcClient {
             )
             .await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Send transaction on C-chain
     pub async fn c_send_transaction(&self, tx: &str) -> Result<String> {
-        let result = self
-            .call(
-                "eth_sendRawTransaction",
-                vec![json!(tx)],
-            )
-            .await?;
+        let result = self.call("eth_sendRawTransaction", vec![json!(tx)]).await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get transaction receipt on C-chain
@@ -441,15 +411,11 @@ impl RpcClient {
         let result = self
             .call(
                 "eth_call",
-                vec![
-                    json!({ "to": to, "data": data }),
-                    json!(block),
-                ],
+                vec![json!({ "to": to, "data": data }), json!(block)],
             )
             .await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get account nonce (transaction count)
@@ -461,26 +427,28 @@ impl RpcClient {
             )
             .await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get current gas price
     pub async fn c_gas_price(&self) -> Result<String> {
         let result = self.call("eth_gasPrice", vec![]).await?;
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get chain ID
     pub async fn c_chain_id(&self) -> Result<String> {
         let result = self.call("eth_chainId", vec![]).await?;
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Estimate gas for a transaction
-    pub async fn c_estimate_gas(&self, to: &str, data: &str, value: Option<&str>) -> Result<String> {
+    pub async fn c_estimate_gas(
+        &self,
+        to: &str,
+        data: &str,
+        value: Option<&str>,
+    ) -> Result<String> {
         let mut tx = serde_json::Map::new();
         tx.insert("to".into(), json!(to));
         tx.insert("data".into(), json!(data));
@@ -492,8 +460,7 @@ impl RpcClient {
             .call("eth_estimateGas", vec![Value::Object(tx)])
             .await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get pending transactions from txpool (if available)
@@ -522,12 +489,9 @@ impl RpcClient {
             params.push(json!(id));
         }
 
-        let result = self
-            .call("platform.getCurrentValidators", params)
-            .await?;
+        let result = self.call("platform.getCurrentValidators", params).await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get all validators on P-chain
@@ -537,12 +501,9 @@ impl RpcClient {
             params.push(json!(id));
         }
 
-        let result = self
-            .call("platform.getValidators", params)
-            .await?;
+        let result = self.call("platform.getValidators", params).await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get pending validators on P-chain
@@ -555,25 +516,18 @@ impl RpcClient {
             params.push(json!(id));
         }
 
-        let result = self
-            .call("platform.getPendingValidators", params)
-            .await?;
+        let result = self.call("platform.getPendingValidators", params).await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 
     /// Get info about a specific validator
     pub async fn p_get_validator_info(&self, node_id: &str) -> Result<ValidatorInfo> {
         let result = self
-            .call(
-                "platform.getValidator",
-                vec![json!(node_id)],
-            )
+            .call("platform.getValidator", vec![json!(node_id)])
             .await?;
 
-        serde_json::from_value(result)
-            .map_err(|e| RpcClientError::ParseError(e.to_string()))
+        serde_json::from_value(result).map_err(|e| RpcClientError::ParseError(e.to_string()))
     }
 }
 

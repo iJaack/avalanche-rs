@@ -252,7 +252,8 @@ impl NetworkMessage {
 
     /// Serialize to bytes (length-prefixed JSON for now; production would use protobuf).
     pub fn encode(&self) -> Result<Vec<u8>, NetworkError> {
-        let json = serde_json::to_vec(self).map_err(|e| NetworkError::Serialization(e.to_string()))?;
+        let json =
+            serde_json::to_vec(self).map_err(|e| NetworkError::Serialization(e.to_string()))?;
         let len = (json.len() as u32).to_be_bytes();
         let mut buf = Vec::with_capacity(4 + json.len());
         buf.extend_from_slice(&len);
@@ -625,9 +626,7 @@ impl PeerManager {
     pub fn check_timeouts(&self) -> Vec<NodeId> {
         self.peers
             .values()
-            .filter(|p| {
-                p.state == PeerState::Connected && p.is_timed_out(self.config.peer_timeout)
-            })
+            .filter(|p| p.state == PeerState::Connected && p.is_timed_out(self.config.peer_timeout))
             .map(|p| p.node_id.clone())
             .collect()
     }
@@ -723,10 +722,12 @@ impl TlsConfig {
             return Err(NetworkError::TlsError("empty private key".into()));
         }
         // Check PEM markers
-        let cert_str =
-            std::str::from_utf8(&self.cert_pem).map_err(|_| NetworkError::TlsError("invalid cert encoding".into()))?;
+        let cert_str = std::str::from_utf8(&self.cert_pem)
+            .map_err(|_| NetworkError::TlsError("invalid cert encoding".into()))?;
         if !cert_str.contains("BEGIN CERTIFICATE") {
-            return Err(NetworkError::TlsError("missing BEGIN CERTIFICATE marker".into()));
+            return Err(NetworkError::TlsError(
+                "missing BEGIN CERTIFICATE marker".into(),
+            ));
         }
         Ok(())
     }
@@ -766,7 +767,12 @@ impl ConnectionPool {
     }
 
     /// Open a connection to a peer.
-    pub fn connect(&mut self, node_id: NodeId, addr: SocketAddr, queue_limit: usize) -> Result<(), NetworkError> {
+    pub fn connect(
+        &mut self,
+        node_id: NodeId,
+        addr: SocketAddr,
+        queue_limit: usize,
+    ) -> Result<(), NetworkError> {
         if self.connections.len() >= self.max_connections {
             return Err(NetworkError::PoolExhausted);
         }
@@ -783,7 +789,11 @@ impl ConnectionPool {
     }
 
     /// Queue a message for sending to a peer. Applies backpressure if queue is full.
-    pub fn enqueue_message(&mut self, node_id: &NodeId, msg: NetworkMessage) -> Result<(), NetworkError> {
+    pub fn enqueue_message(
+        &mut self,
+        node_id: &NodeId,
+        msg: NetworkMessage,
+    ) -> Result<(), NetworkError> {
         let conn = self
             .connections
             .get_mut(node_id)
@@ -872,7 +882,11 @@ pub struct NetworkStats {
 }
 
 impl NetworkManager {
-    pub fn new(config: NetworkConfig, local_node_id: NodeId, tls_config: Option<TlsConfig>) -> Self {
+    pub fn new(
+        config: NetworkConfig,
+        local_node_id: NodeId,
+        tls_config: Option<TlsConfig>,
+    ) -> Self {
         let inbound_limit = config.inbound_buffer_size;
         let max_conns = config.max_peers;
         Self {
@@ -895,7 +909,9 @@ impl NetworkManager {
                 tls.validate()?;
             }
         } else if self.config.require_tls {
-            return Err(NetworkError::TlsError("TLS required but no config provided".into()));
+            return Err(NetworkError::TlsError(
+                "TLS required but no config provided".into(),
+            ));
         }
         self.is_running = true;
         Ok(())
@@ -933,7 +949,8 @@ impl NetworkManager {
             sig: Vec::new(),
             tracked_subnets: Vec::new(),
         };
-        self.connection_pool.enqueue_message(&node_id, version_msg)?;
+        self.connection_pool
+            .enqueue_message(&node_id, version_msg)?;
 
         // Update peer state
         if let Some(p) = self.peer_manager.get_peer_mut(&node_id) {
@@ -944,7 +961,11 @@ impl NetworkManager {
     }
 
     /// Send a message to a specific peer.
-    pub fn send_message(&mut self, node_id: &NodeId, msg: NetworkMessage) -> Result<usize, NetworkError> {
+    pub fn send_message(
+        &mut self,
+        node_id: &NodeId,
+        msg: NetworkMessage,
+    ) -> Result<usize, NetworkError> {
         if !self.is_running {
             return Err(NetworkError::Shutdown);
         }
@@ -981,7 +1002,11 @@ impl NetworkManager {
     }
 
     /// Simulate receiving a message from a peer (used by transport layer / tests).
-    pub fn inject_inbound(&mut self, from: NodeId, msg: NetworkMessage) -> Result<(), NetworkError> {
+    pub fn inject_inbound(
+        &mut self,
+        from: NodeId,
+        msg: NetworkMessage,
+    ) -> Result<(), NetworkError> {
         if self.inbound_buffer.len() >= self.inbound_buffer_limit {
             // Backpressure: drop oldest
             self.inbound_buffer.pop_front();
@@ -1001,7 +1026,11 @@ impl NetworkManager {
     }
 
     /// Process a received Version message to complete handshake.
-    pub fn handle_version(&mut self, from: &NodeId, version_msg: &NetworkMessage) -> Result<(), NetworkError> {
+    pub fn handle_version(
+        &mut self,
+        from: &NodeId,
+        version_msg: &NetworkMessage,
+    ) -> Result<(), NetworkError> {
         if let NetworkMessage::Version {
             network_id,
             node_id: _,
@@ -1027,7 +1056,9 @@ impl NetworkManager {
 
             Ok(())
         } else {
-            Err(NetworkError::InvalidMessage("expected Version message".into()))
+            Err(NetworkError::InvalidMessage(
+                "expected Version message".into(),
+            ))
         }
     }
 
@@ -1143,7 +1174,13 @@ pub struct ConsensusBlock {
 }
 
 impl ConsensusBlock {
-    pub fn new(id: BlockId, parent_id: BlockId, height: u64, timestamp: u64, bytes: Vec<u8>) -> Self {
+    pub fn new(
+        id: BlockId,
+        parent_id: BlockId,
+        height: u64,
+        timestamp: u64,
+        bytes: Vec<u8>,
+    ) -> Self {
         Self {
             id,
             parent_id,
@@ -1401,7 +1438,8 @@ impl SnowballInstance {
             } else {
                 // Preference changed — update and reset confidence
                 // Only change preference if cumulative votes favor the new block
-                let current_cumulative = self.vote_counts.get(&self.preference).copied().unwrap_or(0);
+                let current_cumulative =
+                    self.vote_counts.get(&self.preference).copied().unwrap_or(0);
                 let new_cumulative = self.vote_counts.get(&top_block).copied().unwrap_or(0);
 
                 if new_cumulative > current_cumulative {
@@ -1514,7 +1552,11 @@ impl SnowmanConsensus {
         }
 
         // Validate parent is accepted or processing
-        let parent_status = self.blocks.get(&parent_id).map(|b| b.status.clone()).unwrap();
+        let parent_status = self
+            .blocks
+            .get(&parent_id)
+            .map(|b| b.status.clone())
+            .unwrap();
         match parent_status {
             BlockStatus::Rejected => {
                 return Err(ConsensusError::RejectedParent(parent_id));
@@ -1527,7 +1569,9 @@ impl SnowmanConsensus {
 
         // Check if we're at capacity
         if self.processing.len() >= self.params.max_outstanding {
-            return Err(ConsensusError::TooManyProcessing(self.params.max_outstanding));
+            return Err(ConsensusError::TooManyProcessing(
+                self.params.max_outstanding,
+            ));
         }
 
         // Validate height
@@ -1596,7 +1640,12 @@ impl SnowmanConsensus {
         };
 
         if became_final {
-            let accepted_id = self.snowball_instances.get(&height).unwrap().preference.clone();
+            let accepted_id = self
+                .snowball_instances
+                .get(&height)
+                .unwrap()
+                .preference
+                .clone();
 
             // Accept the winning block
             if let Some(block) = self.blocks.get_mut(&accepted_id) {
@@ -1608,7 +1657,11 @@ impl SnowmanConsensus {
                     block_id: accepted_id.clone(),
                     height,
                     status: BlockStatus::Accepted,
-                    rounds: self.snowball_instances.get(&height).map(|s| s.rounds).unwrap_or(0),
+                    rounds: self
+                        .snowball_instances
+                        .get(&height)
+                        .map(|s| s.rounds)
+                        .unwrap_or(0),
                     decided_at: Instant::now(),
                 });
 
@@ -1682,7 +1735,9 @@ impl SnowmanConsensus {
 
     /// Get the preferred block at a given height.
     pub fn preferred_at_height(&self, height: u64) -> Option<&BlockId> {
-        self.snowball_instances.get(&height).map(|sb| sb.preferred())
+        self.snowball_instances
+            .get(&height)
+            .map(|sb| sb.preferred())
     }
 
     /// Whether the engine is fully caught up (no processing blocks).
@@ -1912,11 +1967,7 @@ impl PersistentPeerStore {
     }
 
     /// Record a connection failure for a peer.
-    pub fn record_failure(
-        &mut self,
-        node_id: &[u8; 20],
-        db: Option<&crate::db::Database>,
-    ) {
+    pub fn record_failure(&mut self, node_id: &[u8; 20], db: Option<&crate::db::Database>) {
         if let Some(record) = self.peers.get_mut(node_id) {
             record.record_failure();
             if record.should_evict(self.max_failures) {
@@ -1968,10 +2019,7 @@ impl PersistentPeerStore {
 
     /// Generate PeerListAck gossip messages for peers we know about.
     pub fn peer_list_ack_ids(&self) -> Vec<NodeId> {
-        self.peers
-            .keys()
-            .map(|id| NodeId(*id))
-            .collect()
+        self.peers.keys().map(|id| NodeId(*id)).collect()
     }
 }
 
@@ -2049,7 +2097,11 @@ mod tests {
         let encoded = msg.encode().unwrap();
         let decoded = NetworkMessage::decode(&encoded).unwrap();
         match decoded {
-            NetworkMessage::Version { network_id, my_version, .. } => {
+            NetworkMessage::Version {
+                network_id,
+                my_version,
+                ..
+            } => {
                 assert_eq!(network_id, 1);
                 assert_eq!(my_version, "avalanche-rs/0.1.0");
             }
@@ -2253,11 +2305,14 @@ mod tests {
         pool.connect(make_node_id(1), addr, 2).unwrap();
 
         // Fill to capacity
-        pool.enqueue_message(&make_node_id(1), NetworkMessage::Ping { uptime: 1 }).unwrap();
-        pool.enqueue_message(&make_node_id(1), NetworkMessage::Ping { uptime: 2 }).unwrap();
+        pool.enqueue_message(&make_node_id(1), NetworkMessage::Ping { uptime: 1 })
+            .unwrap();
+        pool.enqueue_message(&make_node_id(1), NetworkMessage::Ping { uptime: 2 })
+            .unwrap();
 
         // This should trigger backpressure (drop oldest)
-        pool.enqueue_message(&make_node_id(1), NetworkMessage::Ping { uptime: 3 }).unwrap();
+        pool.enqueue_message(&make_node_id(1), NetworkMessage::Ping { uptime: 3 })
+            .unwrap();
 
         // Backpressure with Pings: front is keepalive, so second-oldest (uptime=2) is dropped.
         // Queue is now [Ping{1}, Ping{3}]. Dequeue gives uptime=1 first.
@@ -2663,7 +2718,10 @@ mod tests {
         assert_eq!(f3[0].0, make_block_id(1));
         assert_eq!(f3[0].1, BlockStatus::Accepted);
 
-        assert_eq!(consensus.block_status(&make_block_id(1)), BlockStatus::Accepted);
+        assert_eq!(
+            consensus.block_status(&make_block_id(1)),
+            BlockStatus::Accepted
+        );
         assert_eq!(consensus.last_accepted_height, 1);
     }
 
@@ -2699,8 +2757,12 @@ mod tests {
         let finalized = consensus.record_poll(1, &votes).unwrap();
 
         // block_a accepted, block_b rejected
-        assert!(finalized.iter().any(|(id, s)| *id == make_block_id(1) && *s == BlockStatus::Accepted));
-        assert!(finalized.iter().any(|(id, s)| *id == make_block_id(2) && *s == BlockStatus::Rejected));
+        assert!(finalized
+            .iter()
+            .any(|(id, s)| *id == make_block_id(1) && *s == BlockStatus::Accepted));
+        assert!(finalized
+            .iter()
+            .any(|(id, s)| *id == make_block_id(2) && *s == BlockStatus::Rejected));
 
         assert!(consensus.is_quiescent());
     }
@@ -2730,14 +2792,20 @@ mod tests {
         votes1.insert(make_block_id(1), 5);
         consensus.record_poll(1, &votes1).unwrap();
         consensus.record_poll(1, &votes1).unwrap();
-        assert_eq!(consensus.block_status(&make_block_id(1)), BlockStatus::Accepted);
+        assert_eq!(
+            consensus.block_status(&make_block_id(1)),
+            BlockStatus::Accepted
+        );
 
         // Now finalize block2
         let mut votes2 = HashMap::new();
         votes2.insert(make_block_id(2), 5);
         consensus.record_poll(2, &votes2).unwrap();
         consensus.record_poll(2, &votes2).unwrap();
-        assert_eq!(consensus.block_status(&make_block_id(2)), BlockStatus::Accepted);
+        assert_eq!(
+            consensus.block_status(&make_block_id(2)),
+            BlockStatus::Accepted
+        );
         assert_eq!(consensus.last_accepted_height, 2);
     }
 
@@ -2770,9 +2838,15 @@ mod tests {
         consensus.record_poll(1, &votes).unwrap();
         let finalized = consensus.record_poll(1, &votes).unwrap();
 
-        assert!(finalized.iter().any(|(id, s)| *id == make_block_id(1) && *s == BlockStatus::Accepted));
-        assert!(finalized.iter().any(|(id, s)| *id == make_block_id(2) && *s == BlockStatus::Rejected));
-        assert!(finalized.iter().any(|(id, s)| *id == make_block_id(3) && *s == BlockStatus::Rejected));
+        assert!(finalized
+            .iter()
+            .any(|(id, s)| *id == make_block_id(1) && *s == BlockStatus::Accepted));
+        assert!(finalized
+            .iter()
+            .any(|(id, s)| *id == make_block_id(2) && *s == BlockStatus::Rejected));
+        assert!(finalized
+            .iter()
+            .any(|(id, s)| *id == make_block_id(3) && *s == BlockStatus::Rejected));
     }
 
     #[test]
@@ -2804,10 +2878,22 @@ mod tests {
         let mut consensus = SnowmanConsensus::new(params, genesis.clone());
 
         consensus
-            .add_block(ConsensusBlock::new(make_block_id(1), genesis.clone(), 1, 100, vec![]))
+            .add_block(ConsensusBlock::new(
+                make_block_id(1),
+                genesis.clone(),
+                1,
+                100,
+                vec![],
+            ))
             .unwrap();
         consensus
-            .add_block(ConsensusBlock::new(make_block_id(2), genesis.clone(), 1, 101, vec![]))
+            .add_block(ConsensusBlock::new(
+                make_block_id(2),
+                genesis.clone(),
+                1,
+                101,
+                vec![],
+            ))
             .unwrap();
 
         // Third block at height 2 (different parent chain, but still counts toward processing)
@@ -2831,7 +2917,13 @@ mod tests {
         let mut consensus = SnowmanConsensus::new(params, genesis.clone());
 
         consensus
-            .add_block(ConsensusBlock::new(make_block_id(1), genesis, 1, 100, vec![]))
+            .add_block(ConsensusBlock::new(
+                make_block_id(1),
+                genesis,
+                1,
+                100,
+                vec![],
+            ))
             .unwrap();
 
         let mut votes = HashMap::new();
@@ -2868,7 +2960,10 @@ mod tests {
             tracked_subnets: vec![],
         };
         nm.handle_version(&make_node_id(1), &version).unwrap();
-        nm.peer_manager.get_peer_mut(&make_node_id(1)).unwrap().is_validator = true;
+        nm.peer_manager
+            .get_peer_mut(&make_node_id(1))
+            .unwrap()
+            .is_validator = true;
 
         // Setup consensus
         let genesis = make_block_id(0);
@@ -3108,7 +3203,11 @@ mod tests {
         let encoded = msg.encode_proto().unwrap();
         let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
         match decoded {
-            NetworkMessage::GetAncestors { request_id, max_containers_size, .. } => {
+            NetworkMessage::GetAncestors {
+                request_id,
+                max_containers_size,
+                ..
+            } => {
                 assert_eq!(request_id, 7);
                 assert_eq!(max_containers_size, 2_000_000);
             }
@@ -3126,7 +3225,11 @@ mod tests {
         let encoded = msg.encode_proto().unwrap();
         let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
         match decoded {
-            NetworkMessage::Ancestors { request_id, containers, .. } => {
+            NetworkMessage::Ancestors {
+                request_id,
+                containers,
+                ..
+            } => {
                 assert_eq!(request_id, 8);
                 assert_eq!(containers.len(), 2);
             }
@@ -3274,8 +3377,14 @@ mod tests {
     #[test]
     fn test_persistent_peer_store_peer_list_ack() {
         let mut store = PersistentPeerStore::new(5);
-        store.upsert(PersistentPeerRecord::new([0x01; 20], vec![10, 0, 0, 1], 9651), None);
-        store.upsert(PersistentPeerRecord::new([0x02; 20], vec![10, 0, 0, 2], 9651), None);
+        store.upsert(
+            PersistentPeerRecord::new([0x01; 20], vec![10, 0, 0, 1], 9651),
+            None,
+        );
+        store.upsert(
+            PersistentPeerRecord::new([0x02; 20], vec![10, 0, 0, 2], 9651),
+            None,
+        );
 
         let ack_ids = store.peer_list_ack_ids();
         assert_eq!(ack_ids.len(), 2);

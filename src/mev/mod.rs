@@ -4,13 +4,13 @@
 //! This module provides: mempool monitoring, arbitrage detection,
 //! sandwich construction, liquidation scanning, and bundle submission.
 
-pub mod v4;
 pub mod engine;
+pub mod v4;
 
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Mutex};
-use serde::{Serialize, Deserialize};
+use tokio::sync::{Mutex, RwLock};
 
 // ============================================================================
 // CORE TYPES
@@ -45,7 +45,10 @@ impl U256 {
     }
 
     pub fn from_u64(v: u64) -> Self {
-        Self { high: 0, low: v as u128 }
+        Self {
+            high: 0,
+            low: v as u128,
+        }
     }
 
     pub fn is_zero(&self) -> bool {
@@ -55,13 +58,14 @@ impl U256 {
     /// Parse from hex string (0x-prefixed or not)
     pub fn from_hex(s: &str) -> std::result::Result<Self, MevError> {
         let s = s.trim_start_matches("0x");
-        if s.is_empty() { return Ok(Self::ZERO); }
+        if s.is_empty() {
+            return Ok(Self::ZERO);
+        }
         if s.len() > 64 {
             return Err(MevError::ParseError("U256 hex too long".into()));
         }
         if s.len() <= 32 {
-            let v = u128::from_str_radix(s, 16)
-                .map_err(|e| MevError::ParseError(e.to_string()))?;
+            let v = u128::from_str_radix(s, 16).map_err(|e| MevError::ParseError(e.to_string()))?;
             Ok(Self { high: 0, low: v })
         } else {
             let split = s.len() - 32;
@@ -90,15 +94,23 @@ impl U256 {
     /// Saturating addition
     pub fn saturating_add(self, other: Self) -> Self {
         let (low, carry) = self.low.overflowing_add(other.low);
-        let high = self.high.saturating_add(other.high).saturating_add(carry as u128);
+        let high = self
+            .high
+            .saturating_add(other.high)
+            .saturating_add(carry as u128);
         Self { high, low }
     }
 
     /// Saturating subtraction
     pub fn saturating_sub(self, other: Self) -> Self {
-        if self < other { return Self::ZERO; }
+        if self < other {
+            return Self::ZERO;
+        }
         let (low, borrow) = self.low.overflowing_sub(other.low);
-        let high = self.high.wrapping_sub(other.high).wrapping_sub(borrow as u128);
+        let high = self
+            .high
+            .wrapping_sub(other.high)
+            .wrapping_sub(borrow as u128);
         Self { high, low }
     }
 }
@@ -202,20 +214,23 @@ pub mod selectors {
     pub const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
 
     pub fn is_swap(selector: &[u8]) -> bool {
-        if selector.len() < 4 { return false; }
+        if selector.len() < 4 {
+            return false;
+        }
         let sel = [selector[0], selector[1], selector[2], selector[3]];
-        matches!(sel,
-            SWAP_EXACT_TOKENS_FOR_TOKENS |
-            SWAP_TOKENS_FOR_EXACT_TOKENS |
-            SWAP_EXACT_ETH_FOR_TOKENS |
-            SWAP_TOKENS_FOR_EXACT_ETH |
-            SWAP_EXACT_TOKENS_FOR_ETH |
-            SWAP_ETH_FOR_EXACT_TOKENS |
-            EXACT_INPUT_SINGLE |
-            EXACT_INPUT |
-            EXACT_OUTPUT_SINGLE |
-            EXACT_OUTPUT |
-            MULTICALL
+        matches!(
+            sel,
+            SWAP_EXACT_TOKENS_FOR_TOKENS
+                | SWAP_TOKENS_FOR_EXACT_TOKENS
+                | SWAP_EXACT_ETH_FOR_TOKENS
+                | SWAP_TOKENS_FOR_EXACT_ETH
+                | SWAP_EXACT_TOKENS_FOR_ETH
+                | SWAP_ETH_FOR_EXACT_TOKENS
+                | EXACT_INPUT_SINGLE
+                | EXACT_INPUT
+                | EXACT_OUTPUT_SINGLE
+                | EXACT_OUTPUT
+                | MULTICALL
         )
     }
 }
@@ -270,8 +285,8 @@ pub mod tokens {
     pub fn decimals(addr: &str) -> u8 {
         let addr_lower = addr.to_lowercase();
         match addr_lower.as_str() {
-            "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e" => 6,  // USDC
-            "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7" => 6,  // USDT
+            "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e" => 6, // USDC
+            "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7" => 6, // USDT
             _ => 18,
         }
     }
@@ -335,7 +350,9 @@ impl MevOpportunity {
         match self {
             MevOpportunity::Arbitrage { net_profit, .. } => *net_profit,
             MevOpportunity::Sandwich { net_profit, .. } => *net_profit,
-            MevOpportunity::Liquidation { estimated_profit, .. } => *estimated_profit,
+            MevOpportunity::Liquidation {
+                estimated_profit, ..
+            } => *estimated_profit,
             MevOpportunity::JitLiquidity { estimated_fees, .. } => *estimated_fees,
         }
     }
@@ -372,15 +389,17 @@ impl std::fmt::Display for MevError {
         match self {
             MevError::ParseError(s) => write!(f, "Parse error: {}", s),
             MevError::RpcError(s) => write!(f, "RPC error: {}", s),
-            MevError::InsufficientProfit { expected, minimum } =>
-                write!(f, "Insufficient profit: {} < minimum {}", expected, minimum),
+            MevError::InsufficientProfit { expected, minimum } => {
+                write!(f, "Insufficient profit: {} < minimum {}", expected, minimum)
+            }
             MevError::SimulationFailed(s) => write!(f, "Simulation failed: {}", s),
             MevError::GasTooHigh(g) => write!(f, "Gas too high: {}", g),
             MevError::NonceError(s) => write!(f, "Nonce error: {}", s),
             MevError::Timeout => write!(f, "Operation timed out"),
             MevError::PoolNotFound(s) => write!(f, "Pool not found: {}", s),
-            MevError::SlippageExceeded { expected, actual } =>
-                write!(f, "Slippage exceeded: expected {} got {}", expected, actual),
+            MevError::SlippageExceeded { expected, actual } => {
+                write!(f, "Slippage exceeded: expected {} got {}", expected, actual)
+            }
         }
     }
 }
@@ -398,11 +417,21 @@ pub struct CallDataDecoder;
 
 impl CallDataDecoder {
     /// Decode a UniswapV2-style swap from calldata
-    pub fn decode_v2_swap(input: &[u8], tx_hash: &str, to_addr: &str, gas_price: U256, value: U256) -> Option<DecodedSwap> {
-        if input.len() < 4 { return None; }
+    pub fn decode_v2_swap(
+        input: &[u8],
+        tx_hash: &str,
+        to_addr: &str,
+        gas_price: U256,
+        value: U256,
+    ) -> Option<DecodedSwap> {
+        if input.len() < 4 {
+            return None;
+        }
 
         let selector = [input[0], input[1], input[2], input[3]];
-        if !selectors::is_swap(&selector) { return None; }
+        if !selectors::is_swap(&selector) {
+            return None;
+        }
 
         let dex = DexProtocol::from_address(to_addr);
 
@@ -410,7 +439,9 @@ impl CallDataDecoder {
         // swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) — value = amountIn
         match selector {
             selectors::SWAP_EXACT_TOKENS_FOR_TOKENS => {
-                if input.len() < 4 + 5 * 32 { return None; }
+                if input.len() < 4 + 5 * 32 {
+                    return None;
+                }
                 let amount_in = Self::decode_u256(&input[4..36])?;
                 let amount_out_min = Self::decode_u256(&input[36..68])?;
                 let path = Self::decode_address_array(&input[4..], 2)?;
@@ -432,7 +463,9 @@ impl CallDataDecoder {
                 })
             }
             selectors::SWAP_EXACT_ETH_FOR_TOKENS => {
-                if input.len() < 4 + 4 * 32 { return None; }
+                if input.len() < 4 + 4 * 32 {
+                    return None;
+                }
                 let amount_out_min = Self::decode_u256(&input[4..36])?;
                 let path = Self::decode_address_array(&input[4..], 1)?;
                 let recipient = Self::decode_address(&input[4 + 2 * 32..4 + 3 * 32])?;
@@ -472,7 +505,9 @@ impl CallDataDecoder {
     }
 
     fn decode_u256(data: &[u8]) -> Option<U256> {
-        if data.len() < 32 { return None; }
+        if data.len() < 32 {
+            return None;
+        }
         let mut high_bytes = [0u8; 16];
         let mut low_bytes = [0u8; 16];
         high_bytes.copy_from_slice(&data[0..16]);
@@ -484,33 +519,49 @@ impl CallDataDecoder {
     }
 
     fn decode_u64(data: &[u8]) -> u64 {
-        if data.len() < 32 { return 0; }
+        if data.len() < 32 {
+            return 0;
+        }
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&data[24..32]);
         u64::from_be_bytes(bytes)
     }
 
     fn decode_address(data: &[u8]) -> Option<String> {
-        if data.len() < 32 { return None; }
+        if data.len() < 32 {
+            return None;
+        }
         Some(format!("0x{}", faster_hex::hex_string(&data[12..32])))
     }
 
     fn decode_address_array(data: &[u8], offset_slot: usize) -> Option<Vec<String>> {
-        if data.len() < (offset_slot + 1) * 32 { return None; }
+        if data.len() < (offset_slot + 1) * 32 {
+            return None;
+        }
         let offset = Self::decode_u64(&data[offset_slot * 32..(offset_slot + 1) * 32]) as usize;
-        if data.len() < offset + 32 { return None; }
+        if data.len() < offset + 32 {
+            return None;
+        }
         let length = Self::decode_u64(&data[offset..offset + 32]) as usize;
-        if length == 0 || length > 10 { return None; }
+        if length == 0 || length > 10 {
+            return None;
+        }
 
         let mut addrs = Vec::with_capacity(length);
         for i in 0..length {
             let start = offset + 32 + i * 32;
-            if start + 32 > data.len() { break; }
+            if start + 32 > data.len() {
+                break;
+            }
             if let Some(addr) = Self::decode_address(&data[start..start + 32]) {
                 addrs.push(addr);
             }
         }
-        if addrs.is_empty() { None } else { Some(addrs) }
+        if addrs.is_empty() {
+            None
+        } else {
+            Some(addrs)
+        }
     }
 }
 
@@ -607,13 +658,7 @@ impl MempoolMonitor {
         }
 
         // Decode the swap
-        let swap = CallDataDecoder::decode_v2_swap(
-            &tx.input,
-            &tx.hash,
-            to,
-            tx.gas_price,
-            tx.value,
-        );
+        let swap = CallDataDecoder::decode_v2_swap(&tx.input, &tx.hash, to, tx.gas_price, tx.value);
 
         // Update stats
         let scan_ns = start.elapsed().as_nanos() as u64;
@@ -652,7 +697,8 @@ impl MempoolMonitor {
 
         // Frontrun amount: typically 2-5x the victim's swap
         let frontrun_multiplier = 3.0;
-        let frontrun_amount = U256::from_u128((amount_in_avax * frontrun_multiplier * 1e18) as u128);
+        let frontrun_amount =
+            U256::from_u128((amount_in_avax * frontrun_multiplier * 1e18) as u128);
 
         Some(MevOpportunity::Sandwich {
             victim_tx: swap.tx_hash.clone(),
@@ -676,7 +722,9 @@ impl MempoolMonitor {
         dex_a: DexProtocol,
         dex_b: DexProtocol,
     ) -> Option<MevOpportunity> {
-        if price_a <= 0.0 || price_b <= 0.0 { return None; }
+        if price_a <= 0.0 || price_b <= 0.0 {
+            return None;
+        }
 
         let (buy_dex, sell_dex, buy_price, sell_price) = if price_a < price_b {
             (dex_a, dex_b, price_a, price_b)
@@ -687,7 +735,9 @@ impl MempoolMonitor {
         let spread_bps = ((sell_price - buy_price) / buy_price) * 10_000.0;
 
         // Need at least 30bps to cover gas + slippage
-        if spread_bps < 30.0 { return None; }
+        if spread_bps < 30.0 {
+            return None;
+        }
 
         // Estimate: trade 10 AVAX worth
         let trade_size_avax = 10.0;
@@ -695,7 +745,9 @@ impl MempoolMonitor {
         let gas_cost_avax = 0.005; // single arb tx
 
         let net_profit_avax = estimated_profit_avax - gas_cost_avax;
-        if net_profit_avax < self.config.min_profit_avax { return None; }
+        if net_profit_avax < self.config.min_profit_avax {
+            return None;
+        }
 
         Some(MevOpportunity::Arbitrage {
             token_a: token_a.to_string(),
@@ -740,7 +792,7 @@ pub struct MevBundle {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleTx {
-    pub signed_tx: String,    // raw signed transaction hex
+    pub signed_tx: String, // raw signed transaction hex
     pub can_revert: bool,
     pub gas_price: U256,
     pub description: String,
@@ -783,7 +835,8 @@ impl MevBundle {
     }
 
     pub fn total_gas_cost(&self) -> U256 {
-        self.transactions.iter()
+        self.transactions
+            .iter()
             .fold(U256::ZERO, |acc, tx| acc.saturating_add(tx.gas_price))
     }
 
@@ -832,7 +885,9 @@ impl PoolState {
         let numerator = amt_in * fee_factor * r_out;
         let denominator = r_in * 10_000.0 + amt_in * fee_factor;
 
-        if denominator == 0.0 { return U256::ZERO; }
+        if denominator == 0.0 {
+            return U256::ZERO;
+        }
 
         U256::from_u128((numerator / denominator) as u128)
     }
@@ -869,12 +924,16 @@ impl PoolState {
         // Step 2: Update reserves after frontrun
         let mut pool_after_frontrun = self.clone();
         let token_out = if token_in.to_lowercase() == self.token0.to_lowercase() {
-            pool_after_frontrun.reserve0 = pool_after_frontrun.reserve0.saturating_add(frontrun_amount);
-            pool_after_frontrun.reserve1 = pool_after_frontrun.reserve1.saturating_sub(frontrun_out);
+            pool_after_frontrun.reserve0 =
+                pool_after_frontrun.reserve0.saturating_add(frontrun_amount);
+            pool_after_frontrun.reserve1 =
+                pool_after_frontrun.reserve1.saturating_sub(frontrun_out);
             &self.token1
         } else {
-            pool_after_frontrun.reserve1 = pool_after_frontrun.reserve1.saturating_add(frontrun_amount);
-            pool_after_frontrun.reserve0 = pool_after_frontrun.reserve0.saturating_sub(frontrun_out);
+            pool_after_frontrun.reserve1 =
+                pool_after_frontrun.reserve1.saturating_add(frontrun_amount);
+            pool_after_frontrun.reserve0 =
+                pool_after_frontrun.reserve0.saturating_sub(frontrun_out);
             &self.token0
         };
 
@@ -954,7 +1013,10 @@ mod tests {
 
     #[test]
     fn test_u256_overflow_safe() {
-        let max = U256 { high: u128::MAX, low: u128::MAX };
+        let max = U256 {
+            high: u128::MAX,
+            low: u128::MAX,
+        };
         let one = U256::from_u64(1);
         let result = max.saturating_add(one);
         assert_eq!(result.high, u128::MAX); // saturated
@@ -1003,8 +1065,8 @@ mod tests {
             address: "0xpool".to_string(),
             token0: tokens::WAVAX.to_string(),
             token1: tokens::USDC.to_string(),
-            reserve0: U256::from_u128(1_000_000 * 10u128.pow(18)),   // 1M AVAX
-            reserve1: U256::from_u128(20_000_000 * 10u128.pow(6)),   // 20M USDC
+            reserve0: U256::from_u128(1_000_000 * 10u128.pow(18)), // 1M AVAX
+            reserve1: U256::from_u128(20_000_000 * 10u128.pow(6)), // 20M USDC
             fee_bps: 30,
             last_updated: Instant::now(),
         };
@@ -1015,8 +1077,11 @@ mod tests {
 
         // Should get ~1994 USDC (100 AVAX * $20 - fees - price impact)
         let usdc_out = amount_out.to_token(6);
-        assert!(usdc_out > 1990.0 && usdc_out < 2000.0,
-            "Expected ~1994 USDC, got {}", usdc_out);
+        assert!(
+            usdc_out > 1990.0 && usdc_out < 2000.0,
+            "Expected ~1994 USDC, got {}",
+            usdc_out
+        );
     }
 
     #[test]
@@ -1025,8 +1090,8 @@ mod tests {
             address: "0xpool".to_string(),
             token0: tokens::WAVAX.to_string(),
             token1: tokens::USDC.to_string(),
-            reserve0: U256::from_u128(100_000 * 10u128.pow(18)),   // 100K AVAX
-            reserve1: U256::from_u128(2_000_000 * 10u128.pow(6)),  // 2M USDC
+            reserve0: U256::from_u128(100_000 * 10u128.pow(18)), // 100K AVAX
+            reserve1: U256::from_u128(2_000_000 * 10u128.pow(6)), // 2M USDC
             fee_bps: 30,
             last_updated: Instant::now(),
         };
@@ -1062,7 +1127,11 @@ mod tests {
         // Sandwich should be profitable
         assert!(!result.profit.is_zero(), "Sandwich should be profitable");
         let profit_avax = result.profit.to_avax();
-        assert!(profit_avax > 0.0, "Profit should be positive: {} AVAX", profit_avax);
+        assert!(
+            profit_avax > 0.0,
+            "Profit should be positive: {} AVAX",
+            profit_avax
+        );
 
         // Victim should lose some value
         assert!(!result.victim_loss.is_zero(), "Victim should have loss");
@@ -1076,8 +1145,8 @@ mod tests {
         let opp = monitor.evaluate_arbitrage(
             tokens::WAVAX,
             tokens::USDC,
-            20.00,  // TJ price
-            20.40,  // Pangolin price (2% higher)
+            20.00, // TJ price
+            20.40, // Pangolin price (2% higher)
             DexProtocol::TraderJoe,
             DexProtocol::Pangolin,
         );
@@ -1085,7 +1154,12 @@ mod tests {
         assert!(opp.is_some(), "Should find arbitrage opportunity");
         let opp = opp.unwrap();
         match opp {
-            MevOpportunity::Arbitrage { spread_bps, buy_dex, sell_dex, .. } => {
+            MevOpportunity::Arbitrage {
+                spread_bps,
+                buy_dex,
+                sell_dex,
+                ..
+            } => {
                 assert!(spread_bps > 190.0 && spread_bps < 210.0);
                 assert_eq!(buy_dex, DexProtocol::TraderJoe);
                 assert_eq!(sell_dex, DexProtocol::Pangolin);
@@ -1100,12 +1174,18 @@ mod tests {
 
         // Only 10bps spread — below gas cost threshold
         let opp = monitor.evaluate_arbitrage(
-            tokens::WAVAX, tokens::USDC,
-            20.00, 20.02,
-            DexProtocol::TraderJoe, DexProtocol::Pangolin,
+            tokens::WAVAX,
+            tokens::USDC,
+            20.00,
+            20.02,
+            DexProtocol::TraderJoe,
+            DexProtocol::Pangolin,
         );
 
-        assert!(opp.is_none(), "Should not find opportunity with 10bps spread");
+        assert!(
+            opp.is_none(),
+            "Should not find opportunity with 10bps spread"
+        );
     }
 
     #[test]
@@ -1154,7 +1234,8 @@ mod tests {
         assert_eq!(max.high, 0);
 
         // Full 256-bit
-        let full = U256::from_hex("0x1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let full =
+            U256::from_hex("0x1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         assert!(full.is_err()); // too long (65 hex chars > 64)
     }
 
@@ -1195,7 +1276,10 @@ mod tests {
 
         // High bits comparison
         let c = U256 { high: 1, low: 0 };
-        let d = U256 { high: 0, low: u128::MAX };
+        let d = U256 {
+            high: 0,
+            low: u128::MAX,
+        };
         assert!(c > d);
     }
 
@@ -1205,17 +1289,28 @@ mod tests {
     fn test_dex_router_addresses() {
         // Every DEX should have a non-zero router
         let dexes = [
-            DexProtocol::TraderJoe, DexProtocol::TraderJoeV2,
-            DexProtocol::Pangolin, DexProtocol::SushiSwap,
-            DexProtocol::Platypus, DexProtocol::GMX,
-            DexProtocol::WooFi, DexProtocol::Curve,
+            DexProtocol::TraderJoe,
+            DexProtocol::TraderJoeV2,
+            DexProtocol::Pangolin,
+            DexProtocol::SushiSwap,
+            DexProtocol::Platypus,
+            DexProtocol::GMX,
+            DexProtocol::WooFi,
+            DexProtocol::Curve,
             DexProtocol::Pharaoh,
         ];
         for dex in &dexes {
             let addr = dex.router_address();
-            assert!(addr.starts_with("0x"), "Router should start with 0x: {:?}", dex);
-            assert_ne!(addr, "0x0000000000000000000000000000000000000000",
-                "Router should not be zero: {:?}", dex);
+            assert!(
+                addr.starts_with("0x"),
+                "Router should start with 0x: {:?}",
+                dex
+            );
+            assert_ne!(
+                addr, "0x0000000000000000000000000000000000000000",
+                "Router should not be zero: {:?}",
+                dex
+            );
         }
     }
 
@@ -1223,14 +1318,21 @@ mod tests {
     fn test_dex_roundtrip() {
         // from_address(router_address()) should return the same DEX
         let dexes = [
-            DexProtocol::TraderJoe, DexProtocol::Pangolin,
-            DexProtocol::Platypus, DexProtocol::GMX,
-            DexProtocol::WooFi, DexProtocol::Curve,
+            DexProtocol::TraderJoe,
+            DexProtocol::Pangolin,
+            DexProtocol::Platypus,
+            DexProtocol::GMX,
+            DexProtocol::WooFi,
+            DexProtocol::Curve,
             DexProtocol::Pharaoh,
         ];
         for dex in &dexes {
-            assert_eq!(DexProtocol::from_address(dex.router_address()), *dex,
-                "Roundtrip failed for {:?}", dex);
+            assert_eq!(
+                DexProtocol::from_address(dex.router_address()),
+                *dex,
+                "Roundtrip failed for {:?}",
+                dex
+            );
         }
     }
 
@@ -1251,8 +1353,13 @@ mod tests {
 
         // Only selector, no params
         assert!(CallDataDecoder::decode_v2_swap(
-            &selectors::SWAP_EXACT_TOKENS_FOR_TOKENS, "0x", "0x", U256::ZERO, U256::ZERO
-        ).is_none());
+            &selectors::SWAP_EXACT_TOKENS_FOR_TOKENS,
+            "0x",
+            "0x",
+            U256::ZERO,
+            U256::ZERO
+        )
+        .is_none());
     }
 
     #[test]
@@ -1261,8 +1368,13 @@ mod tests {
         let mut calldata = vec![0u8; 68];
         calldata[..4].copy_from_slice(&selectors::TRANSFER);
         assert!(CallDataDecoder::decode_v2_swap(
-            &calldata, "0xtx", tokens::WAVAX, U256::ZERO, U256::ZERO
-        ).is_none());
+            &calldata,
+            "0xtx",
+            tokens::WAVAX,
+            U256::ZERO,
+            U256::ZERO
+        )
+        .is_none());
     }
 
     #[test]
@@ -1271,7 +1383,11 @@ mod tests {
         calldata[..4].copy_from_slice(&selectors::SWAP_EXACT_TOKENS_FOR_TOKENS);
         // Unknown router address — decode attempts but address array is zeroed
         let _result = CallDataDecoder::decode_v2_swap(
-            &calldata, "0xtx", "0x1111111111111111111111111111111111111111", U256::from_u64(1000), U256::ZERO
+            &calldata,
+            "0xtx",
+            "0x1111111111111111111111111111111111111111",
+            U256::from_u64(1000),
+            U256::ZERO,
         );
         // Returns None (zeroed address array) or Some with Unknown dex — either is valid
     }
@@ -1331,9 +1447,13 @@ mod tests {
     #[test]
     fn test_opportunity_kind() {
         let arb = MevOpportunity::Arbitrage {
-            token_a: "a".into(), token_b: "b".into(),
-            buy_dex: DexProtocol::TraderJoe, sell_dex: DexProtocol::Pangolin,
-            buy_price: 1.0, sell_price: 1.1, spread_bps: 100.0,
+            token_a: "a".into(),
+            token_b: "b".into(),
+            buy_dex: DexProtocol::TraderJoe,
+            sell_dex: DexProtocol::Pangolin,
+            buy_price: 1.0,
+            sell_price: 1.1,
+            spread_bps: 100.0,
             estimated_profit: U256::from_u64(100),
             gas_cost: U256::from_u64(10),
             net_profit: U256::from_u64(90),
@@ -1347,13 +1467,20 @@ mod tests {
         let sw = MevOpportunity::Sandwich {
             victim_tx: "0x".into(),
             victim_swap: DecodedSwap {
-                tx_hash: "0x".into(), dex: DexProtocol::TraderJoe,
-                token_in: "a".into(), token_out: "b".into(),
-                amount_in: U256::ZERO, amount_out_min: U256::ZERO,
-                path: vec![], recipient: "".into(), deadline: 0,
-                gas_price: U256::ZERO, is_exact_input: true,
+                tx_hash: "0x".into(),
+                dex: DexProtocol::TraderJoe,
+                token_in: "a".into(),
+                token_out: "b".into(),
+                amount_in: U256::ZERO,
+                amount_out_min: U256::ZERO,
+                path: vec![],
+                recipient: "".into(),
+                deadline: 0,
+                gas_price: U256::ZERO,
+                is_exact_input: true,
             },
-            frontrun_amount: U256::ZERO, backrun_amount: U256::ZERO,
+            frontrun_amount: U256::ZERO,
+            backrun_amount: U256::ZERO,
             estimated_profit: U256::from_u64(50),
             gas_cost: U256::from_u64(5),
             net_profit: U256::from_u64(45),
@@ -1365,10 +1492,14 @@ mod tests {
     #[test]
     fn test_opportunity_liquidation_kind() {
         let liq = MevOpportunity::Liquidation {
-            protocol: "aave".into(), borrower: "0x".into(),
-            debt_token: "a".into(), collateral_token: "b".into(),
-            debt_amount: U256::ZERO, collateral_amount: U256::ZERO,
-            bonus_bps: 500, estimated_profit: U256::from_u64(200),
+            protocol: "aave".into(),
+            borrower: "0x".into(),
+            debt_token: "a".into(),
+            collateral_token: "b".into(),
+            debt_amount: U256::ZERO,
+            collateral_amount: U256::ZERO,
+            bonus_bps: 500,
+            estimated_profit: U256::from_u64(200),
         };
         assert_eq!(liq.kind(), "liquidation");
         assert_eq!(liq.net_profit(), U256::from_u64(200));
@@ -1380,7 +1511,8 @@ mod tests {
     fn test_pool_zero_reserves() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: "A".into(), token1: "B".into(),
+            token0: "A".into(),
+            token1: "B".into(),
             reserve0: U256::ZERO,
             reserve1: U256::from_u128(1_000_000),
             fee_bps: 30,
@@ -1393,7 +1525,8 @@ mod tests {
     fn test_pool_zero_input() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: "A".into(), token1: "B".into(),
+            token0: "A".into(),
+            token1: "B".into(),
             reserve0: U256::from_u128(1_000_000),
             reserve1: U256::from_u128(1_000_000),
             fee_bps: 30,
@@ -1406,7 +1539,8 @@ mod tests {
     fn test_pool_symmetric_reserves() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: "A".into(), token1: "B".into(),
+            token0: "A".into(),
+            token1: "B".into(),
             reserve0: U256::from_u128(1_000_000),
             reserve1: U256::from_u128(1_000_000),
             fee_bps: 30,
@@ -1414,8 +1548,15 @@ mod tests {
         };
         // With equal reserves, output should be less than input (due to fee + impact)
         let out = pool.get_amount_out(U256::from_u128(1000), "A");
-        assert!(out.low < 1000, "Output should be less than input due to fees");
-        assert!(out.low > 900, "Output shouldn't be too much less: {}", out.low);
+        assert!(
+            out.low < 1000,
+            "Output should be less than input due to fees"
+        );
+        assert!(
+            out.low > 900,
+            "Output shouldn't be too much less: {}",
+            out.low
+        );
     }
 
     #[test]
@@ -1423,7 +1564,8 @@ mod tests {
         // 0% fee pool
         let pool_no_fee = PoolState {
             address: "0x".into(),
-            token0: "A".into(), token1: "B".into(),
+            token0: "A".into(),
+            token1: "B".into(),
             reserve0: U256::from_u128(1_000_000_000),
             reserve1: U256::from_u128(1_000_000_000),
             fee_bps: 0,
@@ -1439,18 +1581,22 @@ mod tests {
         let out_no_fee = pool_no_fee.get_amount_out(amount, "A");
         let out_1pct = pool_1pct.get_amount_out(amount, "A");
 
-        assert!(out_no_fee.low > out_1pct.low,
+        assert!(
+            out_no_fee.low > out_1pct.low,
             "No-fee output ({}) should exceed 1% fee output ({})",
-            out_no_fee.low, out_1pct.low);
+            out_no_fee.low,
+            out_1pct.low
+        );
     }
 
     #[test]
     fn test_pool_direction_matters() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: "A".into(), token1: "B".into(),
-            reserve0: U256::from_u128(1_000_000),   // less of A
-            reserve1: U256::from_u128(10_000_000),   // more of B
+            token0: "A".into(),
+            token1: "B".into(),
+            reserve0: U256::from_u128(1_000_000),  // less of A
+            reserve1: U256::from_u128(10_000_000), // more of B
             fee_bps: 30,
             last_updated: Instant::now(),
         };
@@ -1460,15 +1606,20 @@ mod tests {
         let out_b_to_a = pool.get_amount_out(amount, "B");
 
         // A→B should give more output (B is cheaper)
-        assert!(out_a_to_b.low > out_b_to_a.low,
-            "A→B ({}) should give more than B→A ({})", out_a_to_b.low, out_b_to_a.low);
+        assert!(
+            out_a_to_b.low > out_b_to_a.low,
+            "A→B ({}) should give more than B→A ({})",
+            out_a_to_b.low,
+            out_b_to_a.low
+        );
     }
 
     #[test]
     fn test_price_impact_scales_with_size() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: tokens::WAVAX.into(), token1: tokens::USDC.into(),
+            token0: tokens::WAVAX.into(),
+            token1: tokens::USDC.into(),
             reserve0: U256::from_u128(100_000 * 10u128.pow(18)),
             reserve1: U256::from_u128(2_000_000 * 10u128.pow(6)),
             fee_bps: 30,
@@ -1476,11 +1627,23 @@ mod tests {
         };
 
         let impact_1 = pool.price_impact_bps(U256::from_u128(1 * 10u128.pow(18)), tokens::WAVAX);
-        let impact_100 = pool.price_impact_bps(U256::from_u128(100 * 10u128.pow(18)), tokens::WAVAX);
-        let impact_10k = pool.price_impact_bps(U256::from_u128(10_000 * 10u128.pow(18)), tokens::WAVAX);
+        let impact_100 =
+            pool.price_impact_bps(U256::from_u128(100 * 10u128.pow(18)), tokens::WAVAX);
+        let impact_10k =
+            pool.price_impact_bps(U256::from_u128(10_000 * 10u128.pow(18)), tokens::WAVAX);
 
-        assert!(impact_1 < impact_100, "1 AVAX ({:.1}bps) should have less impact than 100 ({:.1}bps)", impact_1, impact_100);
-        assert!(impact_100 < impact_10k, "100 AVAX ({:.1}bps) should have less impact than 10K ({:.1}bps)", impact_100, impact_10k);
+        assert!(
+            impact_1 < impact_100,
+            "1 AVAX ({:.1}bps) should have less impact than 100 ({:.1}bps)",
+            impact_1,
+            impact_100
+        );
+        assert!(
+            impact_100 < impact_10k,
+            "100 AVAX ({:.1}bps) should have less impact than 10K ({:.1}bps)",
+            impact_100,
+            impact_10k
+        );
     }
 
     // --- Sandwich edge cases ---
@@ -1489,7 +1652,8 @@ mod tests {
     fn test_sandwich_small_victim_unprofitable() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: tokens::WAVAX.into(), token1: tokens::USDC.into(),
+            token0: tokens::WAVAX.into(),
+            token1: tokens::USDC.into(),
             reserve0: U256::from_u128(100_000 * 10u128.pow(18)),
             reserve1: U256::from_u128(2_000_000 * 10u128.pow(6)),
             fee_bps: 30,
@@ -1503,14 +1667,19 @@ mod tests {
 
         // Profit should be very small or zero for tiny swaps
         let profit_avax = result.profit.to_avax();
-        assert!(profit_avax < 0.01, "Tiny sandwich should yield minimal profit: {} AVAX", profit_avax);
+        assert!(
+            profit_avax < 0.01,
+            "Tiny sandwich should yield minimal profit: {} AVAX",
+            profit_avax
+        );
     }
 
     #[test]
     fn test_sandwich_profit_increases_with_victim_size() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: tokens::WAVAX.into(), token1: tokens::USDC.into(),
+            token0: tokens::WAVAX.into(),
+            token1: tokens::USDC.into(),
             reserve0: U256::from_u128(100_000 * 10u128.pow(18)),
             reserve1: U256::from_u128(2_000_000 * 10u128.pow(6)),
             fee_bps: 30,
@@ -1520,13 +1689,22 @@ mod tests {
         let frontrun = U256::from_u128(3_000 * 10u128.pow(18));
 
         let r100 = pool.simulate_sandwich(
-            U256::from_u128(100 * 10u128.pow(18)), frontrun, tokens::WAVAX);
+            U256::from_u128(100 * 10u128.pow(18)),
+            frontrun,
+            tokens::WAVAX,
+        );
         let r1000 = pool.simulate_sandwich(
-            U256::from_u128(1_000 * 10u128.pow(18)), frontrun, tokens::WAVAX);
+            U256::from_u128(1_000 * 10u128.pow(18)),
+            frontrun,
+            tokens::WAVAX,
+        );
 
-        assert!(r1000.profit.low > r100.profit.low,
+        assert!(
+            r1000.profit.low > r100.profit.low,
             "1000 AVAX victim profit ({}) should exceed 100 AVAX ({})",
-            r1000.profit.to_avax(), r100.profit.to_avax());
+            r1000.profit.to_avax(),
+            r100.profit.to_avax()
+        );
     }
 
     // --- Mempool monitor ---
@@ -1552,9 +1730,15 @@ mod tests {
     async fn test_scan_tx_no_calldata() {
         let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
         let tx = PendingTx {
-            hash: "0x123".into(), from: "0x".into(), to: Some("0x".into()),
-            value: U256::from_u64(1000), gas_price: U256::from_u64(25_000_000_000),
-            gas_limit: 21000, input: vec![], nonce: 0, timestamp: 0,
+            hash: "0x123".into(),
+            from: "0x".into(),
+            to: Some("0x".into()),
+            value: U256::from_u64(1000),
+            gas_price: U256::from_u64(25_000_000_000),
+            gas_limit: 21000,
+            input: vec![],
+            nonce: 0,
+            timestamp: 0,
         };
         assert!(monitor.scan_tx(&tx).await.is_none());
     }
@@ -1563,9 +1747,15 @@ mod tests {
     async fn test_scan_tx_no_to() {
         let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
         let tx = PendingTx {
-            hash: "0x123".into(), from: "0x".into(), to: None,
-            value: U256::from_u64(1000), gas_price: U256::from_u64(25_000_000_000),
-            gas_limit: 21000, input: vec![0x38, 0xed, 0x17, 0x39], nonce: 0, timestamp: 0,
+            hash: "0x123".into(),
+            from: "0x".into(),
+            to: None,
+            value: U256::from_u64(1000),
+            gas_price: U256::from_u64(25_000_000_000),
+            gas_limit: 21000,
+            input: vec![0x38, 0xed, 0x17, 0x39],
+            nonce: 0,
+            timestamp: 0,
         };
         assert!(monitor.scan_tx(&tx).await.is_none());
     }
@@ -1577,10 +1767,15 @@ mod tests {
         let mut input = vec![0u8; 200];
         input[..4].copy_from_slice(&selectors::SWAP_EXACT_TOKENS_FOR_TOKENS);
         let tx = PendingTx {
-            hash: "0x123".into(), from: "0x".into(),
+            hash: "0x123".into(),
+            from: "0x".into(),
             to: Some(DexProtocol::TraderJoe.router_address().to_string()),
-            value: U256::ZERO, gas_price: U256::from_u64(25_000_000_000),
-            gas_limit: 21000, input, nonce: 0, timestamp: 0,
+            value: U256::ZERO,
+            gas_price: U256::from_u64(25_000_000_000),
+            gas_limit: 21000,
+            input,
+            nonce: 0,
+            timestamp: 0,
         };
         let _ = monitor.scan_tx(&tx).await;
         let stats = monitor.stats().await;
@@ -1591,17 +1786,25 @@ mod tests {
 
     #[test]
     fn test_evaluate_sandwich_too_small() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig {
-            min_swap_avax: 10.0,
-            ..MempoolConfig::default()
-        });
+        let monitor = MempoolMonitor::new(
+            "http://localhost:9650",
+            MempoolConfig {
+                min_swap_avax: 10.0,
+                ..MempoolConfig::default()
+            },
+        );
         let swap = DecodedSwap {
-            tx_hash: "0x".into(), dex: DexProtocol::TraderJoe,
-            token_in: tokens::WAVAX.into(), token_out: tokens::USDC.into(),
+            tx_hash: "0x".into(),
+            dex: DexProtocol::TraderJoe,
+            token_in: tokens::WAVAX.into(),
+            token_out: tokens::USDC.into(),
             amount_in: U256::from_u128(1 * 10u128.pow(18)), // 1 AVAX (below 10 min)
             amount_out_min: U256::from_u128(20 * 10u128.pow(6)),
-            path: vec![], recipient: "0x".into(), deadline: 0,
-            gas_price: U256::from_u64(25_000_000_000), is_exact_input: true,
+            path: vec![],
+            recipient: "0x".into(),
+            deadline: 0,
+            gas_price: U256::from_u64(25_000_000_000),
+            is_exact_input: true,
         };
         assert!(monitor.evaluate_sandwich(&swap).is_none());
     }
@@ -1610,12 +1813,17 @@ mod tests {
     fn test_evaluate_sandwich_zero_amounts() {
         let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
         let swap = DecodedSwap {
-            tx_hash: "0x".into(), dex: DexProtocol::TraderJoe,
-            token_in: tokens::WAVAX.into(), token_out: tokens::USDC.into(),
+            tx_hash: "0x".into(),
+            dex: DexProtocol::TraderJoe,
+            token_in: tokens::WAVAX.into(),
+            token_out: tokens::USDC.into(),
             amount_in: U256::from_u128(100 * 10u128.pow(18)),
             amount_out_min: U256::ZERO, // zero min = skip
-            path: vec![], recipient: "0x".into(), deadline: 0,
-            gas_price: U256::from_u64(25_000_000_000), is_exact_input: true,
+            path: vec![],
+            recipient: "0x".into(),
+            deadline: 0,
+            gas_price: U256::from_u64(25_000_000_000),
+            is_exact_input: true,
         };
         assert!(monitor.evaluate_sandwich(&swap).is_none());
     }
@@ -1625,36 +1833,68 @@ mod tests {
     #[test]
     fn test_arbitrage_zero_price() {
         let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
-        assert!(monitor.evaluate_arbitrage("A", "B", 0.0, 20.0,
-            DexProtocol::TraderJoe, DexProtocol::Pangolin).is_none());
-        assert!(monitor.evaluate_arbitrage("A", "B", 20.0, 0.0,
-            DexProtocol::TraderJoe, DexProtocol::Pangolin).is_none());
+        assert!(monitor
+            .evaluate_arbitrage(
+                "A",
+                "B",
+                0.0,
+                20.0,
+                DexProtocol::TraderJoe,
+                DexProtocol::Pangolin
+            )
+            .is_none());
+        assert!(monitor
+            .evaluate_arbitrage(
+                "A",
+                "B",
+                20.0,
+                0.0,
+                DexProtocol::TraderJoe,
+                DexProtocol::Pangolin
+            )
+            .is_none());
     }
 
     #[test]
     fn test_arbitrage_negative_price() {
         let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
-        assert!(monitor.evaluate_arbitrage("A", "B", -1.0, 20.0,
-            DexProtocol::TraderJoe, DexProtocol::Pangolin).is_none());
+        assert!(monitor
+            .evaluate_arbitrage(
+                "A",
+                "B",
+                -1.0,
+                20.0,
+                DexProtocol::TraderJoe,
+                DexProtocol::Pangolin
+            )
+            .is_none());
     }
 
     #[test]
     fn test_arbitrage_picks_correct_direction() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig {
-            min_profit_avax: 0.001, // low threshold for test
-            ..MempoolConfig::default()
-        });
+        let monitor = MempoolMonitor::new(
+            "http://localhost:9650",
+            MempoolConfig {
+                min_profit_avax: 0.001, // low threshold for test
+                ..MempoolConfig::default()
+            },
+        );
 
         // B is cheaper on Pangolin — should buy on Pangolin, sell on TraderJoe
-        let opp = monitor.evaluate_arbitrage("A", "B",
-            25.0,  // TraderJoe: higher price
-            20.0,  // Pangolin: lower price
-            DexProtocol::TraderJoe, DexProtocol::Pangolin,
+        let opp = monitor.evaluate_arbitrage(
+            "A",
+            "B",
+            25.0, // TraderJoe: higher price
+            20.0, // Pangolin: lower price
+            DexProtocol::TraderJoe,
+            DexProtocol::Pangolin,
         );
         assert!(opp.is_some());
         match opp.unwrap() {
-            MevOpportunity::Arbitrage { buy_dex, sell_dex, .. } => {
-                assert_eq!(buy_dex, DexProtocol::Pangolin);  // buy where cheap
+            MevOpportunity::Arbitrage {
+                buy_dex, sell_dex, ..
+            } => {
+                assert_eq!(buy_dex, DexProtocol::Pangolin); // buy where cheap
                 assert_eq!(sell_dex, DexProtocol::TraderJoe); // sell where expensive
             }
             _ => panic!("Expected Arbitrage"),
@@ -1685,9 +1925,14 @@ mod tests {
         assert!(format!("{}", MevError::Timeout).contains("timed out"));
         assert!(format!("{}", MevError::PoolNotFound("0xabc".into())).contains("0xabc"));
         assert!(format!("{}", MevError::GasTooHigh(U256::from_u64(999))).contains("0x3e7"));
-        assert!(format!("{}", MevError::SlippageExceeded {
-            expected: U256::from_u64(100), actual: U256::from_u64(80)
-        }).contains("expected"));
+        assert!(format!(
+            "{}",
+            MevError::SlippageExceeded {
+                expected: U256::from_u64(100),
+                actual: U256::from_u64(80)
+            }
+        )
+        .contains("expected"));
     }
 
     // --- Stress tests ---
@@ -1696,7 +1941,8 @@ mod tests {
     fn test_sandwich_simulation_stress() {
         let pool = PoolState {
             address: "0x".into(),
-            token0: tokens::WAVAX.into(), token1: tokens::USDC.into(),
+            token0: tokens::WAVAX.into(),
+            token1: tokens::USDC.into(),
             reserve0: U256::from_u128(100_000 * 10u128.pow(18)),
             reserve1: U256::from_u128(2_000_000 * 10u128.pow(6)),
             fee_bps: 30,
@@ -1711,8 +1957,11 @@ mod tests {
             let _ = pool.simulate_sandwich(victim, frontrun, tokens::WAVAX);
         }
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 100,
-            "1000 sandwich sims should take <100ms, took {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 100,
+            "1000 sandwich sims should take <100ms, took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -1723,7 +1972,10 @@ mod tests {
             let _ = selectors::is_swap(&selectors::TRANSFER);
         }
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 50,
-            "1M selector checks should take <50ms, took {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 50,
+            "1M selector checks should take <50ms, took {:?}",
+            elapsed
+        );
     }
 }

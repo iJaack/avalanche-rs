@@ -19,9 +19,9 @@
 //! const bloom = bloom_check("aabbccdd", "aabb");
 //! ```
 
-use wasm_bindgen::prelude::*;
-use avalanche_core::block::{BlockType, compute_block_id, extract_parent_id};
+use avalanche_core::block::{compute_block_id, extract_parent_id, BlockType};
 use avalanche_core::bloom::BloomFilter;
+use wasm_bindgen::prelude::*;
 
 /// Parse a hex-encoded Avalanche block, returning JSON with block metadata.
 ///
@@ -187,7 +187,7 @@ pub fn decode_message(hex_data: &str) -> String {
 
     // Avalanche messages are protobuf-encoded, but for WASM we provide
     // basic length and hash information
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let hash = Sha256::digest(&data);
 
     format!(
@@ -205,7 +205,7 @@ pub fn sha256_hash(hex_data: &str) -> String {
         Err(_) => return "".to_string(),
     };
 
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let hash = Sha256::digest(&data);
     hex::encode(&hash)
 }
@@ -224,8 +224,12 @@ mod tests {
     fn test_parse_block_valid() {
         // Construct a minimal block: version(2) + typeID(4) + padding
         let mut block = vec![0u8; 50];
-        block[0] = 0x00; block[1] = 0x00; // version 0
-        block[2] = 0x00; block[3] = 0x00; block[4] = 0x00; block[5] = 0x20; // typeID 32 = BanffStandard
+        block[0] = 0x00;
+        block[1] = 0x00; // version 0
+        block[2] = 0x00;
+        block[3] = 0x00;
+        block[4] = 0x00;
+        block[5] = 0x20; // typeID 32 = BanffStandard
         let hex = hex::encode(&block);
         let result = parse_block(&hex);
         assert!(result.contains("BanffStandard"));

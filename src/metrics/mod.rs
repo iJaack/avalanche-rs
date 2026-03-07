@@ -5,10 +5,7 @@
 
 use std::time::SystemTime;
 
-use prometheus::{
-    Encoder, IntCounter, IntGauge,
-    Registry, TextEncoder,
-};
+use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 
 // ---------------------------------------------------------------------------
 // Node Metrics
@@ -56,31 +53,67 @@ impl NodeMetrics {
     pub fn new() -> Self {
         let registry = Registry::new();
 
-        let peers_connected = IntGauge::new("avalanche_peers_connected", "Number of connected peers").unwrap();
-        let peers_discovered = IntCounter::new("avalanche_peers_discovered_total", "Total peers discovered").unwrap();
-        let messages_sent = IntCounter::new("avalanche_messages_sent_total", "Total messages sent").unwrap();
-        let messages_received = IntCounter::new("avalanche_messages_received_total", "Total messages received").unwrap();
+        let peers_connected =
+            IntGauge::new("avalanche_peers_connected", "Number of connected peers").unwrap();
+        let peers_discovered =
+            IntCounter::new("avalanche_peers_discovered_total", "Total peers discovered").unwrap();
+        let messages_sent =
+            IntCounter::new("avalanche_messages_sent_total", "Total messages sent").unwrap();
+        let messages_received = IntCounter::new(
+            "avalanche_messages_received_total",
+            "Total messages received",
+        )
+        .unwrap();
         let bytes_sent = IntCounter::new("avalanche_bytes_sent_total", "Total bytes sent").unwrap();
-        let bytes_received = IntCounter::new("avalanche_bytes_received_total", "Total bytes received").unwrap();
+        let bytes_received =
+            IntCounter::new("avalanche_bytes_received_total", "Total bytes received").unwrap();
 
-        let blocks_downloaded = IntCounter::new("avalanche_blocks_downloaded_total", "Total blocks downloaded").unwrap();
-        let blocks_executed = IntCounter::new("avalanche_blocks_executed_total", "Total blocks executed").unwrap();
+        let blocks_downloaded = IntCounter::new(
+            "avalanche_blocks_downloaded_total",
+            "Total blocks downloaded",
+        )
+        .unwrap();
+        let blocks_executed =
+            IntCounter::new("avalanche_blocks_executed_total", "Total blocks executed").unwrap();
         let sync_height = IntGauge::new("avalanche_sync_height", "Current sync height").unwrap();
-        let sync_target_height = IntGauge::new("avalanche_sync_target_height", "Target sync height").unwrap();
-        let trie_nodes_downloaded = IntCounter::new("avalanche_trie_nodes_downloaded_total", "Total trie nodes downloaded").unwrap();
+        let sync_target_height =
+            IntGauge::new("avalanche_sync_target_height", "Target sync height").unwrap();
+        let trie_nodes_downloaded = IntCounter::new(
+            "avalanche_trie_nodes_downloaded_total",
+            "Total trie nodes downloaded",
+        )
+        .unwrap();
 
-        let blocks_accepted = IntCounter::new("avalanche_blocks_accepted_total", "Total blocks accepted by consensus").unwrap();
-        let blocks_rejected = IntCounter::new("avalanche_blocks_rejected_total", "Total blocks rejected").unwrap();
-        let consensus_rounds = IntCounter::new("avalanche_consensus_rounds_total", "Total consensus rounds").unwrap();
+        let blocks_accepted = IntCounter::new(
+            "avalanche_blocks_accepted_total",
+            "Total blocks accepted by consensus",
+        )
+        .unwrap();
+        let blocks_rejected =
+            IntCounter::new("avalanche_blocks_rejected_total", "Total blocks rejected").unwrap();
+        let consensus_rounds =
+            IntCounter::new("avalanche_consensus_rounds_total", "Total consensus rounds").unwrap();
 
-        let db_reads = IntCounter::new("avalanche_db_reads_total", "Total DB read operations").unwrap();
-        let db_writes = IntCounter::new("avalanche_db_writes_total", "Total DB write operations").unwrap();
-        let db_bytes_written = IntCounter::new("avalanche_db_bytes_written_total", "Total DB bytes written").unwrap();
+        let db_reads =
+            IntCounter::new("avalanche_db_reads_total", "Total DB read operations").unwrap();
+        let db_writes =
+            IntCounter::new("avalanche_db_writes_total", "Total DB write operations").unwrap();
+        let db_bytes_written =
+            IntCounter::new("avalanche_db_bytes_written_total", "Total DB bytes written").unwrap();
 
-        let evm_txs_executed = IntCounter::new("avalanche_evm_txs_executed_total", "Total EVM transactions executed").unwrap();
-        let evm_gas_used = IntCounter::new("avalanche_evm_gas_used_total", "Total EVM gas used").unwrap();
+        let evm_txs_executed = IntCounter::new(
+            "avalanche_evm_txs_executed_total",
+            "Total EVM transactions executed",
+        )
+        .unwrap();
+        let evm_gas_used =
+            IntCounter::new("avalanche_evm_gas_used_total", "Total EVM gas used").unwrap();
 
-        let start_time_seconds = IntGauge::new("avalanche_start_time_seconds", "Node start time (unix seconds)").unwrap();
+        let start_time_seconds = IntGauge::new(
+            "avalanche_start_time_seconds",
+            "Node start time (unix seconds)",
+        )
+        .unwrap();
 
         // Register all metrics
         let _ = registry.register(Box::new(peers_connected.clone()));
@@ -141,7 +174,9 @@ impl NodeMetrics {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).unwrap_or_default();
+        encoder
+            .encode(&metric_families, &mut buffer)
+            .unwrap_or_default();
         String::from_utf8(buffer).unwrap_or_default()
     }
 }
@@ -280,13 +315,28 @@ pub fn structured_log(level: &str, module: &str, message: &str, fields: &[(&str,
         .as_secs();
 
     let mut obj = serde_json::Map::new();
-    obj.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-    obj.insert("level".to_string(), serde_json::Value::String(level.to_string()));
-    obj.insert("module".to_string(), serde_json::Value::String(module.to_string()));
-    obj.insert("message".to_string(), serde_json::Value::String(message.to_string()));
+    obj.insert(
+        "timestamp".to_string(),
+        serde_json::Value::Number(timestamp.into()),
+    );
+    obj.insert(
+        "level".to_string(),
+        serde_json::Value::String(level.to_string()),
+    );
+    obj.insert(
+        "module".to_string(),
+        serde_json::Value::String(module.to_string()),
+    );
+    obj.insert(
+        "message".to_string(),
+        serde_json::Value::String(message.to_string()),
+    );
 
     for (key, value) in fields {
-        obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        obj.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 
     serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default()
@@ -373,14 +423,7 @@ mod tests {
 
     #[test]
     fn test_startup_banner() {
-        let banner = print_startup_banner(
-            "0.1.0",
-            1,
-            "NodeID-abc123",
-            9651,
-            9650,
-            "./data",
-        );
+        let banner = print_startup_banner("0.1.0", 1, "NodeID-abc123", 9651, 9650, "./data");
         assert!(banner.contains("avalanche-rs v0.1.0"));
         assert!(banner.contains("mainnet"));
         assert!(banner.contains("NodeID-abc123"));
@@ -396,7 +439,12 @@ mod tests {
 
     #[test]
     fn test_structured_log() {
-        let log = structured_log("info", "sync", "block downloaded", &[("height", "12345"), ("size", "1024")]);
+        let log = structured_log(
+            "info",
+            "sync",
+            "block downloaded",
+            &[("height", "12345"), ("size", "1024")],
+        );
         assert!(log.contains("\"level\":\"info\""));
         assert!(log.contains("\"module\":\"sync\""));
         assert!(log.contains("\"height\":\"12345\""));

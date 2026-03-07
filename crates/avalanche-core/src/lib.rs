@@ -9,7 +9,7 @@
 
 extern crate alloc;
 
-pub mod types;
-pub mod codec;
 pub mod block;
 pub mod bloom;
+pub mod codec;
+pub mod types;

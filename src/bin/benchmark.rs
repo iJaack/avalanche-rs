@@ -2,9 +2,9 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use avalanche_rs::types::*;
 use avalanche_rs::rpc::RpcClient;
-use std::time::{Instant, Duration};
+use avalanche_rs::types::*;
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 const ENDPOINT: &str = "https://api.avax.network";
@@ -17,10 +17,18 @@ struct BenchResult {
 
 impl BenchResult {
     fn new(name: &str) -> Self {
-        Self { name: name.to_string(), samples: vec![], errors: 0 }
+        Self {
+            name: name.to_string(),
+            samples: vec![],
+            errors: 0,
+        }
     }
-    fn add(&mut self, d: Duration) { self.samples.push(d); }
-    fn add_error(&mut self) { self.errors += 1; }
+    fn add(&mut self, d: Duration) {
+        self.samples.push(d);
+    }
+    fn add_error(&mut self) {
+        self.errors += 1;
+    }
     fn report(&self) {
         if self.samples.is_empty() {
             println!("  {:<40} ❌ all {} requests failed", self.name, self.errors);
@@ -40,7 +48,12 @@ impl BenchResult {
     }
 }
 
-async fn bench_rpc_sequential(client: &RpcClient, method: &str, params: Vec<serde_json::Value>, rounds: usize) -> BenchResult {
+async fn bench_rpc_sequential(
+    client: &RpcClient,
+    method: &str,
+    params: Vec<serde_json::Value>,
+    rounds: usize,
+) -> BenchResult {
     let mut result = BenchResult::new(&format!("{} (seq x{})", method, rounds));
     for _ in 0..rounds {
         let start = Instant::now();
@@ -52,7 +65,12 @@ async fn bench_rpc_sequential(client: &RpcClient, method: &str, params: Vec<serd
     result
 }
 
-async fn bench_rpc_concurrent(endpoint: &str, method: &str, params: Vec<serde_json::Value>, concurrency: usize) -> BenchResult {
+async fn bench_rpc_concurrent(
+    endpoint: &str,
+    method: &str,
+    params: Vec<serde_json::Value>,
+    concurrency: usize,
+) -> BenchResult {
     let mut result = BenchResult::new(&format!("{} (concurrent x{})", method, concurrency));
     let mut set = JoinSet::new();
     let start = Instant::now();
@@ -76,9 +94,13 @@ async fn bench_rpc_concurrent(endpoint: &str, method: &str, params: Vec<serde_js
         }
     }
     let wall = start.elapsed();
-    println!("  {:<40} wall time: {:?} for {} requests ({:.1} req/s)",
-        format!("  └─ throughput"), wall, concurrency,
-        concurrency as f64 / wall.as_secs_f64());
+    println!(
+        "  {:<40} wall time: {:?} for {} requests ({:.1} req/s)",
+        format!("  └─ throughput"),
+        wall,
+        concurrency,
+        concurrency as f64 / wall.as_secs_f64()
+    );
     result
 }
 
@@ -89,7 +111,10 @@ async fn main() {
     println!("║   avalanche-rs v0.1.0 OPTIMIZED — Full Benchmark Suite                  ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  Optimizations: SHA2-ASM, mimalloc, AHash, faster-hex, fat LTO, -O3     ║");
-    println!("║  Target: {} + local ops                        ║", ENDPOINT);
+    println!(
+        "║  Target: {} + local ops                        ║",
+        ENDPOINT
+    );
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -101,35 +126,59 @@ async fn main() {
     let _ = c_client.call("eth_blockNumber", vec![]).await;
     let _ = c_client.call("eth_blockNumber", vec![]).await;
     // Warmup local ops too
-    for i in 0u32..100_000 { let _ = ID::hash(&i.to_be_bytes()); }
+    for i in 0u32..100_000 {
+        let _ = ID::hash(&i.to_be_bytes());
+    }
     println!(" done\n");
 
     // ── RPC LATENCY ─────────────────────────────────────
     println!("━━━ C-Chain Sequential Latency ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
-    bench_rpc_sequential(&c_client, "eth_blockNumber", vec![], 20).await.report();
-    bench_rpc_sequential(&c_client, "eth_getBalance",
-        vec![serde_json::json!("0x8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC"), serde_json::json!("latest")],
-        20).await.report();
-    bench_rpc_sequential(&c_client, "eth_chainId", vec![], 20).await.report();
-    bench_rpc_sequential(&c_client, "eth_gasPrice", vec![], 20).await.report();
+    bench_rpc_sequential(&c_client, "eth_blockNumber", vec![], 20)
+        .await
+        .report();
+    bench_rpc_sequential(
+        &c_client,
+        "eth_getBalance",
+        vec![
+            serde_json::json!("0x8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC"),
+            serde_json::json!("latest"),
+        ],
+        20,
+    )
+    .await
+    .report();
+    bench_rpc_sequential(&c_client, "eth_chainId", vec![], 20)
+        .await
+        .report();
+    bench_rpc_sequential(&c_client, "eth_gasPrice", vec![], 20)
+        .await
+        .report();
 
     println!();
     println!("━━━ P-Chain Sequential Latency ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
-    bench_rpc_sequential(&p_client, "platform.getHeight", vec![], 20).await.report();
+    bench_rpc_sequential(&p_client, "platform.getHeight", vec![], 20)
+        .await
+        .report();
 
     println!();
     println!("━━━ Concurrent Throughput ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
     let ep = format!("{}/ext/bc/C/rpc", ENDPOINT);
-    bench_rpc_concurrent(&ep, "eth_blockNumber", vec![], 50).await.report();
+    bench_rpc_concurrent(&ep, "eth_blockNumber", vec![], 50)
+        .await
+        .report();
     println!();
-    bench_rpc_concurrent(&ep, "eth_blockNumber", vec![], 100).await.report();
+    bench_rpc_concurrent(&ep, "eth_blockNumber", vec![], 100)
+        .await
+        .report();
     println!();
-    bench_rpc_concurrent(&ep, "eth_blockNumber", vec![], 200).await.report();
+    bench_rpc_concurrent(&ep, "eth_blockNumber", vec![], 200)
+        .await
+        .report();
 
     // ── LOCAL PERFORMANCE ───────────────────────────────
     println!();
@@ -143,10 +192,13 @@ async fn main() {
         let _ = ID::hash(&(i as u32).to_be_bytes());
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("SHA-256 hash (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("SHA-256 hash (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     // Block chain build
     let n = 100_000u64;
@@ -158,17 +210,24 @@ async fn main() {
         parent = b.id;
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("Block chain build (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("Block chain build (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     // JSON roundtrip (serde)
     let block = Block::new(
         BlockID(ID::hash(b"bench")),
         BlockID(ID::new([0u8; 32])),
-        999, 12345, vec![], ID::new([0u8; 32]),
-    ).unwrap();
+        999,
+        12345,
+        vec![],
+        ID::new([0u8; 32]),
+    )
+    .unwrap();
     let n = 100_000u64;
     let start = Instant::now();
     for _ in 0..n {
@@ -176,10 +235,13 @@ async fn main() {
         let _: Block = serde_json::from_slice(&json).unwrap();
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("JSON roundtrip (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("JSON roundtrip (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     // Hex roundtrip (faster-hex)
     let id = ID::new([0xAB; 32]);
@@ -195,10 +257,13 @@ async fn main() {
         faster_hex::hex_decode(hex_str.as_bytes(), &mut out).unwrap();
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("Hex roundtrip/faster-hex (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("Hex roundtrip/faster-hex (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     // Also show old hex for comparison
     let start = Instant::now();
@@ -207,10 +272,13 @@ async fn main() {
         let _ = hex::decode(&h).unwrap();
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("Hex roundtrip/std hex (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("Hex roundtrip/std hex (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     // AHash HashMap stress
     let n = 100_000u64;
@@ -225,9 +293,14 @@ async fn main() {
         let _ = map.get(&id);
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  ({} insert + {} lookup)",
-        format!("AHashMap stress (x{})", n * 2), elapsed,
-        elapsed.as_nanos() as f64 / (n * 2) as f64, n, n);
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  ({} insert + {} lookup)",
+        format!("AHashMap stress (x{})", n * 2),
+        elapsed,
+        elapsed.as_nanos() as f64 / (n * 2) as f64,
+        n,
+        n
+    );
 
     // Standard HashMap for comparison
     let start = Instant::now();
@@ -241,9 +314,14 @@ async fn main() {
         let _ = map.get(&id);
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  ({} insert + {} lookup)",
-        format!("StdHashMap stress (x{})", n * 2), elapsed,
-        elapsed.as_nanos() as f64 / (n * 2) as f64, n, n);
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  ({} insert + {} lookup)",
+        format!("StdHashMap stress (x{})", n * 2),
+        elapsed,
+        elapsed.as_nanos() as f64 / (n * 2) as f64,
+        n,
+        n
+    );
 
     // ── EXTREME STRESS ──────────────────────────────────
     println!();
@@ -257,10 +335,13 @@ async fn main() {
         let _ = ID::hash(&(i as u32).to_be_bytes());
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("SHA-256 hash (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("SHA-256 hash (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     // 1M block chain
     let n = 1_000_000u64;
@@ -272,10 +353,13 @@ async fn main() {
         parent = b.id;
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("Block chain (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("Block chain (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     // 1M JSON roundtrips
     let n = 1_000_000u64;
@@ -285,10 +369,13 @@ async fn main() {
         let _: Block = serde_json::from_slice(&json).unwrap();
     }
     let elapsed = start.elapsed();
-    println!("  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
-        format!("JSON roundtrip (x{})", n), elapsed,
+    println!(
+        "  {:<40} total {:>8.1?}  per-op {:>6.0} ns  throughput {:>8.1} M/s",
+        format!("JSON roundtrip (x{})", n),
+        elapsed,
         elapsed.as_nanos() as f64 / n as f64,
-        n as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+        n as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
     println!();
     println!("══════════════════════════════════════════════════════════════════════════");

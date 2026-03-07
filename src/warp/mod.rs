@@ -83,11 +83,7 @@ impl BlsAggregateSignature {
 
     /// Verify the aggregate signature against the message and validator public keys.
     /// Uses blst for BLS12-381 verification.
-    pub fn verify(
-        &self,
-        message: &[u8],
-        validator_keys: &[BlsPublicKey],
-    ) -> Result<bool, String> {
+    pub fn verify(&self, message: &[u8], validator_keys: &[BlsPublicKey]) -> Result<bool, String> {
         use blst::min_pk::{AggregatePublicKey, PublicKey, Signature};
 
         if validator_keys.is_empty() {
@@ -167,12 +163,16 @@ impl UnsignedWarpMessage {
             return None;
         }
         let payload = data[40..40 + payload_len].to_vec();
-        Some(Self { network_id, source_chain_id, payload })
+        Some(Self {
+            network_id,
+            source_chain_id,
+            payload,
+        })
     }
 
     /// Compute the hash (SHA-256) for signing.
     pub fn hash(&self) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let encoded = self.encode();
         let hash = Sha256::digest(&encoded);
         let mut out = [0u8; 32];
@@ -192,10 +192,7 @@ pub struct WarpMessage {
 
 impl WarpMessage {
     /// Create a new warp message.
-    pub fn new(
-        unsigned_message: UnsignedWarpMessage,
-        signature: BlsAggregateSignature,
-    ) -> Self {
+    pub fn new(unsigned_message: UnsignedWarpMessage, signature: BlsAggregateSignature) -> Self {
         Self {
             unsigned_message,
             signature,
@@ -224,7 +221,10 @@ impl WarpMessage {
         }
         let unsigned_message = UnsignedWarpMessage::decode(&data[4..4 + msg_len])?;
         let signature = BlsAggregateSignature::decode(&data[4 + msg_len..])?;
-        Some(Self { unsigned_message, signature })
+        Some(Self {
+            unsigned_message,
+            signature,
+        })
     }
 
     /// Verify the warp message signature.
@@ -403,9 +403,9 @@ mod tests {
             signature: BlsSignature([0; 96]),
             signer_bitset: vec![0b10100000],
         };
-        assert!(sig.has_signed(0));  // bit 7
+        assert!(sig.has_signed(0)); // bit 7
         assert!(!sig.has_signed(1)); // bit 6
-        assert!(sig.has_signed(2));  // bit 5
+        assert!(sig.has_signed(2)); // bit 5
         assert!(!sig.has_signed(3)); // bit 4
         assert!(!sig.has_signed(8)); // out of range
     }
@@ -469,23 +469,22 @@ mod tests {
         };
         let warp = WarpMessage::new(unsigned, sig);
 
-        let msg = warp_app_request(
-            crate::network::ChainId([0xBB; 32]),
-            42,
-            &warp,
-        );
-        assert!(matches!(msg, crate::network::NetworkMessage::AppRequest { request_id: 42, .. }));
+        let msg = warp_app_request(crate::network::ChainId([0xBB; 32]), 42, &warp);
+        assert!(matches!(
+            msg,
+            crate::network::NetworkMessage::AppRequest { request_id: 42, .. }
+        ));
     }
 
     #[test]
     fn test_warp_app_response() {
-        let msg = warp_app_response(
-            crate::network::ChainId([0xCC; 32]),
-            42,
-            true,
-        );
+        let msg = warp_app_response(crate::network::ChainId([0xCC; 32]), 42, true);
         match msg {
-            crate::network::NetworkMessage::AppResponse { app_bytes, request_id, .. } => {
+            crate::network::NetworkMessage::AppResponse {
+                app_bytes,
+                request_id,
+                ..
+            } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(app_bytes, vec![0x01]);
             }

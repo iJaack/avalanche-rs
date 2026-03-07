@@ -7,32 +7,34 @@
 // We need unsafe for RocksDB FFI bindings and revm's EVM internals
 // #![forbid(unsafe_code)]
 
-pub mod types;
-#[cfg(feature = "rpc")]
-pub mod rpc;
-#[cfg(feature = "p2p")]
-pub mod network;
 pub mod codec;
 pub mod consensus;
-pub mod mev;
-pub mod tx;
 pub mod mempool;
+pub mod mev;
+#[cfg(feature = "p2p")]
+pub mod network;
+#[cfg(feature = "rpc")]
+pub mod rpc;
+pub mod tx;
+pub mod types;
 
 // Production node modules
-pub mod proto;
-pub mod identity;
-pub mod evm;
-pub mod db;
-pub mod sync;
 pub mod block;
-pub mod validator;
-pub mod metrics;
-pub mod warp;
-pub mod subnet;
+pub mod db;
+pub mod evm;
+pub mod identity;
 pub mod light;
+pub mod metrics;
+pub mod proto;
+pub mod subnet;
+pub mod sync;
+pub mod validator;
+pub mod warp;
 
 // Re-export common types for convenience
-pub use types::{AvalancheError, Result, ID, NodeID, BlockID, TransactionID, ChainID, Block, Transaction, UTXO};
+pub use types::{
+    AvalancheError, Block, BlockID, ChainID, NodeID, Result, Transaction, TransactionID, ID, UTXO,
+};
 
 #[cfg(feature = "rpc")]
 pub use rpc::RpcClient;

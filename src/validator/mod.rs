@@ -6,8 +6,8 @@
 //! Phase 7: secp256k1 signature validation on P-Chain transactions,
 //! UTXO set tracking from genesis, and transaction verification.
 
-use std::collections::HashMap;
 use crate::network::NodeId;
+use std::collections::HashMap;
 
 /// Information about a validator
 #[derive(Debug, Clone, PartialEq)]
@@ -276,8 +276,8 @@ pub fn verify_pchain_signature(
     expected_address: &[u8; 20],
 ) -> Result<bool, String> {
     use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-    use sha2::{Sha256, Digest};
     use ripemd::Ripemd160;
+    use sha2::{Digest, Sha256};
 
     if signature.len() != 65 {
         return Err(format!(
@@ -287,8 +287,8 @@ pub fn verify_pchain_signature(
     }
 
     // Parse signature: first 64 bytes = r||s, last byte = recovery ID
-    let sig = Signature::from_slice(&signature[..64])
-        .map_err(|e| format!("invalid signature: {}", e))?;
+    let sig =
+        Signature::from_slice(&signature[..64]).map_err(|e| format!("invalid signature: {}", e))?;
 
     let recovery_id = RecoveryId::try_from(signature[64] % 4)
         .map_err(|e| format!("invalid recovery id: {}", e))?;
@@ -375,11 +375,26 @@ pub fn validate_add_validator_tx(
 /// Transaction validation errors.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxValidationError {
-    InsufficientStake { required: u64, provided: u64 },
-    InvalidTimeRange { start: u64, end: u64 },
-    StakingDurationTooShort { min_seconds: u64, actual_seconds: u64 },
-    UtxoNotFound { tx_id: [u8; 32], output_index: u32 },
-    InsufficientFunds { required: u64, available: u64 },
+    InsufficientStake {
+        required: u64,
+        provided: u64,
+    },
+    InvalidTimeRange {
+        start: u64,
+        end: u64,
+    },
+    StakingDurationTooShort {
+        min_seconds: u64,
+        actual_seconds: u64,
+    },
+    UtxoNotFound {
+        tx_id: [u8; 32],
+        output_index: u32,
+    },
+    InsufficientFunds {
+        required: u64,
+        available: u64,
+    },
     InvalidSignature(String),
 }
 
@@ -387,19 +402,37 @@ impl std::fmt::Display for TxValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InsufficientStake { required, provided } => {
-                write!(f, "insufficient stake: need {} nAVAX, got {}", required, provided)
+                write!(
+                    f,
+                    "insufficient stake: need {} nAVAX, got {}",
+                    required, provided
+                )
             }
             Self::InvalidTimeRange { start, end } => {
                 write!(f, "invalid time range: start={} >= end={}", start, end)
             }
-            Self::StakingDurationTooShort { min_seconds, actual_seconds } => {
-                write!(f, "staking duration too short: min={}s, actual={}s", min_seconds, actual_seconds)
+            Self::StakingDurationTooShort {
+                min_seconds,
+                actual_seconds,
+            } => {
+                write!(
+                    f,
+                    "staking duration too short: min={}s, actual={}s",
+                    min_seconds, actual_seconds
+                )
             }
             Self::UtxoNotFound { output_index, .. } => {
                 write!(f, "UTXO not found at index {}", output_index)
             }
-            Self::InsufficientFunds { required, available } => {
-                write!(f, "insufficient funds: need {}, have {}", required, available)
+            Self::InsufficientFunds {
+                required,
+                available,
+            } => {
+                write!(
+                    f,
+                    "insufficient funds: need {}, have {}",
+                    required, available
+                )
             }
             Self::InvalidSignature(e) => write!(f, "invalid signature: {}", e),
         }
@@ -415,7 +448,7 @@ impl std::error::Error for TxValidationError {}
 /// Compute the receipt root hash from transaction receipts using alloy-trie.
 pub fn compute_receipt_root(receipts: &[crate::evm::TxReceipt]) -> [u8; 32] {
     use alloy_trie::EMPTY_ROOT_HASH;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     if receipts.is_empty() {
         let mut out = [0u8; 32];
@@ -443,10 +476,7 @@ pub fn compute_receipt_root(receipts: &[crate::evm::TxReceipt]) -> [u8; 32] {
 }
 
 /// Verify that computed receipts match the expected receipt root from a block header.
-pub fn verify_receipt_root(
-    receipts: &[crate::evm::TxReceipt],
-    expected_root: &[u8; 32],
-) -> bool {
+pub fn verify_receipt_root(receipts: &[crate::evm::TxReceipt], expected_root: &[u8; 32]) -> bool {
     let computed = compute_receipt_root(receipts);
     computed == *expected_root
 }
@@ -485,7 +515,7 @@ mod tests {
         };
         vs.add_validator(info);
 
-        assert_eq!(vs.active_validators(50).len(), 0);  // Before start
+        assert_eq!(vs.active_validators(50).len(), 0); // Before start
         assert_eq!(vs.active_validators(150).len(), 1); // During active
         assert_eq!(vs.active_validators(250).len(), 0); // After end
     }
@@ -493,7 +523,7 @@ mod tests {
     #[test]
     fn test_add_validator_tx_parse() {
         let mut raw = Vec::new();
-        raw.extend_from_slice(&[0xCCu8; 20]);  // NodeID
+        raw.extend_from_slice(&[0xCCu8; 20]); // NodeID
         raw.extend_from_slice(&(100u64).to_be_bytes()); // StartTime
         raw.extend_from_slice(&(200u64).to_be_bytes()); // EndTime
         raw.extend_from_slice(&(1000u64).to_be_bytes()); // Weight
@@ -514,7 +544,7 @@ mod tests {
     #[test]
     fn test_add_validator_tx_invalid_times() {
         let mut raw = Vec::new();
-        raw.extend_from_slice(&[0xDDu8; 20]);  // NodeID
+        raw.extend_from_slice(&[0xDDu8; 20]); // NodeID
         raw.extend_from_slice(&(200u64).to_be_bytes()); // StartTime (AFTER end)
         raw.extend_from_slice(&(100u64).to_be_bytes()); // EndTime (BEFORE start)
         raw.extend_from_slice(&(1000u64).to_be_bytes()); // Weight
@@ -586,9 +616,27 @@ mod tests {
     fn test_utxo_set_for_address() {
         let mut set = UtxoSet::new();
         let owner = [0x33; 20];
-        set.add(Utxo { tx_id: [1; 32], output_index: 0, amount: 100, owner, locktime: 0 });
-        set.add(Utxo { tx_id: [2; 32], output_index: 0, amount: 200, owner, locktime: 0 });
-        set.add(Utxo { tx_id: [3; 32], output_index: 0, amount: 300, owner: [0x44; 20], locktime: 0 });
+        set.add(Utxo {
+            tx_id: [1; 32],
+            output_index: 0,
+            amount: 100,
+            owner,
+            locktime: 0,
+        });
+        set.add(Utxo {
+            tx_id: [2; 32],
+            output_index: 0,
+            amount: 200,
+            owner,
+            locktime: 0,
+        });
+        set.add(Utxo {
+            tx_id: [3; 32],
+            output_index: 0,
+            amount: 300,
+            owner: [0x44; 20],
+            locktime: 0,
+        });
 
         let owned = set.utxos_for_address(&owner);
         assert_eq!(owned.len(), 2);
@@ -606,9 +654,9 @@ mod tests {
 
     #[test]
     fn test_verify_pchain_signature_roundtrip() {
-        use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
-        use sha2::{Sha256, Digest};
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
         use ripemd::Ripemd160;
+        use sha2::{Digest, Sha256};
 
         // Generate a key pair
         let signing_key = SigningKey::from_bytes(&[0x42u8; 32].into()).unwrap();
@@ -638,8 +686,8 @@ mod tests {
 
     #[test]
     fn test_verify_pchain_signature_wrong_address() {
-        use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
-        use sha2::{Sha256, Digest};
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+        use sha2::{Digest, Sha256};
 
         let signing_key = SigningKey::from_bytes(&[0x42u8; 32].into()).unwrap();
         let message = b"test";
@@ -671,7 +719,10 @@ mod tests {
         let min_stake = 2_000_000_000_000; // 2000 AVAX
 
         let result = validate_add_validator_tx(&tx, &utxo_set, &[], min_stake);
-        assert!(matches!(result, Err(TxValidationError::InsufficientStake { .. })));
+        assert!(matches!(
+            result,
+            Err(TxValidationError::InsufficientStake { .. })
+        ));
     }
 
     #[test]
@@ -685,7 +736,10 @@ mod tests {
         let utxo_set = UtxoSet::new();
 
         let result = validate_add_validator_tx(&tx, &utxo_set, &[], 2_000_000_000_000);
-        assert!(matches!(result, Err(TxValidationError::StakingDurationTooShort { .. })));
+        assert!(matches!(
+            result,
+            Err(TxValidationError::StakingDurationTooShort { .. })
+        ));
     }
 
     #[test]
@@ -700,7 +754,10 @@ mod tests {
         let inputs = vec![([0xFF; 32], 0u32)]; // doesn't exist
 
         let result = validate_add_validator_tx(&tx, &utxo_set, &inputs, 2_000_000_000_000);
-        assert!(matches!(result, Err(TxValidationError::UtxoNotFound { .. })));
+        assert!(matches!(
+            result,
+            Err(TxValidationError::UtxoNotFound { .. })
+        ));
     }
 
     #[test]
@@ -722,7 +779,10 @@ mod tests {
 
         let inputs = vec![([0xEE; 32], 0u32)];
         let result = validate_add_validator_tx(&tx, &utxo_set, &inputs, 2_000_000_000_000);
-        assert!(matches!(result, Err(TxValidationError::InsufficientFunds { .. })));
+        assert!(matches!(
+            result,
+            Err(TxValidationError::InsufficientFunds { .. })
+        ));
     }
 
     #[test]
@@ -754,25 +814,22 @@ mod tests {
         let root = compute_receipt_root(&[]);
         // Should return EMPTY_ROOT_HASH
         let expected = [
-            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
-            0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
-            0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
-            0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0,
+            0xf8, 0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5,
+            0xe3, 0x63, 0xb4, 0x21,
         ];
         assert_eq!(root, expected);
     }
 
     #[test]
     fn test_receipt_root_deterministic() {
-        let receipts = vec![
-            crate::evm::TxReceipt {
-                success: true,
-                gas_used: 21000,
-                output: vec![],
-                contract_address: None,
-                logs: vec![],
-            },
-        ];
+        let receipts = vec![crate::evm::TxReceipt {
+            success: true,
+            gas_used: 21000,
+            output: vec![],
+            contract_address: None,
+            logs: vec![],
+        }];
         let root1 = compute_receipt_root(&receipts);
         let root2 = compute_receipt_root(&receipts);
         assert_eq!(root1, root2);
@@ -794,7 +851,10 @@ mod tests {
             contract_address: None,
             logs: vec![],
         }];
-        assert_ne!(compute_receipt_root(&receipts1), compute_receipt_root(&receipts2));
+        assert_ne!(
+            compute_receipt_root(&receipts1),
+            compute_receipt_root(&receipts2)
+        );
     }
 
     #[test]

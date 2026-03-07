@@ -100,7 +100,8 @@ mod tests {
                 1000,
                 vec![],
                 ID::new([0u8; 32]),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(block.height, 1);
             assert_eq!(block.tx_count(), 0);
         }
@@ -114,7 +115,8 @@ mod tests {
                 500,
                 vec![],
                 ID::new([0u8; 32]),
-            ).unwrap();
+            )
+            .unwrap();
             let json = serde_json::to_string(&block).unwrap();
             let recovered: Block = serde_json::from_str(&json).unwrap();
             assert_eq!(block, recovered);
@@ -165,7 +167,8 @@ mod tests {
                 ID::new([0u8; 32]),
                 500,
                 "owner".to_string(),
-            ).lock();
+            )
+            .lock();
             assert!(utxo.locked);
         }
 
@@ -206,7 +209,8 @@ mod tests {
                 100,
                 vec![],
                 ID::new([0u8; 32]),
-            ).unwrap();
+            )
+            .unwrap();
             let encoded = avalanche_rs::codec::encode(&block).unwrap();
             let decoded: Block = avalanche_rs::codec::decode(&encoded).unwrap();
             assert_eq!(block, decoded);
@@ -347,7 +351,8 @@ mod tests {
                 1000,
                 vec![],
                 ID::new([0u8; 32]),
-            ).unwrap();
+            )
+            .unwrap();
 
             let start = Instant::now();
             for _ in 0..1_000 {
@@ -428,7 +433,10 @@ mod tests {
             assert!(decoded.len() >= 36, "decoded too short: {}", decoded.len());
             let id: [u8; 32] = decoded[..32].try_into().expect("32 bytes");
             // Must be non-zero
-            assert!(id.iter().any(|&b| b != 0), "C-Chain ID should not be all zeros");
+            assert!(
+                id.iter().any(|&b| b != 0),
+                "C-Chain ID should not be all zeros"
+            );
         }
 
         /// Fuji C-Chain CB58 ID (yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp).
@@ -446,12 +454,14 @@ mod tests {
         fn test_mainnet_and_fuji_cchain_ids_differ() {
             let mainnet_id: [u8; 32] = {
                 let d = bs58::decode("2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5")
-                    .into_vec().unwrap();
+                    .into_vec()
+                    .unwrap();
                 d[..32].try_into().unwrap()
             };
             let fuji_id: [u8; 32] = {
                 let d = bs58::decode("yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp")
-                    .into_vec().unwrap();
+                    .into_vec()
+                    .unwrap();
                 d[..32].try_into().unwrap()
             };
             assert_ne!(mainnet_id, fuji_id);
@@ -484,12 +494,14 @@ mod tests {
             let root = exec.compute_state_root_mpt();
             // Should produce the empty-trie EMPTY_ROOT_HASH modified by the account
             let empty_trie = [
-                0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
-                0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
-                0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
-                0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+                0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0,
+                0xf8, 0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5,
+                0xe3, 0x63, 0xb4, 0x21,
             ];
-            assert_ne!(root, empty_trie, "state root with accounts should differ from empty trie");
+            assert_ne!(
+                root, empty_trie,
+                "state root with accounts should differ from empty trie"
+            );
         }
 
         /// Simulate the network_id selection logic used in main() for cchain_id.

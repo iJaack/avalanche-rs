@@ -34,13 +34,14 @@ impl BloomFilter {
 
     /// Insert an element into the bloom filter.
     pub fn insert(&mut self, data: &[u8]) {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash = Sha256::digest(data);
 
         for i in 0..self.num_hashes as usize {
             let h1 = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
             let h2 = u32::from_be_bytes([hash[4], hash[5], hash[6], hash[7]]);
-            let bit_index = ((h1 as u64).wrapping_add((i as u64).wrapping_mul(h2 as u64))) % (self.num_bits as u64);
+            let bit_index = ((h1 as u64).wrapping_add((i as u64).wrapping_mul(h2 as u64)))
+                % (self.num_bits as u64);
             let byte_idx = bit_index as usize / 8;
             let bit_idx = bit_index as usize % 8;
             if byte_idx < self.bits.len() {
@@ -51,13 +52,14 @@ impl BloomFilter {
 
     /// Check if an element might be in the filter.
     pub fn may_contain(&self, data: &[u8]) -> bool {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash = Sha256::digest(data);
 
         for i in 0..self.num_hashes as usize {
             let h1 = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
             let h2 = u32::from_be_bytes([hash[4], hash[5], hash[6], hash[7]]);
-            let bit_index = ((h1 as u64).wrapping_add((i as u64).wrapping_mul(h2 as u64))) % (self.num_bits as u64);
+            let bit_index = ((h1 as u64).wrapping_add((i as u64).wrapping_mul(h2 as u64)))
+                % (self.num_bits as u64);
             let byte_idx = bit_index as usize / 8;
             let bit_idx = bit_index as usize % 8;
             if byte_idx >= self.bits.len() || (self.bits[byte_idx] & (1 << bit_idx)) == 0 {

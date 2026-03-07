@@ -8,10 +8,10 @@
 //! - Multi-chain connection tracking
 //! - Dynamic subnet/chain add/remove
 
-use std::collections::HashMap;
 use crate::network::{ChainId, NodeId};
 use crate::sync::SyncPhase;
 use crate::validator::ValidatorSet;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Subnet Identifiers
@@ -152,11 +152,13 @@ impl SubnetTracker {
 
     /// Add a subnet to track.
     pub fn add_subnet(&mut self, subnet_id: SubnetId) {
-        self.subnets.entry(subnet_id.clone()).or_insert_with(|| SubnetState {
-            id: subnet_id,
-            validators: ValidatorSet::new(),
-            chains: HashMap::new(),
-        });
+        self.subnets
+            .entry(subnet_id.clone())
+            .or_insert_with(|| SubnetState {
+                id: subnet_id,
+                validators: ValidatorSet::new(),
+                chains: HashMap::new(),
+            });
     }
 
     /// Add a chain to a subnet.
@@ -286,7 +288,9 @@ mod tests {
     fn make_chain(name: &str, subnet: &SubnetId) -> ChainConfig {
         let mut chain_id = [0u8; 32];
         for (i, b) in name.bytes().enumerate() {
-            if i < 32 { chain_id[i] = b; }
+            if i < 32 {
+                chain_id[i] = b;
+            }
         }
         ChainConfig {
             chain_id: ChainId(chain_id),

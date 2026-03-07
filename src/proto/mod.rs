@@ -15,9 +15,9 @@ pub mod pb {
 
 // Re-export key generated types for convenience.
 pub use pb::{
-    message::Message as ProtoOneOf, BloomFilter as ProtoBloomFilter, Client as ProtoClient,
-    ClaimedIpPort as ProtoClaimedIpPort, Handshake as ProtoHandshake, Message as ProtoMessage,
-    Ping as ProtoPing, Pong as ProtoPong,
+    message::Message as ProtoOneOf, BloomFilter as ProtoBloomFilter,
+    ClaimedIpPort as ProtoClaimedIpPort, Client as ProtoClient, Handshake as ProtoHandshake,
+    Message as ProtoMessage, Ping as ProtoPing, Pong as ProtoPong,
 };
 
 use crate::network::{BlockId, ChainId, NetworkError, NetworkMessage, NodeId, PeerInfo};
@@ -295,7 +295,10 @@ impl NetworkMessage {
             } => ProtoOneOf::Ancestors(pb::Ancestors {
                 chain_id: Bytes::copy_from_slice(&chain_id.0),
                 request_id: *request_id,
-                containers: containers.iter().map(|c| Bytes::copy_from_slice(c)).collect(),
+                containers: containers
+                    .iter()
+                    .map(|c| Bytes::copy_from_slice(c))
+                    .collect(),
             }),
 
             NetworkMessage::Get {
@@ -461,17 +464,13 @@ impl NetworkMessage {
                 Ok(NetworkMessage::PeerList { peers })
             }
 
-            ProtoOneOf::GetPeerList(_) => Ok(NetworkMessage::PeerListAck {
-                peer_ids: vec![],
-            }),
+            ProtoOneOf::GetPeerList(_) => Ok(NetworkMessage::PeerListAck { peer_ids: vec![] }),
 
-            ProtoOneOf::GetStateSummaryFrontier(g) => {
-                Ok(NetworkMessage::GetStateSummaryFrontier {
-                    chain_id: bytes_to_chain_id(&g.chain_id),
-                    request_id: g.request_id,
-                    deadline: g.deadline,
-                })
-            }
+            ProtoOneOf::GetStateSummaryFrontier(g) => Ok(NetworkMessage::GetStateSummaryFrontier {
+                chain_id: bytes_to_chain_id(&g.chain_id),
+                request_id: g.request_id,
+                deadline: g.deadline,
+            }),
             ProtoOneOf::StateSummaryFrontier(s) => Ok(NetworkMessage::StateSummaryFrontier {
                 chain_id: bytes_to_chain_id(&s.chain_id),
                 request_id: s.request_id,
@@ -510,12 +509,20 @@ impl NetworkMessage {
                 chain_id: bytes_to_chain_id(&g.chain_id),
                 request_id: g.request_id,
                 deadline: g.deadline,
-                container_ids: g.container_ids.iter().map(|b| bytes_to_block_id(b)).collect(),
+                container_ids: g
+                    .container_ids
+                    .iter()
+                    .map(|b| bytes_to_block_id(b))
+                    .collect(),
             }),
             ProtoOneOf::Accepted(a) => Ok(NetworkMessage::Accepted {
                 chain_id: bytes_to_chain_id(&a.chain_id),
                 request_id: a.request_id,
-                container_ids: a.container_ids.iter().map(|b| bytes_to_block_id(b)).collect(),
+                container_ids: a
+                    .container_ids
+                    .iter()
+                    .map(|b| bytes_to_block_id(b))
+                    .collect(),
             }),
 
             ProtoOneOf::GetAncestors(g) => Ok(NetworkMessage::GetAncestors {
@@ -581,12 +588,14 @@ impl NetworkMessage {
                 "AppError: code={}, msg={}",
                 e.error_code, e.error_message
             ))),
-            ProtoOneOf::CompressedZstd(_) => {
-                Err(NetworkError::Serialization("unexpected nested compression".into()))
-            }
+            ProtoOneOf::CompressedZstd(_) => Err(NetworkError::Serialization(
+                "unexpected nested compression".into(),
+            )),
             ProtoOneOf::Simplex(_) => {
                 // Simplex consensus messages — not yet implemented
-                Err(NetworkError::InvalidMessage("simplex not yet supported".into()))
+                Err(NetworkError::InvalidMessage(
+                    "simplex not yet supported".into(),
+                ))
             }
         }
     }
@@ -791,7 +800,9 @@ mod tests {
         let encoded = msg.encode_proto().unwrap();
         let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
         match decoded {
-            NetworkMessage::PeerList { peers: decoded_peers } => {
+            NetworkMessage::PeerList {
+                peers: decoded_peers,
+            } => {
                 assert_eq!(decoded_peers.len(), 1);
                 assert_eq!(decoded_peers[0].ip_port, 9651);
                 assert_eq!(decoded_peers[0].cert_bytes.len(), 100);
@@ -936,7 +947,9 @@ mod tests {
         ];
 
         for msg in &messages {
-            let encoded = msg.encode_proto().expect(&format!("encode {:?}", msg.name()));
+            let encoded = msg
+                .encode_proto()
+                .expect(&format!("encode {:?}", msg.name()));
             let decoded =
                 NetworkMessage::decode_proto(&encoded).expect(&format!("decode {:?}", msg.name()));
             assert_eq!(msg.name(), decoded.name());
@@ -953,7 +966,11 @@ mod tests {
         let encoded = msg.encode_proto().unwrap();
         let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
         match decoded {
-            NetworkMessage::GetAcceptedFrontier { chain_id, request_id, .. } => {
+            NetworkMessage::GetAcceptedFrontier {
+                chain_id,
+                request_id,
+                ..
+            } => {
                 assert_eq!(chain_id.0, [0u8; 32]);
                 assert_eq!(request_id, 1);
             }
@@ -974,7 +991,11 @@ mod tests {
         let encoded = msg.encode_proto().unwrap();
         let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
         match decoded {
-            NetworkMessage::GetAncestors { request_id, container_id: cid, .. } => {
+            NetworkMessage::GetAncestors {
+                request_id,
+                container_id: cid,
+                ..
+            } => {
                 assert_eq!(request_id, 5);
                 assert_eq!(cid.0, [0xAA; 32]);
             }
