@@ -1,0 +1,14 @@
+[package]
+name = "avalanche-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core types and codec for Avalanche, compatible with no_std"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+sha2 = { version = "0.10", default-features = false }

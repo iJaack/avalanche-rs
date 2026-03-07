@@ -1766,6 +1766,222 @@ impl fmt::Display for ConsensusError {
 impl std::error::Error for ConsensusError {}
 
 // =============================================================================
+// PERSISTENT PEER MANAGEMENT
+// =============================================================================
+
+/// A persistent peer record stored in RocksDB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistentPeerRecord {
+    /// 20-byte NodeID
+    pub node_id: [u8; 20],
+    /// IP address bytes (4 for IPv4, 16 for IPv6)
+    pub ip_bytes: Vec<u8>,
+    /// Port number
+    pub port: u16,
+    /// Average latency in milliseconds
+    pub latency_ms: u64,
+    /// Reliability score: 0-1000 (higher = more reliable)
+    pub reliability_score: u32,
+    /// Number of successful connections
+    pub success_count: u64,
+    /// Number of failed connections
+    pub failure_count: u64,
+    /// Last time we successfully connected (Unix millis)
+    pub last_connected_ms: u64,
+    /// Last time we saw this peer in gossip (Unix millis)
+    pub last_seen_ms: u64,
+}
+
+impl PersistentPeerRecord {
+    pub fn new(node_id: [u8; 20], ip_bytes: Vec<u8>, port: u16) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            node_id,
+            ip_bytes,
+            port,
+            latency_ms: 0,
+            reliability_score: 500, // neutral starting score
+            success_count: 0,
+            failure_count: 0,
+            last_connected_ms: 0,
+            last_seen_ms: now_ms,
+        }
+    }
+
+    /// Record a successful connection.
+    pub fn record_success(&mut self, latency_ms: u64) {
+        self.success_count += 1;
+        self.latency_ms = if self.latency_ms == 0 {
+            latency_ms
+        } else {
+            // Exponential moving average
+            (self.latency_ms * 7 + latency_ms * 3) / 10
+        };
+        self.reliability_score = (self.reliability_score + 50).min(1000);
+        self.last_connected_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+    }
+
+    /// Record a failed connection attempt.
+    pub fn record_failure(&mut self) {
+        self.failure_count += 1;
+        self.reliability_score = self.reliability_score.saturating_sub(100);
+    }
+
+    /// Whether this peer should be evicted (too many failures, score too low).
+    pub fn should_evict(&self, max_failures: u64) -> bool {
+        self.failure_count >= max_failures || self.reliability_score == 0
+    }
+
+    /// Serialize to JSON bytes for storage.
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Deserialize from JSON bytes.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        serde_json::from_slice(data).ok()
+    }
+
+    /// Convert to SocketAddr.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        parse_peer_addr(&self.ip_bytes, self.port)
+    }
+}
+
+/// Manages persistent peer storage backed by RocksDB.
+pub struct PersistentPeerStore {
+    /// In-memory cache of peer records
+    peers: HashMap<[u8; 20], PersistentPeerRecord>,
+    /// Maximum consecutive failures before eviction
+    max_failures: u64,
+}
+
+impl PersistentPeerStore {
+    /// Create a new persistent peer store.
+    pub fn new(max_failures: u64) -> Self {
+        Self {
+            peers: HashMap::new(),
+            max_failures,
+        }
+    }
+
+    /// Load peers from RocksDB on startup.
+    pub fn load_from_db(&mut self, db: &crate::db::Database) -> usize {
+        let raw_peers = db.load_all_peers();
+        let mut loaded = 0;
+        for (key, value) in raw_peers {
+            if let Some(record) = PersistentPeerRecord::decode(&value) {
+                let mut node_id = [0u8; 20];
+                if key.len() == 20 {
+                    node_id.copy_from_slice(&key);
+                    self.peers.insert(node_id, record);
+                    loaded += 1;
+                }
+            }
+        }
+        loaded
+    }
+
+    /// Save a peer record to the store and optionally to DB.
+    pub fn upsert(&mut self, record: PersistentPeerRecord, db: Option<&crate::db::Database>) {
+        if let Some(db) = db {
+            let _ = db.put_peer(&record.node_id, &record.encode());
+        }
+        self.peers.insert(record.node_id, record);
+    }
+
+    /// Record a successful connection for a peer.
+    pub fn record_success(
+        &mut self,
+        node_id: &[u8; 20],
+        latency_ms: u64,
+        db: Option<&crate::db::Database>,
+    ) {
+        if let Some(record) = self.peers.get_mut(node_id) {
+            record.record_success(latency_ms);
+            if let Some(db) = db {
+                let _ = db.put_peer(node_id, &record.encode());
+            }
+        }
+    }
+
+    /// Record a connection failure for a peer.
+    pub fn record_failure(
+        &mut self,
+        node_id: &[u8; 20],
+        db: Option<&crate::db::Database>,
+    ) {
+        if let Some(record) = self.peers.get_mut(node_id) {
+            record.record_failure();
+            if record.should_evict(self.max_failures) {
+                if let Some(db) = db {
+                    let _ = db.delete_peer(node_id);
+                }
+                self.peers.remove(node_id);
+            } else if let Some(db) = db {
+                let _ = db.put_peer(node_id, &record.encode());
+            }
+        }
+    }
+
+    /// Get all stored peer records, sorted by reliability score (best first).
+    pub fn best_peers(&self, limit: usize) -> Vec<&PersistentPeerRecord> {
+        let mut peers: Vec<_> = self.peers.values().collect();
+        peers.sort_by(|a, b| b.reliability_score.cmp(&a.reliability_score));
+        peers.truncate(limit);
+        peers
+    }
+
+    /// Evict peers that have exceeded the failure threshold.
+    pub fn evict_bad_peers(&mut self, db: Option<&crate::db::Database>) -> usize {
+        let to_remove: Vec<[u8; 20]> = self
+            .peers
+            .iter()
+            .filter(|(_, r)| r.should_evict(self.max_failures))
+            .map(|(id, _)| *id)
+            .collect();
+        let count = to_remove.len();
+        for id in &to_remove {
+            if let Some(db) = db {
+                let _ = db.delete_peer(id);
+            }
+            self.peers.remove(id);
+        }
+        count
+    }
+
+    /// Get the total number of stored peers.
+    pub fn count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Get a peer record by NodeID.
+    pub fn get(&self, node_id: &[u8; 20]) -> Option<&PersistentPeerRecord> {
+        self.peers.get(node_id)
+    }
+
+    /// Generate PeerListAck gossip messages for peers we know about.
+    pub fn peer_list_ack_ids(&self) -> Vec<NodeId> {
+        self.peers
+            .keys()
+            .map(|id| NodeId(*id))
+            .collect()
+    }
+}
+
+impl Default for PersistentPeerStore {
+    fn default() -> Self {
+        Self::new(5) // evict after 5 consecutive failures
+    }
+}
+
+// =============================================================================
 // TEST HARNESS
 // =============================================================================
 
@@ -2916,6 +3132,164 @@ mod tests {
             }
             other => panic!("expected Ancestors, got {:?}", other.name()),
         }
+    }
+
+    // --- Persistent Peer Management tests ---
+
+    #[test]
+    fn test_persistent_peer_record_new() {
+        let record = PersistentPeerRecord::new([0xAA; 20], vec![192, 168, 1, 1], 9651);
+        assert_eq!(record.node_id, [0xAA; 20]);
+        assert_eq!(record.port, 9651);
+        assert_eq!(record.reliability_score, 500);
+        assert_eq!(record.success_count, 0);
+        assert_eq!(record.failure_count, 0);
+    }
+
+    #[test]
+    fn test_persistent_peer_record_success() {
+        let mut record = PersistentPeerRecord::new([0xBB; 20], vec![10, 0, 0, 1], 9651);
+        record.record_success(50);
+        assert_eq!(record.success_count, 1);
+        assert_eq!(record.latency_ms, 50);
+        assert_eq!(record.reliability_score, 550);
+        assert!(record.last_connected_ms > 0);
+    }
+
+    #[test]
+    fn test_persistent_peer_record_failure() {
+        let mut record = PersistentPeerRecord::new([0xCC; 20], vec![10, 0, 0, 2], 9651);
+        record.record_failure();
+        assert_eq!(record.failure_count, 1);
+        assert_eq!(record.reliability_score, 400);
+    }
+
+    #[test]
+    fn test_persistent_peer_record_eviction() {
+        let mut record = PersistentPeerRecord::new([0xDD; 20], vec![10, 0, 0, 3], 9651);
+        for _ in 0..5 {
+            record.record_failure();
+        }
+        assert!(record.should_evict(5));
+    }
+
+    #[test]
+    fn test_persistent_peer_record_encode_decode() {
+        let record = PersistentPeerRecord::new([0xEE; 20], vec![172, 16, 0, 1], 9651);
+        let encoded = record.encode();
+        let decoded = PersistentPeerRecord::decode(&encoded).unwrap();
+        assert_eq!(decoded.node_id, record.node_id);
+        assert_eq!(decoded.port, record.port);
+        assert_eq!(decoded.reliability_score, record.reliability_score);
+    }
+
+    #[test]
+    fn test_persistent_peer_record_socket_addr() {
+        let record = PersistentPeerRecord::new([0xFF; 20], vec![192, 168, 1, 100], 9651);
+        let addr = record.socket_addr().unwrap();
+        assert_eq!(addr.port(), 9651);
+    }
+
+    #[test]
+    fn test_persistent_peer_store_basic() {
+        let mut store = PersistentPeerStore::new(3);
+        let record = PersistentPeerRecord::new([0x11; 20], vec![10, 0, 0, 1], 9651);
+        store.upsert(record, None);
+        assert_eq!(store.count(), 1);
+        assert!(store.get(&[0x11; 20]).is_some());
+    }
+
+    #[test]
+    fn test_persistent_peer_store_best_peers() {
+        let mut store = PersistentPeerStore::new(5);
+
+        let mut good = PersistentPeerRecord::new([0x01; 20], vec![10, 0, 0, 1], 9651);
+        good.reliability_score = 900;
+
+        let mut bad = PersistentPeerRecord::new([0x02; 20], vec![10, 0, 0, 2], 9651);
+        bad.reliability_score = 100;
+
+        let mut ok = PersistentPeerRecord::new([0x03; 20], vec![10, 0, 0, 3], 9651);
+        ok.reliability_score = 500;
+
+        store.upsert(bad, None);
+        store.upsert(good, None);
+        store.upsert(ok, None);
+
+        let best = store.best_peers(2);
+        assert_eq!(best.len(), 2);
+        assert_eq!(best[0].reliability_score, 900);
+        assert_eq!(best[1].reliability_score, 500);
+    }
+
+    #[test]
+    fn test_persistent_peer_store_evict_bad() {
+        let mut store = PersistentPeerStore::new(3);
+
+        let mut bad = PersistentPeerRecord::new([0x01; 20], vec![10, 0, 0, 1], 9651);
+        for _ in 0..3 {
+            bad.record_failure();
+        }
+
+        let good = PersistentPeerRecord::new([0x02; 20], vec![10, 0, 0, 2], 9651);
+
+        store.upsert(bad, None);
+        store.upsert(good, None);
+        assert_eq!(store.count(), 2);
+
+        let evicted = store.evict_bad_peers(None);
+        assert_eq!(evicted, 1);
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn test_persistent_peer_store_record_and_evict() {
+        let mut store = PersistentPeerStore::new(3);
+        let record = PersistentPeerRecord::new([0xAA; 20], vec![10, 0, 0, 1], 9651);
+        store.upsert(record, None);
+
+        // 3 failures should evict
+        store.record_failure(&[0xAA; 20], None);
+        store.record_failure(&[0xAA; 20], None);
+        store.record_failure(&[0xAA; 20], None);
+
+        assert_eq!(store.count(), 0); // evicted
+    }
+
+    #[test]
+    fn test_persistent_peer_store_db_roundtrip() {
+        let (db, _dir) = crate::db::Database::open_temp().unwrap();
+        let mut store = PersistentPeerStore::new(5);
+
+        let record = PersistentPeerRecord::new([0x42; 20], vec![10, 0, 0, 42], 9651);
+        store.upsert(record, Some(&db));
+
+        // Load into a new store
+        let mut store2 = PersistentPeerStore::new(5);
+        let loaded = store2.load_from_db(&db);
+        assert_eq!(loaded, 1);
+        assert_eq!(store2.get(&[0x42; 20]).unwrap().port, 9651);
+    }
+
+    #[test]
+    fn test_persistent_peer_store_peer_list_ack() {
+        let mut store = PersistentPeerStore::new(5);
+        store.upsert(PersistentPeerRecord::new([0x01; 20], vec![10, 0, 0, 1], 9651), None);
+        store.upsert(PersistentPeerRecord::new([0x02; 20], vec![10, 0, 0, 2], 9651), None);
+
+        let ack_ids = store.peer_list_ack_ids();
+        assert_eq!(ack_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_persistent_peer_latency_averaging() {
+        let mut record = PersistentPeerRecord::new([0x01; 20], vec![10, 0, 0, 1], 9651);
+        record.record_success(100);
+        assert_eq!(record.latency_ms, 100);
+
+        record.record_success(200);
+        // EMA: (100 * 7 + 200 * 3) / 10 = 130
+        assert_eq!(record.latency_ms, 130);
     }
 }
 

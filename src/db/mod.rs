@@ -27,6 +27,7 @@ pub const CF_TX_INDEX: &str = "tx_index";
 pub const CF_METADATA: &str = "metadata";
 pub const CF_TRIE_NODES: &str = "trie_nodes";
 pub const CF_STATE_ROOTS: &str = "state_roots";
+pub const CF_PEERS: &str = "peers";
 
 const ALL_CFS: &[&str] = &[
     CF_BLOCKS,
@@ -37,6 +38,7 @@ const ALL_CFS: &[&str] = &[
     CF_METADATA,
     CF_TRIE_NODES,
     CF_STATE_ROOTS,
+    CF_PEERS,
 ];
 
 /// Well-known metadata keys.
@@ -263,6 +265,30 @@ impl Database {
     /// Get a trie node by hash.
     pub fn get_trie_node(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, DbError> {
         self.get_cf(CF_TRIE_NODES, hash)
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer storage
+    // -----------------------------------------------------------------------
+
+    /// Store a persistent peer record by NodeID (20-byte key).
+    pub fn put_peer(&self, node_id: &[u8; 20], peer_data: &[u8]) -> Result<(), DbError> {
+        self.put_cf(CF_PEERS, node_id, peer_data)
+    }
+
+    /// Get a peer record by NodeID.
+    pub fn get_peer(&self, node_id: &[u8; 20]) -> Result<Option<Vec<u8>>, DbError> {
+        self.get_cf(CF_PEERS, node_id)
+    }
+
+    /// Delete a peer record.
+    pub fn delete_peer(&self, node_id: &[u8; 20]) -> Result<(), DbError> {
+        self.delete_cf(CF_PEERS, node_id)
+    }
+
+    /// Load all stored peers.
+    pub fn load_all_peers(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.iter_cf_owned(CF_PEERS)
     }
 
     /// Get the underlying RocksDB handle (for advanced use).
