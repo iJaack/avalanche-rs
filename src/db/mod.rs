@@ -25,6 +25,10 @@ pub const CF_METADATA: &str = "metadata";
 pub const CF_TRIE_NODES: &str = "trie_nodes";
 pub const CF_STATE_ROOTS: &str = "state_roots";
 pub const CF_PEERS: &str = "peers";
+/// Column family for archive historical account snapshots.
+pub const CF_ARCHIVE_STATE: &str = "archive_state";
+/// Column family for blob sidecar data (EIP-4844).
+pub const CF_BLOBS: &str = "blobs";
 
 const ALL_CFS: &[&str] = &[
     CF_BLOCKS,
@@ -36,6 +40,8 @@ const ALL_CFS: &[&str] = &[
     CF_TRIE_NODES,
     CF_STATE_ROOTS,
     CF_PEERS,
+    CF_ARCHIVE_STATE,
+    CF_BLOBS,
 ];
 
 /// Well-known metadata keys.
@@ -487,6 +493,11 @@ fn rlp_encode_list(items: &[Vec<u8>]) -> Vec<u8> {
 
 /// Decode a minimal RLP-encoded account back into `AccountState` fields.
 /// This is the inverse of `AccountState::rlp_encode()`.
+/// Public alias for use by the archive module.
+pub fn decode_account_state_rlp(rlp: &[u8]) -> AccountState {
+    decode_account_rlp(rlp)
+}
+
 fn decode_account_rlp(rlp: &[u8]) -> AccountState {
     // Minimal decoder: parse list header, then 4 fields (nonce, balance, storage_root, code_hash)
     if rlp.is_empty() {

@@ -7,6 +7,7 @@
 // We need unsafe for RocksDB FFI bindings and revm's EVM internals
 // #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod codec;
 pub mod consensus;
 pub mod mempool;
@@ -16,20 +17,26 @@ pub mod network;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 pub mod tx;
+pub mod txpool;
 pub mod types;
 
 // Production node modules
+pub mod blob;
 pub mod block;
+pub mod cache;
 pub mod db;
+pub mod debug;
 pub mod evm;
 pub mod identity;
 pub mod light;
 pub mod metrics;
 pub mod proto;
+pub mod snap;
 pub mod subnet;
 pub mod sync;
 pub mod validator;
 pub mod warp;
+pub mod websocket;
 
 // Re-export common types for convenience
 pub use types::{

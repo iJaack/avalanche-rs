@@ -79,6 +79,10 @@ alloy-rlp = "0.3"
 # Metrics (Phase 6)
 prometheus = "0.13"
 
+# Performance (Phase 10)
+parking_lot = "0.12"
+lru = "0.12"
+
 # Lazy statics
 once_cell = "1.19"
 
