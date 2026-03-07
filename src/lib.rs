@@ -27,6 +27,7 @@ pub mod cache;
 pub mod db;
 pub mod debug;
 pub mod evm;
+pub mod fortuna;
 pub mod identity;
 pub mod light;
 pub mod metrics;

@@ -30,6 +30,7 @@ hex = "0.4"
 faster-hex = "0.10"
 bs58 = "0.5"
 k256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
 ahash = "0.8"
 mimalloc = { version = "0.1", default-features = false }

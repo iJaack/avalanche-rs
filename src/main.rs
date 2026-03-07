@@ -1045,11 +1045,7 @@ async fn connect_and_handshake(
     // Build protobuf Handshake directly (need BLS sig field)
     use avalanche_rs::proto::pb;
 
-    let upgrade_time = match node.config.network_id {
-        1 => 1765296000u64,
-        5 => 1761750000u64,
-        _ => 0,
-    };
+    let upgrade_time = avalanche_rs::fortuna::latest_upgrade_time(node.config.network_id);
 
     // Build valid bloom filter: [numHashes(1byte)] [seed(8bytes)] [entries(1+bytes)]
     // Format: numHashes=1, seed=random 8 bytes, entries=all zeros (we know no peers)

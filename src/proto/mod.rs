@@ -138,11 +138,8 @@ impl NetworkMessage {
                 // Latest activated upgrade time — must match what the network expects.
                 // AvalancheGo uses this to check compatibility.
                 // Granite is the latest activated upgrade on both networks.
-                let upgrade_time = match *network_id {
-                    1 => 1765296000u64, // mainnet Granite: 2025-12-09T16:00:00Z
-                    5 => 1761750000u64, // fuji Granite: 2025-10-29T15:00:00Z
-                    _ => 0,
-                };
+                // Fortuna (ACP-181/204/226) activated 2025-03-13 but Granite is later.
+                let upgrade_time = crate::fortuna::latest_upgrade_time(*network_id);
 
                 // Build a minimal bloom filter (empty filter with random salt)
                 // AvalancheGo expects this field to be present
