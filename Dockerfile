@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:1.75-slim AS builder
+FROM rust:1.84-slim AS builder
 
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
