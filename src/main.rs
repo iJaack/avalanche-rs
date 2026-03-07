@@ -3759,15 +3759,27 @@ mod integration_tests {
     #[test]
     fn test_rpc_info_network_name() {
         assert_eq!(
-            match 1u32 { 1 => "mainnet", 5 => "fuji", _ => "custom" },
+            match 1u32 {
+                1 => "mainnet",
+                5 => "fuji",
+                _ => "custom",
+            },
             "mainnet"
         );
         assert_eq!(
-            match 5u32 { 1 => "mainnet", 5 => "fuji", _ => "custom" },
+            match 5u32 {
+                1 => "mainnet",
+                5 => "fuji",
+                _ => "custom",
+            },
             "fuji"
         );
         assert_eq!(
-            match 999u32 { 1 => "mainnet", 5 => "fuji", _ => "custom" },
+            match 999u32 {
+                1 => "mainnet",
+                5 => "fuji",
+                _ => "custom",
+            },
             "custom"
         );
     }

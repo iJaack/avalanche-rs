@@ -292,10 +292,7 @@ pub enum IntegrityStatus {
 }
 
 /// Verify basic DB integrity by scanning column families.
-pub fn verify_db_integrity(
-    total_keys: u64,
-    valid_keys: u64,
-) -> IntegrityReport {
+pub fn verify_db_integrity(total_keys: u64, valid_keys: u64) -> IntegrityReport {
     let corrupted = total_keys.saturating_sub(valid_keys);
     let status = if corrupted == 0 {
         IntegrityStatus::Ok

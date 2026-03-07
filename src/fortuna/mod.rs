@@ -2,8 +2,6 @@
 //!
 //! Activated on both mainnet and fuji on 2025-03-13T15:00:00Z.
 
-
-
 // Fortuna activation: 2025-03-13T15:00:00Z = 1741878000
 pub const FORTUNA_MAINNET_TIMESTAMP: u64 = 1741878000;
 pub const FORTUNA_FUJI_TIMESTAMP: u64 = 1741878000;
@@ -52,7 +50,11 @@ pub struct EpochInfo {
 
 /// Calculate the epoch for a block given its timestamp.
 /// Returns None if Fortuna is not yet active.
-pub fn calculate_epoch(network_id: u32, block_timestamp: u64, p_chain_height: u64) -> Option<EpochInfo> {
+pub fn calculate_epoch(
+    network_id: u32,
+    block_timestamp: u64,
+    p_chain_height: u64,
+) -> Option<EpochInfo> {
     if !is_fortuna_active(network_id, block_timestamp) {
         return None;
     }
@@ -94,8 +96,8 @@ pub fn verify_secp256r1(
         ));
     }
 
-    let signature = Signature::from_slice(signature_bytes)
-        .map_err(|e| format!("invalid signature: {}", e))?;
+    let signature =
+        Signature::from_slice(signature_bytes).map_err(|e| format!("invalid signature: {}", e))?;
 
     let verifying_key = VerifyingKey::from_sec1_bytes(public_key_bytes)
         .map_err(|e| format!("invalid public key: {}", e))?;

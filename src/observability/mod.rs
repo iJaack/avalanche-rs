@@ -208,7 +208,11 @@ mod tests {
         let s = id.as_str();
         // Format: {timestamp_millis}-{16-char hex}
         let parts: Vec<&str> = s.splitn(2, '-').collect();
-        assert_eq!(parts.len(), 2, "request ID must have timestamp-random format");
+        assert_eq!(
+            parts.len(),
+            2,
+            "request ID must have timestamp-random format"
+        );
         // Timestamp part is numeric
         assert!(
             parts[0].parse::<u128>().is_ok(),
@@ -297,8 +301,8 @@ mod tests {
     fn test_alerts_yml_syntax() {
         let alerts_yaml = include_str!("../../docs/alerts.yml");
         // Parse the YAML to verify it is syntactically valid
-        let parsed: serde_json::Value = serde_yaml_to_json(alerts_yaml)
-            .expect("alerts.yml must be valid YAML");
+        let parsed: serde_json::Value =
+            serde_yaml_to_json(alerts_yaml).expect("alerts.yml must be valid YAML");
 
         // Verify expected structure
         let groups = parsed["groups"].as_array().expect("must have groups array");
@@ -310,7 +314,12 @@ mod tests {
         assert!(rules.len() >= 4, "must have at least 4 alert rules");
 
         // Check each rule has required fields
-        let expected_alerts = ["NodeBehind", "LowPeerCount", "HighDiskUsage", "HighMemoryUsage"];
+        let expected_alerts = [
+            "NodeBehind",
+            "LowPeerCount",
+            "HighDiskUsage",
+            "HighMemoryUsage",
+        ];
         for (rule, expected_name) in rules.iter().zip(expected_alerts.iter()) {
             assert_eq!(
                 rule["alert"].as_str().unwrap(),
@@ -318,7 +327,10 @@ mod tests {
                 "alert name mismatch"
             );
             assert!(rule["expr"].is_string(), "rule must have an expr");
-            assert!(rule["labels"]["severity"].is_string(), "rule must have severity");
+            assert!(
+                rule["labels"]["severity"].is_string(),
+                "rule must have severity"
+            );
             assert!(
                 rule["annotations"]["summary"].is_string(),
                 "rule must have summary annotation"
@@ -368,10 +380,7 @@ mod tests {
 
             // Detect top-level keys
             if line.starts_with("  - name:") {
-                group_name = trimmed
-                    .trim_start_matches("- name:")
-                    .trim()
-                    .to_string();
+                group_name = trimmed.trim_start_matches("- name:").trim().to_string();
             }
 
             if trimmed.starts_with("- alert:") {
@@ -405,10 +414,7 @@ mod tests {
                 in_labels = false;
                 in_annotations = false;
 
-                let name = trimmed
-                    .trim_start_matches("- alert:")
-                    .trim()
-                    .to_string();
+                let name = trimmed.trim_start_matches("- alert:").trim().to_string();
                 current_rule.insert("alert".to_string(), serde_json::Value::String(name));
                 continue;
             }
@@ -483,7 +489,11 @@ mod tests {
             if in_annotations && trimmed.contains(':') {
                 let mut parts = trimmed.splitn(2, ':');
                 if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    let val = v.trim().trim_start_matches('>').trim_start_matches('-').trim();
+                    let val = v
+                        .trim()
+                        .trim_start_matches('>')
+                        .trim_start_matches('-')
+                        .trim();
                     current_annotations.insert(
                         k.trim().to_string(),
                         serde_json::Value::String(val.to_string()),
@@ -517,14 +527,8 @@ mod tests {
         }
 
         let mut group = serde_json::Map::new();
-        group.insert(
-            "name".to_string(),
-            serde_json::Value::String(group_name),
-        );
-        group.insert(
-            "rules".to_string(),
-            serde_json::Value::Array(current_rules),
-        );
+        group.insert("name".to_string(), serde_json::Value::String(group_name));
+        group.insert("rules".to_string(), serde_json::Value::Array(current_rules));
         groups.push(serde_json::Value::Object(group));
 
         let mut root = serde_json::Map::new();
