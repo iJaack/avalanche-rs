@@ -82,6 +82,15 @@ struct Cli {
     /// Requires a funded account in the EVM state and connected peers.
     #[arg(long, default_value = "false", env = "AVAX_VALIDATOR")]
     validator: bool,
+
+    /// State pruning depth: keep only the last N blocks of trie nodes.
+    /// Set to 0 to disable pruning. Genesis and finalized blocks are always protected.
+    #[arg(long, default_value = "256", env = "AVAX_STATE_PRUNING_DEPTH")]
+    state_pruning_depth: u64,
+
+    /// Enable light client mode: download headers only, verify via proofs.
+    #[arg(long, default_value = "false", env = "AVAX_LIGHT_CLIENT")]
+    light_client: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +564,31 @@ async fn main() {
             }
         }
     });
+
+    // 10a. Start state pruning background task (every 60s)
+    if node.config.state_pruning_depth > 0 {
+        let prune_node = node.clone();
+        let prune_depth = node.config.state_pruning_depth;
+        tokio::spawn(async move {
+            let mut pruner = avalanche_rs::db::StatePruner::new(prune_depth);
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip first tick
+            loop {
+                interval.tick().await;
+                let current = prune_node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+                // Use current height as finalized (conservative — protects tip)
+                let (pruned, bytes) = pruner.prune_once(&prune_node.db, current, current);
+                if pruned > 0 {
+                    let (total_pruned, total_bytes) = pruner.metrics();
+                    info!(
+                        "State pruning: {} entries removed ({} bytes), total: {} entries ({} bytes)",
+                        pruned, bytes, total_pruned, total_bytes
+                    );
+                }
+            }
+        });
+        info!("State pruning enabled: depth={}", prune_depth);
+    }
 
     info!(
         "Node started: p2p=:{}, http=:{}, node_id={}",
