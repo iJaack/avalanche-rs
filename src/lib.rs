@@ -29,6 +29,7 @@ pub mod validator;
 pub mod metrics;
 pub mod warp;
 pub mod subnet;
+pub mod light;
 
 // Re-export common types for convenience
 pub use types::{AvalancheError, Result, ID, NodeID, BlockID, TransactionID, ChainID, Block, Transaction, UTXO};

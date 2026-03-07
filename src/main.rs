@@ -353,6 +353,8 @@ struct NodeState {
     mev_engine: Arc<MevEngine>,
     /// Pending transactions for block building (validator mode only)
     pending_txs: Arc<RwLock<Vec<EvmTransaction>>>,
+    /// Light client for headers-only mode
+    light_client: Arc<RwLock<avalanche_rs::light::LightClient>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +506,13 @@ async fn main() {
         c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
         pending_txs: Arc::new(RwLock::new(Vec::new())),
+        light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
     });
+
+    // Log light client mode
+    if node.config.light_client {
+        info!("Light client mode enabled — headers only, state via on-demand proofs");
+    }
 
     // 6. Start P2P listener
     let staking_addr: SocketAddr = format!("0.0.0.0:{}", node.config.staking_port)
@@ -2607,6 +2615,14 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_address(addr_str) {
                 Some(addr) => {
+                    // In light client mode, serve from proof cache first
+                    if node.config.light_client {
+                        let lc = node.light_client.read().await;
+                        if let Some(balance) = lc.get_cached_balance(&addr) {
+                            return rpc_ok(&format!("\"0x{:x}\"", balance), id);
+                        }
+                        // No cached proof — fall through to EVM state
+                    }
                     let evm = node.evm.read().await;
                     let balance = evm.get_balance(addr);
                     rpc_ok(&format!("\"0x{:x}\"", balance), id)
