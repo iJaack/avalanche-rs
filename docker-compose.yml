@@ -1,0 +1,48 @@
+services:
+  avalanche-fuji:
+    build: .
+    profiles: ["fuji"]
+    container_name: avalanche-rs-fuji
+    ports:
+      - "9650:9650"
+      - "9651:9651"
+    volumes:
+      - fuji-data:/data/avalanche-rs
+    command:
+      - "--network-id=5"
+      - "--data-dir=/data/avalanche-rs"
+      - "--http-port=9650"
+      - "--staking-port=9651"
+      - "--log-level=info"
+      - "--log-format=json"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  avalanche-mainnet:
+    build: .
+    profiles: ["mainnet"]
+    container_name: avalanche-rs-mainnet
+    ports:
+      - "9650:9650"
+      - "9651:9651"
+    volumes:
+      - mainnet-data:/data/avalanche-rs
+    command:
+      - "--network-id=1"
+      - "--data-dir=/data/avalanche-rs"
+      - "--http-port=9650"
+      - "--staking-port=9651"
+      - "--log-level=info"
+      - "--log-format=json"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+volumes:
+  fuji-data:
+  mainnet-data:

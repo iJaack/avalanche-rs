@@ -72,6 +72,26 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t avalanche-rs:ci .
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo bench (compile only)
+        run: cargo bench --no-run
+
   no_std:
     name: no_std core crate
     runs-on: ubuntu-latest
