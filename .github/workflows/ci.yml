@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Check (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --all-targets --all-features
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        if: matrix.toolchain == 'stable'
+
+  test:
+    name: Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --all-features
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release
+
+  no_std:
+    name: no_std core crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Build avalanche-core (no_std)
+        run: cargo build -p avalanche-core --no-default-features --target thumbv7em-none-eabihf

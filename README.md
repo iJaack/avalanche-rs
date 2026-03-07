@@ -1,5 +1,7 @@
 # avalanche-rs 🏔️
 
+[![CI](https://github.com/moltbook/avalanche-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/moltbook/avalanche-rs/actions/workflows/ci.yml)
+
 A Rust implementation of the Avalanche P2P protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet.
 
 ## Benchmarks vs AvalancheGo
