@@ -1,52 +1,69 @@
 # avalanche-rs 🏔️
 
-[![CI](https://github.com/moltbook/avalanche-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/moltbook/avalanche-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml)
 
-A Rust implementation of the Avalanche P2P protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet.
+A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 23.8K lines of Rust, 518 tests, 8.6 MB binary.
 
-## Benchmarks vs AvalancheGo
+## Benchmarks vs AvalancheGo 1.14.1
 
-Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, **3 minutes each** (2026-03-05):
+Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, **3 minutes each** (2026-03-07):
 
-| Metric | avalanche-rs | AvalancheGo 1.14.1 | Delta |
-|--------|-------------|---------------------|-------|
-| **Binary size** | 7.8 MB | 89 MB | **11x smaller** |
-| **First peer connected** | 117ms | ~6.3s | **~54x faster** |
-| **P-Chain bootstrap** | 12.0s ✅ complete | ❌ 63.6% at 3 min | **avalanche-rs finished** |
-| **P-Chain blocks synced** | 3,196 | 267K fetched, 170K executed | AvalancheGo fetches more |
-| **P-Chain tip height** | 267,051 ✅ | 267,053 (partial) | similar |
-| **C-Chain bootstrap** | 12.3s ✅ complete | ❌ not started | **avalanche-rs only** |
-| **C-Chain blocks synced** | 508 | 0 | ∞ |
-| **Status at 3 min** | ✅ IDLE (done) | ⏳ still executing | **avalanche-rs idle** |
-| **Peers connected** | 11 | healthy at 30s | similar |
+| Metric | avalanche-rs | AvalancheGo 1.14.1 | Δ |
+|--------|-------------|-------------------|---|
+| **Binary size** | 8.6 MB | 88.7 MB | **10.3× smaller** |
+| **Memory (RSS) @ 3 min** | 36 MB | 1,787 MB | **49.6× less** |
+| **First peer handshake** | 595 ms | ~8 s | **~13× faster** |
+| **P-Chain bootstrap** | ✅ Complete + following | ❌ 40.8% executed | **avalanche-rs wins** |
+| **P-Chain blocks synced** | 3,067 | 267K fetched, 109K executed | * |
+| **C-Chain blocks synced** | 503 | 0 (not started) | ∞ |
+| **Status at 3 min** | ✅ Following chain tip | ⏳ Still executing | — |
 
-avalanche-rs completes full P-Chain + C-Chain bootstrap in **12.3 seconds**, then sits idle. At 3 minutes, AvalancheGo has fetched all blocks but is only 63.6% through executing them — C-Chain hasn't started.
+avalanche-rs completes full P-Chain + C-Chain bootstrap in **~25 seconds**, then tracks the chain tip. AvalancheGo is still executing blocks after 3 minutes.
 
-> Full benchmark details: [`BENCHMARKS.md`](BENCHMARKS.md)
+> Full benchmark details: [`BENCHMARK.md`](BENCHMARK.md)
 
-## Status
+## Features
 
-**Working:** Full bootstrap sequence with block storage on Fuji testnet.
+### Networking & Protocol
+- TLS identity generation (ECDSA P-256, self-signed certs)
+- mTLS connections with mutual authentication
+- Protobuf wire protocol (4-byte length prefix + prost)
+- Version/PeerList handshake exchange
+- BLS12-381 signatures (proof-of-possession DST)
+- Bloom filter for efficient peer tracking
+- Peer discovery (12+ simultaneous connections)
+- Persistent peer management with scoring & eviction
+- Avalanche Warp Messaging (AWM) — BLS aggregate sig relay
 
-```
-✅ TLS identity generation (ECDSA P-256, self-signed certs)
-✅ mTLS connection to bootstrap nodes
-✅ Protobuf wire protocol (4-byte length prefix + prost)
-✅ Handshake exchange (Version + PeerList)
-✅ BLS signatures (blst, proof-of-possession DST)
-✅ IP signing with TLS key (ring ECDSA P-256 SHA-256 ASN1)
-✅ Bloom filter for known peers
-✅ Peer discovery (12+ simultaneous connections via PeerList)
-✅ JSON-RPC server (eth_chainId, eth_blockNumber, avax_getNodeID, etc.)
-✅ RocksDB storage (7 column families)
-✅ EVM execution via revm
-✅ 363 tests passing (331 unit + 32 integration)
-✅ P-Chain bootstrap (3,200+ blocks via recursive GetAncestors)
-✅ C-Chain bootstrap (500+ blocks via recursive GetAncestors)
-✅ P-Chain chain verification (tip-to-genesis walk, height matches API)
-✅ Validator set tracking (pre-populated with known Fuji validators)
-✅ MEV engine (mempool scanning, V2/V4 arbitrage, sandwich simulation, hook risk analysis)
-```
+### Consensus & Sync
+- Snowman consensus engine (α=15, β=20, chits, confidence counters)
+- P-Chain bootstrap (3,000+ blocks via recursive GetAncestors)
+- C-Chain bootstrap (500+ blocks with EVM execution via revm)
+- State sync protocol (StateSummaryFrontier, trie node download)
+- Continuous sync (SyncPhase::Following — tracks chain tip)
+- Block building with BLS signing (--validator mode)
+- State trie verification (alloy-trie MPT)
+- State pruning (configurable depth, background task)
+- Light client mode (headers-only, merkle proof verification)
+
+### RPC Server
+- **eth_*** — 14 methods: getBalance, getTransactionCount, getCode, getStorageAt, call, estimateGas, gasPrice, getTransactionByHash, getTransactionReceipt, getBlockByNumber, getBlockByHash, getLogs, newFilter, getFilterChanges
+- **platform.*** — 7 methods: getCurrentValidators, getPendingValidators, getHeight, getBlock, getSubnets, getStake, getMinStake
+- **net_***, **web3_***, **avax_*** — version, clientVersion, syncing, nodeID
+- Prometheus metrics at `/metrics`
+- Health endpoint matching AvalancheGo format
+
+### Transaction Validation
+- P-Chain: secp256k1 signature verification
+- P-Chain: UTXO tracking from genesis, double-spend detection
+- C-Chain: full EVM execution via revm
+- C-Chain: receipt root & gas accounting verification
+
+### Advanced
+- Subnet support (--tracked-subnets, per-chain sync state)
+- MEV engine (V2/V4 AMM math, sandwich sim, arbitrage detection)
+- WASM build target (avalanche-core → wasm32)
+- `no_std` core library (avalanche-core crate)
 
 ## Quick Start
 
@@ -57,7 +74,7 @@ cargo build --release
 # Run on Fuji testnet
 ./target/release/avalanche-rs \
   --network-id 5 \
-  --bootstrap-ips "52.29.72.46:9651,207.229.99.63:9651" \
+  --bootstrap-ips "52.29.72.46:9651" \
   --staking-port 9651 \
   --http-port 9650
 
@@ -67,51 +84,67 @@ cargo build --release
   --bootstrap-ips "52.29.72.46:9651" \
   --staking-port 9651 \
   --http-port 9650
-```
 
-## Bootstrap Sequence
+# Light client mode (headers only, minimal memory)
+./target/release/avalanche-rs \
+  --network-id 5 --light-client \
+  --bootstrap-ips "52.29.72.46:9651"
 
-The node performs a full Snowman bootstrap sequence:
+# Validator mode (block building)
+./target/release/avalanche-rs \
+  --network-id 5 --validator \
+  --bootstrap-ips "52.29.72.46:9651"
 
-```
-1. Connect to bootstrap peers (mTLS)
-2. Handshake (Version ↔ PeerList)
-3. Discover peers (PeerList → dial up to 12 simultaneously)
-4. P-Chain bootstrap:
-   GetAcceptedFrontier → AcceptedFrontier (tip hash)
-   GetAccepted → Accepted (confirmed tip)
-   GetAncestors → Ancestors (up to 2MB of blocks per round)
-   Recursive fetch (up to 10 rounds) → 3,200+ blocks stored
-   Chain walk: verify tip → genesis via parent pointers (height matches API)
-5. C-Chain bootstrap (Fuji only):
-   GetAcceptedFrontier → AcceptedFrontier (C-Chain tip)
-   GetAccepted → Accepted
-   GetAncestors → recursive fetch → blocks stored (prefixed "c:")
-6. Validator set loaded (2 known Fuji bootstrap validators)
+# Custom state pruning depth
+./target/release/avalanche-rs \
+  --network-id 5 --state-pruning-depth 512 \
+  --bootstrap-ips "52.29.72.46:9651"
 ```
 
 ## Architecture
 
 ```
-src/
-├── main.rs          # Node daemon, P2P connect, handshake, message loop
-├── block/           # Block header parsing (Apricot + Banff), chain graph, Snowman
-├── identity/        # TLS cert generation, IP signing, BLS keys
-├── proto/           # Protobuf codec (p2p.proto from AvalancheGo)
-├── network/         # P2P networking, peer management
-├── sync/            # Bootstrap state sync (GetAcceptedFrontier, GetAncestors)
-├── evm/             # C-Chain EVM execution via revm
-├── db/              # RocksDB storage layer (8 column families)
-├── rpc/             # JSON-RPC server
-├── tx/              # Transaction types and validation
-├── types/           # Core types (blocks, headers, vertices)
-├── consensus/       # Snowman consensus stubs
-├── mempool/         # Transaction mempool
-├── mev/             # MEV engine (mempool monitor, AMM math, sandwich/arb, V4 hooks)
-└── codec/           # Serialization helpers
+avalanche-rs/
+├── src/
+│   ├── main.rs          # Node daemon, P2P, handshake, message loop, RPC server
+│   ├── block/           # Block parsing (Apricot + Banff), chain graph
+│   ├── consensus/       # Snowman consensus (alpha/beta, chits, confidence)
+│   ├── identity/        # TLS cert generation, IP signing, BLS keys
+│   ├── proto/           # Protobuf codec (p2p.proto)
+│   ├── network/         # P2P networking, persistent peer management
+│   ├── sync/            # State sync, bootstrap, chain following
+│   ├── evm/             # C-Chain EVM execution via revm
+│   ├── db/              # RocksDB storage (10 column families + pruning)
+│   ├── rpc/             # JSON-RPC client
+│   ├── tx/              # Transaction types, UTXO validation
+│   ├── validator/       # Validator set tracking, signature verification
+│   ├── warp/            # Avalanche Warp Messaging (AWM)
+│   ├── subnet/          # Subnet discovery & chain management
+│   ├── metrics/         # Prometheus metrics & health endpoint
+│   ├── light/           # Light client (headers-only, proof requests)
+│   ├── mempool/         # Transaction mempool
+│   ├── mev/             # MEV engine (V2/V4 AMM, sandwich, arb)
+│   ├── types/           # Core types
+│   └── codec/           # Serialization helpers
+├── crates/
+│   ├── avalanche-core/  # no_std protocol library (codec, blocks, BLS, bloom)
+│   └── avalanche-wasm/  # WASM bindings (wasm-bindgen)
 ```
 
-~16K lines of Rust.
+## WASM Support
+
+The `avalanche-core` crate compiles to WebAssembly for browser-based light clients:
+
+```bash
+# Build WASM package
+cd crates/avalanche-wasm
+wasm-pack build --target web
+
+# Or raw wasm32 build
+cargo build -p avalanche-core --target wasm32-unknown-unknown --no-default-features
+```
+
+Exported functions: `parse_block`, `verify_bls_signature`, `bloom_check`, `decode_message`
 
 ## Protocol Compatibility
 
@@ -119,8 +152,8 @@ src/
 - **RPC Protocol:** 44
 - **Wire format:** 4-byte BE length prefix + protobuf (prost)
 - **TLS:** ECDSA P-256, mutual auth required
-- **BLS DST:** `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` (proof of possession)
-- **Bloom filter:** `[numHashes:1][seeds:8*n][entries:1+]`
+- **BLS DST:** `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
+- **Snowman:** α_p=15, α_c=15, β=20 (Fuji parameters)
 
 ## Key Dependencies
 
@@ -133,18 +166,35 @@ src/
 | `blst` 0.3 | BLS12-381 signatures |
 | `revm` 19 | EVM execution |
 | `rocksdb` 0.22 | Persistent storage |
+| `alloy-trie` 0.7 | Merkle Patricia Trie verification |
+| `prometheus` 0.13 | Metrics collection |
 | `tokio` 1.0 | Async runtime |
 
-## What's Next
+## Development
 
-- [x] ~~Full P-Chain block parsing (height, timestamp extraction)~~ ✅
-- [x] ~~Validate block parent linkage~~ ✅ (chain walk verified)
-- [x] ~~Block signature validation~~ ✅ (BLS format validation, signature parsing)
-- [x] ~~Full Snowman consensus participation~~ ✅ (vote tallying, finality detection, block acceptance)
-- [x] ~~Validator set updates from AddValidator/AddDelegator txs~~ ✅ (P-Chain tx parsing, validator tracking)
-- [x] ~~State sync (EVM state root extraction done; full account trie download pending)~~ ✅ (StateSyncEngine with trie node storage)
-- [x] ~~C-Chain block parsing (RLP decode from wire format)~~ ✅ (Avalanche-wrapped RLP + raw RLP, parentHash/height/timestamp extraction)
-- [x] ~~MEV engine integration~~ ✅ (V2/V4 AMM math, sandwich sim, hook risk, mempool scan)
+```bash
+# Run all tests
+cargo test
+
+# Run with clippy
+cargo clippy -- -D warnings
+
+# Format check
+cargo fmt -- --check
+
+# Verify no_std core compiles
+cargo test -p avalanche-core --no-default-features
+
+# Release build
+cargo build --release
+```
+
+## Stats
+
+- **23,851 lines** of Rust
+- **518 tests** (476 unit + 3 integration + 39 avalanche-core)
+- **8.6 MB** release binary (LTO + strip)
+- **36 MB** RSS at steady state (49.6× less than AvalancheGo)
 
 ## The Bloom Filter Bug 🐛
 

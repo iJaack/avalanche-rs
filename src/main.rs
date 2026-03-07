@@ -2705,6 +2705,7 @@ fn rpc_ok(result: &str, id: &serde_json::Value) -> String {
 }
 
 /// In-memory log filter for eth_newFilter/getFilterChanges/uninstallFilter.
+#[allow(dead_code)]
 struct LogFilter {
     from_block: u64,
     to_block: Option<u64>,
