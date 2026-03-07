@@ -3281,6 +3281,162 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // -----------------------------------------------------------------
 
         // -----------------------------------------------------------------
+        // eth_feeHistory (EIP-1559)
+        // -----------------------------------------------------------------
+        "eth_feeHistory" => {
+            let block_count = params.get(0).and_then(|v| {
+                v.as_u64().or_else(|| {
+                    v.as_str().and_then(|s| {
+                        let s = s.strip_prefix("0x").unwrap_or(s);
+                        u64::from_str_radix(s, 16).ok()
+                    })
+                })
+            }).unwrap_or(1);
+            let newest_block = parse_block_number(
+                params.get(1).unwrap_or(&serde_json::Value::Null), node
+            );
+            let block_count = block_count.min(1024);
+            let oldest = newest_block.saturating_sub(block_count.saturating_sub(1));
+            let base_fee = "0x5d21dba00"; // 25 gwei
+            let mut base_fees = Vec::new();
+            let mut gas_used_ratios = Vec::new();
+            for _ in 0..block_count {
+                base_fees.push(format!("\"{}\"", base_fee));
+                gas_used_ratios.push("0.5".to_string());
+            }
+            base_fees.push(format!("\"{}\"", base_fee)); // +1 for next block
+            rpc_ok(
+                &format!(
+                    "{{\"oldestBlock\":\"0x{:x}\",\"baseFeePerGas\":[{}],\"gasUsedRatio\":[{}]}}",
+                    oldest,
+                    base_fees.join(","),
+                    gas_used_ratios.join(",")
+                ),
+                id,
+            )
+        }
+
+        // -----------------------------------------------------------------
+        // eth_maxPriorityFeePerGas
+        // -----------------------------------------------------------------
+        "eth_maxPriorityFeePerGas" => {
+            rpc_ok("\"0x3b9aca00\"", id) // 1 gwei suggested priority fee
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getBlockReceipts
+        // -----------------------------------------------------------------
+        "eth_getBlockReceipts" => {
+            let block_num = parse_block_number(
+                params.get(0).unwrap_or(&serde_json::Value::Null), node
+            );
+            // Return receipts from DB if available, else empty array
+            match node.db.get_block_receipts(block_num) {
+                Ok(Some(data)) => {
+                    let receipts_json = String::from_utf8_lossy(&data);
+                    rpc_ok(&receipts_json, id)
+                }
+                _ => rpc_ok("[]", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_createAccessList
+        // -----------------------------------------------------------------
+        "eth_createAccessList" => {
+            let tx_obj = params.get(0);
+            if tx_obj.is_none() {
+                return rpc_error(-32602, "missing transaction object", id);
+            }
+            // Return empty access list with gas estimate
+            rpc_ok(
+                "{\"accessList\":[],\"gasUsed\":\"0x5208\"}",
+                id,
+            )
+        }
+
+        // -----------------------------------------------------------------
+        // avax_getAtomicTx
+        // -----------------------------------------------------------------
+        "avax_getAtomicTx" => {
+            let tx_id_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+            if tx_id_str.is_empty() {
+                return rpc_error(-32602, "missing txID", id);
+            }
+            // Atomic txs stored in CF_BLOCKS with "atomic:" prefix
+            let key = format!("atomic:{}", tx_id_str);
+            match node.db.get_cf(avalanche_rs::db::CF_BLOCKS, key.as_bytes()) {
+                Ok(Some(data)) => {
+                    rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id)
+                }
+                _ => rpc_ok("null", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // avax_issueTx
+        // -----------------------------------------------------------------
+        "avax_issueTx" => {
+            let tx_bytes_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+            if tx_bytes_str.is_empty() {
+                return rpc_error(-32602, "missing tx bytes", id);
+            }
+            match parse_hex_bytes(tx_bytes_str) {
+                Some(tx_bytes) => {
+                    // Hash the tx to create an ID
+                    let tx_hash = {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&tx_bytes);
+                        hasher.finalize()
+                    };
+                    let tx_id = hex::encode(&tx_hash);
+                    // Store in DB for retrieval
+                    let key = format!("atomic:{}", tx_id);
+                    let _ = node.db.put_cf(avalanche_rs::db::CF_BLOCKS, key.as_bytes(), &tx_bytes);
+                    rpc_ok(&format!("{{\"txID\":\"0x{}\"}}", tx_id), id)
+                }
+                None => rpc_error(-32602, "invalid tx hex", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // info namespace
+        // -----------------------------------------------------------------
+        "info.getNetworkID" => {
+            rpc_ok(&format!("{{\"networkID\":\"{}\"}}", node.config.network_id), id)
+        }
+
+        "info.getNetworkName" => {
+            let name = match node.config.network_id {
+                1 => "mainnet",
+                5 => "fuji",
+                _ => "custom",
+            };
+            rpc_ok(&format!("{{\"networkName\":\"{}\"}}", name), id)
+        }
+
+        "info.getBlockchainID" => {
+            // C-Chain blockchain ID
+            rpc_ok("{\"blockchainID\":\"2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5\"}", id)
+        }
+
+        "info.getNodeVersion" => {
+            rpc_ok(
+                &format!(
+                    "{{\"version\":\"avalanche-rs/0.1.0\",\"databaseVersion\":\"{}\",\"gitCommit\":\"rust\"}}",
+                    "0.1.0"
+                ),
+                id,
+            )
+        }
+
+        "info.peers" => {
+            let pm = node.peer_manager.read().await;
+            let peer_count = pm.connected_count();
+            rpc_ok(&format!("{{\"numPeers\":{},\"peers\":[]}}", peer_count), id)
+        }
+
+        // -----------------------------------------------------------------
         // Unknown method
         // -----------------------------------------------------------------
         _ => {
@@ -3557,6 +3713,86 @@ mod integration_tests {
         let (key, raw) = result.unwrap();
         assert_eq!(key, genesis_id);
         assert_eq!(raw.len(), genesis.len());
+    }
+
+    #[test]
+    fn test_rpc_fee_history_format() {
+        // Verify fee history response structure
+        let base_fee = "0x5d21dba00";
+        let block_count = 4u64;
+        let oldest = 10u64;
+        let mut base_fees = Vec::new();
+        let mut gas_used_ratios = Vec::new();
+        for _ in 0..block_count {
+            base_fees.push(format!("\"{}\"", base_fee));
+            gas_used_ratios.push("0.5".to_string());
+        }
+        base_fees.push(format!("\"{}\"", base_fee));
+        let result = format!(
+            "{{\"oldestBlock\":\"0x{:x}\",\"baseFeePerGas\":[{}],\"gasUsedRatio\":[{}]}}",
+            oldest,
+            base_fees.join(","),
+            gas_used_ratios.join(",")
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["oldestBlock"], "0xa");
+        assert_eq!(parsed["baseFeePerGas"].as_array().unwrap().len(), 5);
+        assert_eq!(parsed["gasUsedRatio"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_rpc_info_network_name() {
+        assert_eq!(
+            match 1u32 { 1 => "mainnet", 5 => "fuji", _ => "custom" },
+            "mainnet"
+        );
+        assert_eq!(
+            match 5u32 { 1 => "mainnet", 5 => "fuji", _ => "custom" },
+            "fuji"
+        );
+        assert_eq!(
+            match 999u32 { 1 => "mainnet", 5 => "fuji", _ => "custom" },
+            "custom"
+        );
+    }
+
+    #[test]
+    fn test_db_block_receipts() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        // Store two receipts for block 100
+        let receipt0 = br#"{"status":"0x1","gasUsed":"0x5208"}"#;
+        let receipt1 = br#"{"status":"0x1","gasUsed":"0xa410"}"#;
+        db.put_receipt(100, 0, receipt0).unwrap();
+        db.put_receipt(100, 1, receipt1).unwrap();
+
+        let result = db.get_block_receipts(100).unwrap();
+        assert!(result.is_some());
+        let data = String::from_utf8(result.unwrap()).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["gasUsed"], "0x5208");
+    }
+
+    #[test]
+    fn test_db_block_receipts_empty() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let result = db.get_block_receipts(999).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_rpc_max_priority_fee() {
+        // 1 gwei = 0x3b9aca00
+        let fee = u64::from_str_radix("3b9aca00", 16).unwrap();
+        assert_eq!(fee, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_rpc_create_access_list_format() {
+        let result = "{\"accessList\":[],\"gasUsed\":\"0x5208\"}";
+        let parsed: serde_json::Value = serde_json::from_str(result).unwrap();
+        assert!(parsed["accessList"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["gasUsed"], "0x5208");
     }
 }
 

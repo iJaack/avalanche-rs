@@ -2,7 +2,7 @@
 //!
 //! Activated on both mainnet and fuji on 2025-03-13T15:00:00Z.
 
-use sha2::{Digest, Sha256};
+
 
 // Fortuna activation: 2025-03-13T15:00:00Z = 1741878000
 pub const FORTUNA_MAINNET_TIMESTAMP: u64 = 1741878000;
@@ -229,6 +229,7 @@ mod tests {
         let pub_key_bytes = verifying_key.to_sec1_bytes();
 
         // Sign a message
+        use sha2::Digest;
         let message_hash = sha2::Sha256::digest(b"test message");
         let message_hash: [u8; 32] = message_hash.into();
         let (signature, _) = signing_key.sign(&message_hash);

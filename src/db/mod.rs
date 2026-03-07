@@ -233,6 +233,27 @@ impl Database {
         self.get_cf(CF_RECEIPTS, &key)
     }
 
+    /// Get all receipts for a block (serialized as JSON array).
+    pub fn get_block_receipts(&self, block_height: u64) -> Result<Option<Vec<u8>>, DbError> {
+        let prefix = block_height.to_be_bytes();
+        let mut receipts = Vec::new();
+        // Scan receipts with this block height prefix (up to 1000 tx per block)
+        for tx_idx in 0u32..1000 {
+            let mut key = Vec::with_capacity(12);
+            key.extend_from_slice(&prefix);
+            key.extend_from_slice(&tx_idx.to_be_bytes());
+            match self.get_cf(CF_RECEIPTS, &key)? {
+                Some(data) => receipts.push(String::from_utf8_lossy(&data).to_string()),
+                None => break,
+            }
+        }
+        if receipts.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(format!("[{}]", receipts.join(",")).into_bytes()))
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Metadata
     // -----------------------------------------------------------------------
