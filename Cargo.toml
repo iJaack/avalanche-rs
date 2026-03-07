@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/avalanche-core"]
+members = [".", "crates/avalanche-core", "crates/avalanche-wasm"]
 
 [package]
 name = "avalanche-rs"

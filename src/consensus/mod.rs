@@ -552,13 +552,18 @@ mod tests {
         // Round 1: A gets quorum → A preferred with consecutive=1
         sc.process_chits(&[block_a, block_a]);
         assert!(sc.is_preferred(&block_a));
+        assert_eq!(sc.block_confidence(&block_a).unwrap().consecutive, 1);
 
-        // Round 2: only B gets quorum → B consecutive=1, A consecutive stays 1 (not polled)
-        // But A's consecutive isn't reset since it wasn't polled with < alpha votes
-        // B consecutive == A consecutive, so preference doesn't switch
-        // We need to also vote for A below quorum to reset it
-        sc.process_chits(&[block_b, block_b, block_a]); // A gets 1 vote (< alpha=2), B gets 2
-        // A consecutive reset to 0, B consecutive = 1 → B preferred
+        // Round 2: B gets quorum, A gets quorum too → both consecutive=2 for A, 1 for B
+        // A keeps preference since it has higher consecutive
+        sc.process_chits(&[block_b, block_b]);
+        // B now has consecutive=1, A still has consecutive=1 (not polled)
+        // B should NOT surpass A since 1 > 1 is false
+
+        // Round 3-4: B gets quorum twice more, surpassing A
+        sc.process_chits(&[block_b, block_b]);
+        sc.process_chits(&[block_b, block_b]);
+        // B consecutive = 3, A consecutive still = 1
         assert!(sc.is_preferred(&block_b));
     }
 
