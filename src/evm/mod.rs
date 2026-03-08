@@ -85,6 +85,7 @@ pub struct BlockResult {
     pub receipts: Vec<TxReceipt>,
     pub gas_used: u64,
     pub tx_count: usize,
+    pub state_root: [u8; 32],
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +192,11 @@ impl EvmExecutor {
             None => TxKind::Create,
         };
 
-        let chain_id = self.chain_id;
+        let chain_id = if block.chain_id == 0 {
+            self.chain_id
+        } else {
+            block.chain_id
+        };
         let mut evm = Evm::builder()
             .with_db(&mut db_clone)
             .modify_cfg_env(|cfg| {
@@ -242,7 +247,11 @@ impl EvmExecutor {
             None => TxKind::Create,
         };
 
-        let chain_id = self.chain_id;
+        let chain_id = if block.chain_id == 0 {
+            self.chain_id
+        } else {
+            block.chain_id
+        };
         let mut evm = Evm::builder()
             .with_db(&mut db_clone)
             .modify_cfg_env(|cfg| {
@@ -288,7 +297,11 @@ impl EvmExecutor {
             None => TxKind::Create,
         };
 
-        let chain_id = self.chain_id;
+        let chain_id = if block.chain_id == 0 {
+            self.chain_id
+        } else {
+            block.chain_id
+        };
         let tx_caller = Address::from(tx.from);
         let tx_value = U256::from(tx.value);
         let tx_data = Bytes::from(tx.data.clone());
@@ -345,14 +358,25 @@ impl EvmExecutor {
 
         for tx in txs {
             let receipt = self.execute_tx(tx, block)?;
-            total_gas += receipt.gas_used;
+            total_gas = total_gas
+                .checked_add(receipt.gas_used)
+                .ok_or_else(|| EvmError::StateError("block gas overflow".to_string()))?;
+            if total_gas > block.gas_limit {
+                return Err(EvmError::InvalidTransaction(format!(
+                    "block gas limit exceeded: used={}, limit={}",
+                    total_gas, block.gas_limit
+                )));
+            }
             receipts.push(receipt);
         }
+
+        let state_root = self.compute_state_root_mpt();
 
         Ok(BlockResult {
             tx_count: txs.len(),
             gas_used: total_gas,
             receipts,
+            state_root,
         })
     }
 
@@ -368,7 +392,9 @@ impl EvmExecutor {
         raw_block: &[u8],
         chain_id: u64,
     ) -> Result<BlockResult, EvmError> {
-        use crate::block::{extract_cchain_block_fields, extract_cchain_transactions};
+        use crate::block::{
+            extract_cchain_block_fields, extract_cchain_transactions, BlockHeader,
+        };
 
         let fields = extract_cchain_block_fields(raw_block)
             .ok_or_else(|| EvmError::InvalidTransaction("cannot parse block fields".to_string()))?;
@@ -385,10 +411,22 @@ impl EvmExecutor {
 
         let raw_txs = extract_cchain_transactions(raw_block);
         if raw_txs.is_empty() {
+            let state_root = self.compute_state_root_mpt();
+            if let Some(expected_state_root) = BlockHeader::extract_state_root(raw_block) {
+                if state_root != expected_state_root {
+                    return Err(EvmError::StateError(format!(
+                        "state root mismatch: expected=0x{}, computed=0x{}",
+                        hex::encode(expected_state_root),
+                        hex::encode(state_root)
+                    )));
+                }
+            }
+
             return Ok(BlockResult {
                 receipts: vec![],
                 gas_used: 0,
                 tx_count: 0,
+                state_root,
             });
         }
 
@@ -409,7 +447,19 @@ impl EvmExecutor {
             })
             .collect();
 
-        self.execute_block(&evm_txs, &ctx)
+        let result = self.execute_block(&evm_txs, &ctx)?;
+
+        if let Some(expected_state_root) = BlockHeader::extract_state_root(raw_block) {
+            if result.state_root != expected_state_root {
+                return Err(EvmError::StateError(format!(
+                    "state root mismatch: expected=0x{}, computed=0x{}",
+                    hex::encode(expected_state_root),
+                    hex::encode(result.state_root)
+                )));
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get the number of accounts in the state DB.
@@ -731,6 +781,69 @@ mod tests {
         assert!(result.receipts[0].success);
         assert!(result.receipts[1].success);
         assert_eq!(result.gas_used, 42_000);
+        assert_eq!(result.state_root, exec.compute_state_root_mpt());
+    }
+
+    #[test]
+    fn test_block_gas_limit_enforced() {
+        let mut exec = EvmExecutor::new(43114);
+        let sender = [0x01; 20];
+        exec.set_balance(sender, 100_000_000_000_000_000_000u128);
+
+        let block = BlockContext {
+            gas_limit: 21_000,
+            ..test_block()
+        };
+        let txs = vec![
+            EvmTransaction {
+                from: sender,
+                to: Some([0x02; 20]),
+                value: 1,
+                data: vec![],
+                gas_limit: 21_000,
+                gas_price: 25_000_000_000,
+                nonce: 0,
+            },
+            EvmTransaction {
+                from: sender,
+                to: Some([0x03; 20]),
+                value: 1,
+                data: vec![],
+                gas_limit: 21_000,
+                gas_price: 25_000_000_000,
+                nonce: 1,
+            },
+        ];
+
+        let err = exec.execute_block(&txs, &block).unwrap_err();
+        assert!(
+            err.to_string().contains("block gas limit exceeded"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_receipt_generation_for_transfer() {
+        let mut exec = EvmExecutor::new(43114);
+        let sender = [0x01; 20];
+        let receiver = [0x02; 20];
+        exec.set_balance(sender, 10_000_000_000_000_000_000u128);
+
+        let tx = EvmTransaction {
+            from: sender,
+            to: Some(receiver),
+            value: 1_000_000_000_000,
+            data: vec![],
+            gas_limit: 21_000,
+            gas_price: 25_000_000_000,
+            nonce: 0,
+        };
+
+        let receipt = exec.execute_tx(&tx, &test_block()).unwrap();
+        assert!(receipt.success);
+        assert_eq!(receipt.gas_used, 21_000);
+        assert!(receipt.logs.is_empty());
     }
 
     #[test]
@@ -778,7 +891,11 @@ mod tests {
         hp.push(0x94);
         hp.extend_from_slice(&[0u8; 20]); // miner
         hp.push(0xa0);
-        hp.extend_from_slice(&[0u8; 32]); // stateRoot
+        hp.extend_from_slice(&[
+            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92,
+            0xc0, 0xf8, 0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62,
+            0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+        ]); // stateRoot = empty trie
         hp.push(0xa0);
         hp.extend_from_slice(&[0u8; 32]); // txRoot
         hp.push(0xa0);
@@ -855,6 +972,24 @@ mod tests {
         // Empty bytes → should error
         let result = exec.execute_cchain_block_raw(&[], 43114);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_cchain_block_raw_state_root_mismatch() {
+        let mut exec = EvmExecutor::new(43114);
+        let mut block = make_test_cchain_block_rlp(1);
+
+        // Corrupt a byte in the state root field to force mismatch.
+        let idx = block
+            .windows(2)
+            .position(|w| w == [0xa0, 0x56])
+            .map(|p| p + 1)
+            .expect("state root prefix present");
+        block[idx] ^= 0x01;
+
+        let result = exec.execute_cchain_block_raw(&block, 43114);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("state root mismatch"));
     }
 
     #[test]

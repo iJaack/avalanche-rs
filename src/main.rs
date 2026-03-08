@@ -150,6 +150,22 @@ struct Cli {
     /// Max concurrent startup dials and steady outbound pool target.
     #[arg(long, default_value = "8", env = "AVAX_CONNECTION_POOL_SIZE")]
     connection_pool_size: usize,
+
+    /// AVAX amount to stake (supports validator/delegator flows).
+    #[arg(long, env = "AVAX_STAKE_AMOUNT")]
+    stake_amount: Option<u64>,
+
+    /// Staking duration in days.
+    #[arg(long, env = "AVAX_STAKE_DURATION")]
+    stake_duration: Option<u16>,
+
+    /// Delegation fee percentage (minimum 2.0).
+    #[arg(long, env = "AVAX_DELEGATION_FEE")]
+    delegation_fee: Option<f64>,
+
+    /// Hex reward address where staking rewards should be sent.
+    #[arg(long, env = "AVAX_REWARD_ADDRESS")]
+    reward_address: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2647,8 +2663,7 @@ async fn build_cchain_block(
         let result = evm
             .execute_block(&txs, &ctx)
             .map_err(|e| format!("EVM execution: {}", e))?;
-        // Compute a simple state root (will be refined by Feature 4)
-        let state_root = evm.compute_state_root_simple();
+        let state_root = result.state_root;
         (result, state_root)
     };
 
@@ -2848,9 +2863,26 @@ async fn execute_cchain_block_and_store(
         Some(f) => f,
         None => return, // not a valid C-Chain block
     };
+    let expected_state_root = BlockHeader::extract_state_root(raw_block);
 
     let raw_txs = extract_cchain_transactions(raw_block);
     if raw_txs.is_empty() {
+        if let Some(expected) = expected_state_root {
+            let computed = {
+                let evm = evm.read().await;
+                evm.compute_state_root_mpt()
+            };
+            if computed != expected {
+                debug!(
+                    "C-Chain #{} state root mismatch (empty block): expected=0x{}, computed=0x{}",
+                    fields.number,
+                    hex::encode(expected),
+                    hex::encode(computed)
+                );
+                return;
+            }
+        }
+
         // Even with no transactions update tip height
         let mut m = metrics.write().await;
         if fields.number > m.tip_height {
@@ -2892,9 +2924,24 @@ async fn execute_cchain_block_and_store(
 
     match result {
         Ok(block_result) => {
+            if let Some(expected) = expected_state_root {
+                if block_result.state_root != expected {
+                    debug!(
+                        "C-Chain #{} state root mismatch: expected=0x{}, computed=0x{}",
+                        fields.number,
+                        hex::encode(expected),
+                        hex::encode(block_result.state_root)
+                    );
+                    return;
+                }
+            }
+
             debug!(
-                "C-Chain #{}: executed {} txs, {} gas used",
-                fields.number, block_result.tx_count, block_result.gas_used
+                "C-Chain #{}: executed {} txs, {} gas used, state_root=0x{}",
+                fields.number,
+                block_result.tx_count,
+                block_result.gas_used,
+                hex::encode(block_result.state_root)
             );
 
             // Persist receipts: key = block_height (8 BE) + tx_index (4 BE)
@@ -4117,6 +4164,10 @@ mod integration_tests {
                 log_max_size: 100,
                 log_max_files: 10,
                 connection_pool_size: 8,
+                stake_amount: None,
+                stake_duration: None,
+                delegation_fee: None,
+                reward_address: None,
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
@@ -4291,6 +4342,10 @@ mod integration_tests {
                 log_max_size: 100,
                 log_max_files: 10,
                 connection_pool_size: 8,
+                stake_amount: None,
+                stake_duration: None,
+                delegation_fee: None,
+                reward_address: None,
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
@@ -4426,6 +4481,10 @@ mod integration_tests {
                 log_max_size: 100,
                 log_max_files: 10,
                 connection_pool_size: 8,
+                stake_amount: None,
+                stake_duration: None,
+                delegation_fee: None,
+                reward_address: None,
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
