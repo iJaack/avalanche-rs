@@ -36,6 +36,7 @@ pub mod metrics;
 pub mod observability;
 pub mod proto;
 pub mod snap;
+pub mod staking;
 pub mod subnet;
 pub mod sync;
 pub mod validator;
