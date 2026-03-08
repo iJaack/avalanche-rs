@@ -3713,6 +3713,133 @@ mod integration_tests {
         h.finalize().into()
     }
 
+    #[tokio::test]
+    #[ignore = "requires outbound mainnet connectivity"]
+    async fn test_mainnet_sync_handshake_and_fetches_pchain_block() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let identity = NodeIdentity::generate().expect("generate node identity");
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        let evm = Arc::new(RwLock::new(EvmExecutor::new(43114)));
+
+        let net_config = NetworkConfig {
+            network_id: 1,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(RwLock::new(PeerManager::new(
+            net_config,
+            identity.node_id.clone(),
+        )));
+
+        let mut chain_id_bytes = [0u8; 32];
+        chain_id_bytes[31] = 0x01;
+        let sync_engine = Arc::new(SyncEngine::new(SyncConfig {
+            chain_id: ChainId(chain_id_bytes),
+            ..Default::default()
+        }));
+
+        let node = Arc::new(NodeState {
+            identity,
+            db,
+            evm,
+            sync_engine,
+            peer_manager,
+            config: Cli {
+                network_id: 1,
+                data_dir: PathBuf::from("./data/test-mainnet-sync"),
+                bootstrap_ips: vec![],
+                staking_tls_cert_file: None,
+                staking_tls_key_file: None,
+                http_port: 0,
+                staking_port: 9651,
+                log_level: "info".to_string(),
+                log_format: "pretty".to_string(),
+                chain_id: 43114,
+                validator: false,
+                state_pruning_depth: 256,
+                light_client: false,
+                archive: false,
+                blob_retention_epochs: 4096,
+                txpool_size: 4096,
+                block_cache_size: 1024,
+                rpc_max_body_size: 5_242_880,
+                max_memory_mb: 0,
+                log_max_size: 100,
+                log_max_files: 10,
+            },
+            start_time: Instant::now(),
+            validators: std::collections::HashMap::new(),
+            validators_seen: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            total_stake_weight: Arc::new(RwLock::new(0u64)),
+            p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
+            pending_txs: Arc::new(RwLock::new(Vec::new())),
+            light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
+            archive_store: Arc::new(ArchiveStore::new(false)),
+        });
+
+        let mut handshake_complete = false;
+        let mut fetched_pchain_block = false;
+        let mut connected_bootstrap: Option<SocketAddr> = None;
+
+        for bootstrap_ip in MAINNET_BOOTSTRAP_IPS.iter().take(4) {
+            let bootstrap_addr: SocketAddr = bootstrap_ip
+                .parse()
+                .expect("valid mainnet bootstrap address");
+
+            let handle = tokio::spawn(connect_and_handshake(bootstrap_addr, node.clone()));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+            let mut saw_connected_this_attempt = false;
+
+            while tokio::time::Instant::now() < deadline {
+                {
+                    let pm = node.peer_manager.read().await;
+                    if pm.connected_count() > 0 && pm.active_peer_addrs().contains(&bootstrap_addr) {
+                        saw_connected_this_attempt = true;
+                        handshake_complete = true;
+                    }
+                }
+
+                if node
+                    .db
+                    .iter_cf_owned(CF_BLOCKS)
+                    .iter()
+                    .any(|(_, raw)| BlockHeader::parse(raw, Chain::PChain).is_ok())
+                {
+                    fetched_pchain_block = true;
+                }
+
+                if saw_connected_this_attempt && fetched_pchain_block {
+                    connected_bootstrap = Some(bootstrap_addr);
+                    break;
+                }
+
+                if handle.is_finished() {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            handle.abort();
+            let _ = handle.await;
+
+            if connected_bootstrap.is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            handshake_complete,
+            "expected handshake completion with at least one mainnet bootstrap node"
+        );
+        assert!(
+            fetched_pchain_block,
+            "expected to fetch at least one P-Chain block from mainnet bootstrap"
+        );
+    }
+
     #[test]
     fn test_integrity_check_all_match() {
         let (db, _dir) = Database::open_temp().unwrap();
