@@ -30,6 +30,37 @@ pub struct BlsAggregateSignature {
     pub signer_bitset: Vec<u8>,
 }
 
+/// Validator metadata used for Warp signature quorum checks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WarpValidator {
+    pub public_key: BlsPublicKey,
+    pub weight: u64,
+}
+
+/// P-Chain validator set snapshot for trustless Warp verification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WarpValidatorSet {
+    pub validators: Vec<WarpValidator>,
+    pub total_weight: u64,
+}
+
+impl WarpValidatorSet {
+    pub fn new(validators: Vec<WarpValidator>) -> Self {
+        let total_weight = validators.iter().map(|v| v.weight).sum();
+        Self {
+            validators,
+            total_weight,
+        }
+    }
+
+    pub fn public_keys(&self) -> Vec<BlsPublicKey> {
+        self.validators
+            .iter()
+            .map(|v| v.public_key.clone())
+            .collect()
+    }
+}
+
 impl BlsAggregateSignature {
     /// Parse an aggregate signature from raw bytes.
     /// Format: signature(96) + bitset_len(4 BE) + bitset(N)
@@ -120,6 +151,35 @@ impl BlsAggregateSignature {
         let result = sig.verify(false, message, dst, &[], &agg_pk_final, false);
 
         Ok(result == blst::BLST_ERROR::BLST_SUCCESS)
+    }
+
+    /// Total signed validator weight from the provided validator set.
+    pub fn signed_weight(&self, validator_set: &WarpValidatorSet) -> u64 {
+        validator_set
+            .validators
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.has_signed(*i))
+            .map(|(_, validator)| validator.weight)
+            .sum()
+    }
+
+    /// Check if signers satisfy a quorum fraction.
+    pub fn has_quorum(
+        &self,
+        validator_set: &WarpValidatorSet,
+        quorum_num: u64,
+        quorum_den: u64,
+    ) -> Result<bool, String> {
+        if quorum_den == 0 {
+            return Err("quorum denominator must be non-zero".to_string());
+        }
+        if validator_set.total_weight == 0 {
+            return Err("validator set has zero total weight".to_string());
+        }
+        let signed_weight = self.signed_weight(validator_set);
+        Ok((signed_weight as u128) * (quorum_den as u128)
+            >= (validator_set.total_weight as u128) * (quorum_num as u128))
     }
 }
 
@@ -236,6 +296,22 @@ impl WarpMessage {
     /// Number of validators that signed this message.
     pub fn signer_count(&self) -> usize {
         self.signature.signer_count()
+    }
+
+    /// Verify message signature and quorum against a known validator set.
+    pub fn verify_with_validator_set(
+        &self,
+        validator_set: &WarpValidatorSet,
+        quorum_num: u64,
+        quorum_den: u64,
+    ) -> Result<bool, String> {
+        let keys = validator_set.public_keys();
+        let sig_ok = self.verify(&keys)?;
+        if !sig_ok {
+            return Ok(false);
+        }
+        self.signature
+            .has_quorum(validator_set, quorum_num, quorum_den)
     }
 }
 
@@ -505,5 +581,45 @@ mod tests {
         };
         let warp = WarpMessage::new(unsigned, sig);
         assert_eq!(warp.signer_count(), 16);
+    }
+
+    #[test]
+    fn test_warp_validator_set_quorum() {
+        let validators = vec![
+            WarpValidator {
+                public_key: BlsPublicKey([1u8; 48]),
+                weight: 60,
+            },
+            WarpValidator {
+                public_key: BlsPublicKey([2u8; 48]),
+                weight: 20,
+            },
+            WarpValidator {
+                public_key: BlsPublicKey([3u8; 48]),
+                weight: 20,
+            },
+        ];
+        let validator_set = WarpValidatorSet::new(validators);
+        let sig = BlsAggregateSignature {
+            signature: BlsSignature([0x55; 96]),
+            signer_bitset: vec![0b1100_0000],
+        };
+
+        assert_eq!(sig.signed_weight(&validator_set), 80);
+        assert!(sig.has_quorum(&validator_set, 2, 3).unwrap());
+        assert!(!sig.has_quorum(&validator_set, 9, 10).unwrap());
+    }
+
+    #[test]
+    fn test_warp_quorum_invalid_denominator() {
+        let validator_set = WarpValidatorSet::new(vec![WarpValidator {
+            public_key: BlsPublicKey([1u8; 48]),
+            weight: 1,
+        }]);
+        let sig = BlsAggregateSignature {
+            signature: BlsSignature([0x11; 96]),
+            signer_bitset: vec![0x80],
+        };
+        assert!(sig.has_quorum(&validator_set, 2, 0).is_err());
     }
 }
