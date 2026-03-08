@@ -1,24 +1,24 @@
-# avalanche-rs 🏔️
+# avalanche-rs
 
 [![CI](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml)
 
-A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 27.8K lines of Rust, 597 tests, 8.6 MB binary.
+A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 31K lines of Rust, 663 tests, 8.5 MB binary.
 
 ## Benchmarks vs AvalancheGo 1.14.1
 
-Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, **3 minutes each** (2026-03-07):
+Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, **3 minutes each** (2026-03-08):
 
 | Metric | avalanche-rs | AvalancheGo 1.14.1 | Δ |
 |--------|-------------|-------------------|---|
-| **Binary size** | 8.6 MB | 88.7 MB | **10.3× smaller** |
-| **Memory (RSS) @ 3 min** | 36 MB | 1,787 MB | **49.6× less** |
-| **First peer handshake** | 595 ms | ~8 s | **~13× faster** |
+| **Binary size** | 8.5 MB | 88.7 MB | **10.4× smaller** |
+| **Memory (RSS) @ 3 min** | 67 MB | 1,787 MB | **26.7× less** |
+| **First peer handshake** | 100 ms | ~8 s | **~80× faster** |
 | **P-Chain bootstrap** | ✅ Complete + following | ❌ 40.8% executed | **avalanche-rs wins** |
-| **P-Chain blocks synced** | 3,067 | 267K fetched, 109K executed | * |
-| **C-Chain blocks synced** | 503 | 0 (not started) | ∞ |
+| **P-Chain blocks synced** | 3,066 | 267K fetched, 109K executed | * |
+| **C-Chain blocks synced** | 516 | 0 (not started) | ∞ |
 | **Status at 3 min** | ✅ Following chain tip | ⏳ Still executing | — |
 
-avalanche-rs completes full P-Chain + C-Chain bootstrap in **~25 seconds**, then tracks the chain tip. AvalancheGo is still executing blocks after 3 minutes.
+avalanche-rs completes full P-Chain + C-Chain bootstrap in **~12 seconds**, then tracks the chain tip. AvalancheGo is still executing blocks after 3 minutes.
 
 > Full benchmark details: [`BENCHMARK.md`](BENCHMARK.md)
 
@@ -69,6 +69,18 @@ avalanche-rs completes full P-Chain + C-Chain bootstrap in **~25 seconds**, then
 - debug_traceBlockByNumber — trace all txs in a block
 - Configurable tracers: structLogger (default), callTracer
 
+### Upgrade Support
+- **Fortuna** (ACP-176): Dynamic EVM gas limits — adjusts C-Chain gas limits based on network utilization using an exponential moving average, matching AvalancheGo's Fortuna upgrade behavior
+- **Granite** (ACP-181, ACP-204, ACP-226): Epoch-based validator management (ACP-181), secp256r1 signature verification for WebAuthn/passkey support (ACP-204), dynamic block time targeting based on network load (ACP-226)
+
+### Hardening & Observability
+- Panic recovery with structured error capture
+- Rate limiting (per-IP and global)
+- Connection limits with backpressure
+- Structured logging (JSON output, span context)
+- Prometheus histograms for latency tracking
+- Span tracing for request lifecycle
+
 ### Performance
 - LRU block cache (--block-cache-size, default 1024)
 - LRU account state cache (reduce trie lookups)
@@ -100,7 +112,7 @@ cargo build --release
 # Run on mainnet
 ./target/release/avalanche-rs \
   --network-id 1 \
-  --bootstrap-ips "52.29.72.46:9651" \
+  --bootstrap-ips "54.94.43.49:9651" \
   --staking-port 9651 \
   --http-port 9650
 
@@ -120,6 +132,20 @@ cargo build --release
   --bootstrap-ips "52.29.72.46:9651"
 ```
 
+## Docker
+
+```bash
+# Build the Docker image
+docker build -t avalanche-rs .
+
+# Run on Fuji testnet
+docker run -p 9650:9650 -p 9651:9651 avalanche-rs \
+  --network-id 5 --bootstrap-ips "52.29.72.46:9651"
+
+# Run with docker-compose
+docker compose up
+```
+
 ## Architecture
 
 ```
@@ -134,12 +160,16 @@ avalanche-rs/
 │   ├── db/              # RocksDB storage (12 column families + pruning)
 │   ├── debug/           # Debug & trace APIs (structLogs, callTracer)
 │   ├── evm/             # C-Chain EVM execution via revm
+│   ├── fortuna/         # Fortuna upgrade (ACP-176: dynamic EVM gas limits)
+│   ├── granite/         # Granite upgrade (ACP-181/204/226: epochs, secp256r1, dynamic blocks)
+│   ├── hardening/       # Panic recovery, rate limiting, connection limits
 │   ├── identity/        # TLS cert generation, IP signing, BLS keys
 │   ├── light/           # Light client (headers-only, proof requests)
 │   ├── mempool/         # Transaction mempool
 │   ├── metrics/         # Prometheus metrics & health endpoint
 │   ├── mev/             # MEV engine (V2/V4 AMM, sandwich, arb)
 │   ├── network/         # P2P networking, persistent peer management
+│   ├── observability/   # Structured logging, span tracing, histograms
 │   ├── proto/           # Protobuf codec (p2p.proto)
 │   ├── rpc/             # JSON-RPC client
 │   ├── snap/            # Snap/1 sync protocol (fast state download)
@@ -147,10 +177,10 @@ avalanche-rs/
 │   ├── sync/            # State sync, bootstrap, chain following
 │   ├── tx/              # Transaction types, UTXO validation
 │   ├── txpool/          # Transaction pool (EIP-1559 priority queue)
+│   ├── types/           # Core types
 │   ├── validator/       # Validator set tracking, signature verification
 │   ├── warp/            # Avalanche Warp Messaging (AWM)
 │   ├── websocket/       # WebSocket subscriptions (newHeads, logs)
-│   ├── types/           # Core types
 │   └── codec/           # Serialization helpers
 ├── crates/
 │   ├── avalanche-core/  # no_std protocol library (codec, blocks, BLS, bloom)
@@ -171,6 +201,27 @@ cargo build -p avalanche-core --target wasm32-unknown-unknown --no-default-featu
 ```
 
 Exported functions: `parse_block`, `verify_bls_signature`, `bloom_check`, `decode_message`
+
+## Fuzz Testing
+
+Fuzz targets for security-critical parsing using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz):
+
+```bash
+# Install cargo-fuzz (requires nightly)
+cargo install cargo-fuzz
+
+# List targets
+cargo fuzz list
+
+# Run a specific target (e.g., 30 seconds)
+cargo +nightly fuzz run protobuf_parse -- -max_total_time=30
+cargo +nightly fuzz run block_parse -- -max_total_time=30
+cargo +nightly fuzz run rpc_input -- -max_total_time=30
+cargo +nightly fuzz run bloom_parse -- -max_total_time=30
+cargo +nightly fuzz run rlp_decode -- -max_total_time=30
+```
+
+Targets: `protobuf_parse`, `block_parse`, `rpc_input`, `bloom_parse`, `rlp_decode`
 
 ## Protocol Compatibility
 
@@ -199,7 +250,7 @@ Exported functions: `parse_block`, `verify_bls_signature`, `bloom_check`, `decod
 ## Development
 
 ```bash
-# Run all tests
+# Run all tests (663 tests)
 cargo test
 
 # Run with clippy
@@ -217,33 +268,12 @@ cargo build --release
 
 ## Stats
 
-- **23,851 lines** of Rust
-- **518 tests** (476 unit + 3 integration + 39 avalanche-core)
-- **8.6 MB** release binary (LTO + strip)
-- **36 MB** RSS at steady state (49.6× less than AvalancheGo)
+- **30,832 lines** of Rust (src + crates)
+- **663 tests** passing
+- **8.5 MB** release binary (LTO + strip)
+- **67 MB** RSS at steady state (26.7× less than AvalancheGo)
 
-## Fuzz Testing
-
-Fuzz targets for security-critical parsing using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz):
-
-```bash
-# Install cargo-fuzz (requires nightly)
-cargo install cargo-fuzz
-
-# List targets
-cargo fuzz list
-
-# Run a specific target (e.g., 30 seconds)
-cargo +nightly fuzz run protobuf_parse -- -max_total_time=30
-cargo +nightly fuzz run block_parse -- -max_total_time=30
-cargo +nightly fuzz run rpc_input -- -max_total_time=30
-cargo +nightly fuzz run bloom_parse -- -max_total_time=30
-cargo +nightly fuzz run rlp_decode -- -max_total_time=30
-```
-
-Targets: `protobuf_parse`, `block_parse`, `rpc_input`, `bloom_parse`, `rlp_decode`
-
-## The Bloom Filter Bug 🐛
+## The Bloom Filter Bug
 
 The handshake was rejected for hours because AvalancheGo's `bloom.Parse()` expects a structured format:
 `[numHashes(1 byte)][hash_seeds(8 bytes each)][entries(1+ bytes)]` — not raw zero bytes.
