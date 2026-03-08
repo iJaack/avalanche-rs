@@ -428,20 +428,24 @@ impl EvmExecutor {
             });
         }
 
-        // Pre-fund the zero address (placeholder sender) so gas deduction succeeds.
-        // NOTE: sender recovery via ECDSA is a planned enhancement.
-        self.set_balance([0u8; 20], u128::MAX / 2);
-
+        // Recover sender addresses from ECDSA signatures. Fall back to zero address
+        // if recovery fails (e.g., missing signature data).
         let evm_txs: Vec<EvmTransaction> = raw_txs
             .iter()
-            .map(|t| EvmTransaction {
-                from: [0u8; 20], // TODO: recover from ECDSA signature
-                to: t.to,
-                value: t.value,
-                data: t.data.clone(),
-                gas_limit: t.gas_limit,
-                gas_price: t.gas_price.max(fields.base_fee),
-                nonce: t.nonce,
+            .map(|t| {
+                let from = t.recover_sender().unwrap_or([0u8; 20]);
+                // Pre-fund recovered sender so gas deduction succeeds
+                // (full state sync is not yet implemented)
+                self.set_balance(from, u128::MAX / 2);
+                EvmTransaction {
+                    from,
+                    to: t.to,
+                    value: t.value,
+                    data: t.data.clone(),
+                    gas_limit: t.gas_limit,
+                    gas_price: t.gas_price.max(fields.base_fee),
+                    nonce: t.nonce,
+                }
             })
             .collect();
 

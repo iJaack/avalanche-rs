@@ -284,6 +284,7 @@ struct ChainMetrics {
     pub blocks_synced: u64,
     pub genesis_height: u64,
     pub tip_height: u64,
+    pub tip_hash: [u8; 32],
     pub chain_length: u64,
     pub last_sync_time: Instant,
 }
@@ -305,6 +306,7 @@ impl Default for ChainMetrics {
             blocks_synced: 0,
             genesis_height: 0,
             tip_height: 0,
+            tip_hash: [0u8; 32],
             chain_length: 0,
             last_sync_time: Instant::now(),
         }
@@ -2167,6 +2169,7 @@ async fn connect_and_handshake(
                                                                     m.blocks_synced = new_total as u64;
                                                                     m.chain_length = chain_len;
                                                                     m.tip_height = tip_height;
+                                                                    m.tip_hash = tip;
                                                                     m.genesis_height = genesis_height;
                                                                     m.last_sync_time = Instant::now();
                                                                 }
@@ -2608,6 +2611,7 @@ async fn run_block_builder(node: Arc<NodeState>) {
                 {
                     let mut m = node.c_chain_metrics.write().await;
                     m.tip_height = block.number;
+                    m.tip_hash = block.id;
                     m.blocks_synced += 1;
                 }
 
@@ -2642,15 +2646,10 @@ async fn build_cchain_block(
         .unwrap_or_default()
         .as_secs();
 
-    // Look up parent block hash (tip of C-Chain)
+    // Look up parent block hash (tip of C-Chain) from in-memory metrics
     let parent_hash = {
         let metrics = node.c_chain_metrics.read().await;
-        if metrics.tip_height > 0 {
-            // Try to find the parent hash from DB (best effort)
-            [0u8; 32] // TODO: maintain tip hash in metrics
-        } else {
-            [0u8; 32]
-        }
+        metrics.tip_hash
     };
 
     // Miner address = derived from node identity (first 20 bytes of node_id)
@@ -2721,7 +2720,7 @@ fn encode_cchain_block_rlp(
     gas_used: u64,
     timestamp: u64,
     base_fee: u64,
-    _txs: &[EvmTransaction],
+    txs: &[EvmTransaction],
 ) -> Vec<u8> {
     fn rlp_bytes32(v: &[u8; 32]) -> Vec<u8> {
         let mut out = vec![0xa0u8];
@@ -2744,6 +2743,40 @@ fn encode_cchain_block_rlp(
         out.extend_from_slice(sl);
         out
     }
+    fn rlp_u128(v: u128) -> Vec<u8> {
+        if v == 0 {
+            return vec![0x80];
+        }
+        let b = v.to_be_bytes();
+        let s = b.iter().position(|&x| x != 0).unwrap_or(15);
+        let sl = &b[s..];
+        if sl.len() == 1 && sl[0] < 0x80 {
+            return vec![sl[0]];
+        }
+        let mut out = vec![0x80 + sl.len() as u8];
+        out.extend_from_slice(sl);
+        out
+    }
+    fn rlp_bytes(v: &[u8]) -> Vec<u8> {
+        if v.is_empty() {
+            return vec![0x80];
+        }
+        if v.len() == 1 && v[0] < 0x80 {
+            return vec![v[0]];
+        }
+        let mut out = Vec::new();
+        if v.len() <= 55 {
+            out.push(0x80 + v.len() as u8);
+        } else {
+            let lb = v.len().to_be_bytes();
+            let ls = lb.iter().position(|&x| x != 0).unwrap_or(7);
+            let lsl = &lb[ls..];
+            out.push(0xb7 + lsl.len() as u8);
+            out.extend_from_slice(lsl);
+        }
+        out.extend_from_slice(v);
+        out
+    }
     fn rlp_list(payload: Vec<u8>) -> Vec<u8> {
         let len = payload.len();
         let mut out = Vec::new();
@@ -2758,6 +2791,26 @@ fn encode_cchain_block_rlp(
         }
         out.extend(payload);
         out
+    }
+    /// Encode a single transaction as a legacy RLP list:
+    /// [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
+    fn rlp_encode_tx(tx: &EvmTransaction) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend(rlp_u64(tx.nonce));
+        payload.extend(rlp_u128(tx.gas_price));
+        payload.extend(rlp_u64(tx.gas_limit));
+        // to: 20-byte address or 0x80 for contract creation
+        match tx.to {
+            Some(addr) => payload.extend(rlp_bytes20(&addr)),
+            None => payload.push(0x80),
+        }
+        payload.extend(rlp_u128(tx.value));
+        payload.extend(rlp_bytes(&tx.data));
+        // v, r, s: empty signature (locally built block)
+        payload.push(0x80); // v = 0
+        payload.push(0x80); // r = 0
+        payload.push(0x80); // s = 0
+        rlp_list(payload)
     }
 
     let empty32 = [0u8; 32];
@@ -2787,12 +2840,22 @@ fn encode_cchain_block_rlp(
 
     let header = rlp_list(header_payload);
     let uncles = 0xc0u8; // empty uncles list
-    let txs_list = 0xc0u8; // empty txs list (TODO: encode txs)
+
+    // Encode transactions list
+    let txs_encoded = if txs.is_empty() {
+        vec![0xc0u8] // empty list
+    } else {
+        let mut txs_payload = Vec::new();
+        for tx in txs {
+            txs_payload.extend(rlp_encode_tx(tx));
+        }
+        rlp_list(txs_payload)
+    };
 
     let mut outer: Vec<u8> = Vec::new();
     outer.extend(header);
     outer.push(uncles);
-    outer.push(txs_list);
+    outer.extend(txs_encoded);
     let rlp = rlp_list(outer);
 
     // Wrap with Avalanche codec header: version(2) + typeID(4)
@@ -2872,11 +2935,18 @@ async fn execute_cchain_block_and_store(
     db: &Database,
     metrics: &Arc<RwLock<ChainMetrics>>,
 ) {
+    use sha2::{Digest, Sha256};
+
     let fields = match extract_cchain_block_fields(raw_block) {
         Some(f) => f,
         None => return, // not a valid C-Chain block
     };
     let expected_state_root = BlockHeader::extract_state_root(raw_block);
+
+    // Compute block hash for tip tracking
+    let mut hasher = Sha256::new();
+    hasher.update(raw_block);
+    let block_hash: [u8; 32] = hasher.finalize().into();
 
     let raw_txs = extract_cchain_transactions(raw_block);
     if raw_txs.is_empty() {
@@ -2896,10 +2966,11 @@ async fn execute_cchain_block_and_store(
             }
         }
 
-        // Even with no transactions update tip height
+        // Even with no transactions update tip height and hash
         let mut m = metrics.write().await;
         if fields.number > m.tip_height {
             m.tip_height = fields.number;
+            m.tip_hash = block_hash;
         }
         return;
     }
@@ -2914,24 +2985,26 @@ async fn execute_cchain_block_and_store(
         chain_id,
     };
 
-    // Convert raw txs to EVM transactions (zero sender — ECDSA recovery is a planned enhancement)
-    let evm_txs: Vec<EvmTransaction> = raw_txs
-        .iter()
-        .map(|t| EvmTransaction {
-            from: [0u8; 20],
-            to: t.to,
-            value: t.value,
-            data: t.data.clone(),
-            gas_limit: t.gas_limit,
-            gas_price: t.gas_price.max(fields.base_fee),
-            nonce: t.nonce,
-        })
-        .collect();
-
+    // Recover sender addresses from ECDSA signatures, falling back to zero address
     let result = {
         let mut evm = evm.write().await;
-        // Pre-fund zero address so gas deduction succeeds for all txs
-        evm.set_balance([0u8; 20], u128::MAX / 2);
+        let evm_txs: Vec<EvmTransaction> = raw_txs
+            .iter()
+            .map(|t| {
+                let from = t.recover_sender().unwrap_or([0u8; 20]);
+                // Pre-fund recovered sender so gas deduction succeeds
+                evm.set_balance(from, u128::MAX / 2);
+                EvmTransaction {
+                    from,
+                    to: t.to,
+                    value: t.value,
+                    data: t.data.clone(),
+                    gas_limit: t.gas_limit,
+                    gas_price: t.gas_price.max(fields.base_fee),
+                    nonce: t.nonce,
+                }
+            })
+            .collect();
         evm.execute_block(&evm_txs, &ctx)
     };
 
@@ -2975,6 +3048,7 @@ async fn execute_cchain_block_and_store(
             let mut m = metrics.write().await;
             if fields.number > m.tip_height {
                 m.tip_height = fields.number;
+                m.tip_hash = block_hash;
             }
         }
         Err(e) => {
@@ -3932,6 +4006,36 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
 // Consensus loop
 // ---------------------------------------------------------------------------
 
+/// Log chain analysis using in-memory metrics (avoids RocksDB format mismatch).
+async fn log_chain_metrics(node: &NodeState) {
+    let p = node.p_chain_metrics.read().await;
+    let c = node.c_chain_metrics.read().await;
+
+    if p.blocks_synced > 0 || p.tip_height > 0 {
+        info!(
+            "P-Chain analysis: {} blocks synced, genesis height {}, tip height {}, chain length {}, tip hash 0x{}",
+            p.blocks_synced,
+            p.genesis_height,
+            p.tip_height,
+            p.chain_length,
+            hex::encode(p.tip_hash)
+        );
+    } else {
+        info!("P-Chain analysis: no blocks synced yet");
+    }
+
+    if c.blocks_synced > 0 || c.tip_height > 0 {
+        info!(
+            "C-Chain analysis: {} blocks synced, tip height {}, tip hash 0x{}",
+            c.blocks_synced,
+            c.tip_height,
+            hex::encode(c.tip_hash)
+        );
+    } else {
+        info!("C-Chain analysis: no blocks synced yet");
+    }
+}
+
 async fn run_consensus_loop(node: Arc<NodeState>) {
     info!("Starting consensus loop");
 
@@ -3960,12 +4064,10 @@ async fn run_consensus_loop(node: Arc<NodeState>) {
             }
         }
 
-        // After 60 seconds, run chain graph analysis if we have blocks
+        // After 60 seconds, log chain analysis from in-memory metrics
         if !chain_analysis_done && node.start_time.elapsed().as_secs() > 60 {
             chain_analysis_done = true;
-            // TODO: analyze_chain_graphs reads from RocksDB and gets wrong heights
-            // (DB format differs from wire format). Use in-memory metrics instead.
-            // analyze_chain_graphs(&node);
+            log_chain_metrics(&node).await;
         }
     }
 }

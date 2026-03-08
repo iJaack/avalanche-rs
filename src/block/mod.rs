@@ -566,8 +566,8 @@ fn rlp_skip(data: &[u8], pos: usize) -> Result<usize, String> {
 // C-Chain transaction extraction
 // ---------------------------------------------------------------------------
 
-/// A raw transaction decoded from a C-Chain (Ethereum) block, before ECDSA
-/// sender recovery.
+/// A raw transaction decoded from a C-Chain (Ethereum) block, with ECDSA
+/// signature fields for sender recovery.
 #[derive(Debug, Clone)]
 pub struct CChainRawTx {
     /// Transaction type: 0 = legacy, 1 = EIP-2930, 2 = EIP-1559.
@@ -584,6 +584,74 @@ pub struct CChainRawTx {
     pub value: u128,
     /// Call data / init code.
     pub data: Vec<u8>,
+    /// ECDSA recovery id (v).
+    pub v: u64,
+    /// ECDSA signature r component (32 bytes big-endian).
+    pub r: Vec<u8>,
+    /// ECDSA signature s component (32 bytes big-endian).
+    pub s: Vec<u8>,
+    /// The raw RLP bytes of the unsigned transaction (for signing hash computation).
+    pub unsigned_rlp: Vec<u8>,
+}
+
+impl CChainRawTx {
+    /// Recover the sender address from the ECDSA signature (v, r, s).
+    ///
+    /// Returns the 20-byte Ethereum address derived from the recovered public key,
+    /// or `None` if recovery fails (invalid signature, empty r/s, etc.).
+    pub fn recover_sender(&self) -> Option<[u8; 20]> {
+        use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+
+        if self.r.is_empty() || self.s.is_empty() {
+            return None;
+        }
+
+        // Compute the signing hash (keccak256 of unsigned tx bytes)
+        let signing_hash = revm::primitives::keccak256(&self.unsigned_rlp);
+
+        // Pad r and s to exactly 32 bytes
+        let mut r_bytes = [0u8; 32];
+        let mut s_bytes = [0u8; 32];
+        let r_len = self.r.len().min(32);
+        let s_len = self.s.len().min(32);
+        r_bytes[32 - r_len..].copy_from_slice(&self.r[..r_len]);
+        s_bytes[32 - s_len..].copy_from_slice(&self.s[..s_len]);
+
+        // Construct the 64-byte signature (r || s)
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&r_bytes);
+        sig_bytes[32..].copy_from_slice(&s_bytes);
+
+        let signature = Signature::from_bytes((&sig_bytes).into()).ok()?;
+
+        // Determine recovery ID from v
+        let recovery_id = match self.tx_type {
+            0 => {
+                // Legacy: v = 27/28 (pre-EIP-155) or v = chainId*2 + 35/36 (EIP-155)
+                if self.v >= 35 {
+                    RecoveryId::new(((self.v - 35) % 2) != 0, false)
+                } else {
+                    RecoveryId::new((self.v - 27) != 0, false)
+                }
+            }
+            _ => {
+                // Typed txs (EIP-2930, EIP-1559): v is the yParity (0 or 1)
+                RecoveryId::new(self.v != 0, false)
+            }
+        };
+
+        let recovered_key =
+            VerifyingKey::recover_from_prehash(signing_hash.as_slice(), &signature, recovery_id)
+                .ok()?;
+
+        // Ethereum address = last 20 bytes of keccak256(uncompressed_pubkey[1..])
+        let uncompressed = recovered_key.to_encoded_point(false);
+        let pub_key_bytes = &uncompressed.as_bytes()[1..]; // skip 0x04 prefix
+        let hash = revm::primitives::keccak256(pub_key_bytes);
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&hash[12..]);
+        Some(address)
+    }
 }
 
 /// Block-level fields extracted from a C-Chain block header, needed to build
@@ -820,6 +888,19 @@ fn parse_legacy_tx(data: &[u8], pos: usize) -> Option<CChainRawTx> {
     let value = rlp_read_u128(data, fp).unwrap_or(0);
     fp = rlp_skip(data, fp).ok()?;
     let tx_data = rlp_read_bytes_vec(data, fp).unwrap_or_default();
+    fp = rlp_skip(data, fp).ok()?;
+    let v = rlp_read_u64(data, fp).unwrap_or(27);
+    fp = rlp_skip(data, fp).ok()?;
+    let r = rlp_read_bytes_vec(data, fp).unwrap_or_default();
+    fp = rlp_skip(data, fp).ok()?;
+    let s = rlp_read_bytes_vec(data, fp).unwrap_or_default();
+
+    // Build unsigned RLP for legacy tx signing hash:
+    // For EIP-155: [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
+    // For pre-EIP-155: [nonce, gasPrice, gasLimit, to, value, data]
+    let unsigned_rlp =
+        build_legacy_unsigned_rlp(nonce, gas_price, gas_limit, to, value, &tx_data, v);
+
     Some(CChainRawTx {
         tx_type: 0,
         nonce,
@@ -828,7 +909,108 @@ fn parse_legacy_tx(data: &[u8], pos: usize) -> Option<CChainRawTx> {
         to,
         value,
         data: tx_data,
+        v,
+        r,
+        s,
+        unsigned_rlp,
     })
+}
+
+/// Build the unsigned RLP for a legacy transaction (for signing hash computation).
+fn build_legacy_unsigned_rlp(
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+    to: Option<[u8; 20]>,
+    value: u128,
+    data: &[u8],
+    v: u64,
+) -> Vec<u8> {
+    fn rlp_encode_u64(val: u64) -> Vec<u8> {
+        if val == 0 {
+            return vec![0x80];
+        }
+        let b = val.to_be_bytes();
+        let s = b.iter().position(|&x| x != 0).unwrap_or(7);
+        let sl = &b[s..];
+        if sl.len() == 1 && sl[0] < 0x80 {
+            return vec![sl[0]];
+        }
+        let mut out = vec![0x80 + sl.len() as u8];
+        out.extend_from_slice(sl);
+        out
+    }
+    fn rlp_encode_u128(val: u128) -> Vec<u8> {
+        if val == 0 {
+            return vec![0x80];
+        }
+        let b = val.to_be_bytes();
+        let s = b.iter().position(|&x| x != 0).unwrap_or(15);
+        let sl = &b[s..];
+        if sl.len() == 1 && sl[0] < 0x80 {
+            return vec![sl[0]];
+        }
+        let mut out = vec![0x80 + sl.len() as u8];
+        out.extend_from_slice(sl);
+        out
+    }
+    fn rlp_encode_bytes(val: &[u8]) -> Vec<u8> {
+        if val.is_empty() {
+            return vec![0x80];
+        }
+        if val.len() == 1 && val[0] < 0x80 {
+            return vec![val[0]];
+        }
+        let mut out = Vec::new();
+        if val.len() <= 55 {
+            out.push(0x80 + val.len() as u8);
+        } else {
+            let lb = val.len().to_be_bytes();
+            let ls = lb.iter().position(|&x| x != 0).unwrap_or(7);
+            let lsl = &lb[ls..];
+            out.push(0xb7 + lsl.len() as u8);
+            out.extend_from_slice(lsl);
+        }
+        out.extend_from_slice(val);
+        out
+    }
+
+    let mut payload = Vec::new();
+    payload.extend(rlp_encode_u64(nonce));
+    payload.extend(rlp_encode_u128(gas_price));
+    payload.extend(rlp_encode_u64(gas_limit));
+    match to {
+        Some(addr) => {
+            payload.push(0x94);
+            payload.extend_from_slice(&addr);
+        }
+        None => payload.push(0x80),
+    }
+    payload.extend(rlp_encode_u128(value));
+    payload.extend(rlp_encode_bytes(data));
+
+    // EIP-155: if v >= 35, chain_id = (v - 35) / 2, append [chainId, 0, 0]
+    if v >= 35 {
+        let chain_id = (v - 35) / 2;
+        payload.extend(rlp_encode_u64(chain_id));
+        payload.push(0x80); // 0
+        payload.push(0x80); // 0
+    }
+
+    // Wrap in RLP list
+    let len = payload.len();
+    let mut out = Vec::new();
+    if len <= 55 {
+        out.push(0xc0 + len as u8);
+    } else {
+        let lb = len.to_be_bytes();
+        let ls = lb.iter().position(|&x| x != 0).unwrap_or(7);
+        let lsl = &lb[ls..];
+        out.push(0xf7 + lsl.len() as u8);
+        out.extend_from_slice(lsl);
+    }
+    out.extend(payload);
+    out
 }
 
 /// Parse an EIP-2718 typed transaction. `raw` is `[type_byte || rlp_payload]`.
@@ -845,7 +1027,8 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
 
     match tx_type {
         0x01 => {
-            // EIP-2930: [chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, ...]
+            // EIP-2930: [chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, signatureYParity, signatureR, signatureS]
+            let fields_start = fp;
             fp = rlp_skip(payload, fp).ok()?; // chainId
             let nonce = rlp_read_u64(payload, fp).unwrap_or(0);
             fp = rlp_skip(payload, fp).ok()?;
@@ -858,6 +1041,33 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
             let value = rlp_read_u128(payload, fp).unwrap_or(0);
             fp = rlp_skip(payload, fp).ok()?;
             let data = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
+            fp = rlp_skip(payload, fp).ok()?;
+            // accessList
+            let after_access_list = rlp_skip(payload, fp).ok()?;
+            // The unsigned payload is everything up to (but not including) v, r, s
+            let unsigned_payload = &payload[..after_access_list];
+            // For typed txs, signing hash = keccak(type_byte || RLP([fields without v,r,s]))
+            let mut unsigned_rlp = vec![tx_type];
+            // Re-wrap the fields (chainId..accessList) in an RLP list
+            let fields_bytes = &payload[fields_start..after_access_list];
+            let flen = fields_bytes.len();
+            if flen <= 55 {
+                unsigned_rlp.push(0xc0 + flen as u8);
+            } else {
+                let lb = flen.to_be_bytes();
+                let ls = lb.iter().position(|&x| x != 0).unwrap_or(7);
+                let lsl = &lb[ls..];
+                unsigned_rlp.push(0xf7 + lsl.len() as u8);
+                unsigned_rlp.extend_from_slice(lsl);
+            }
+            unsigned_rlp.extend_from_slice(fields_bytes);
+            let _ = unsigned_payload; // used above
+
+            let v = rlp_read_u64(payload, after_access_list).unwrap_or(0);
+            fp = rlp_skip(payload, after_access_list).ok()?;
+            let r = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
+            fp = rlp_skip(payload, fp).ok()?;
+            let s = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
             Some(CChainRawTx {
                 tx_type: 1,
                 nonce,
@@ -866,10 +1076,15 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
                 to,
                 value,
                 data,
+                v,
+                r,
+                s,
+                unsigned_rlp,
             })
         }
         0x02 => {
-            // EIP-1559: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, ...]
+            // EIP-1559: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, signatureYParity, signatureR, signatureS]
+            let fields_start = fp;
             fp = rlp_skip(payload, fp).ok()?; // chainId
             let nonce = rlp_read_u64(payload, fp).unwrap_or(0);
             fp = rlp_skip(payload, fp).ok()?;
@@ -883,6 +1098,29 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
             let value = rlp_read_u128(payload, fp).unwrap_or(0);
             fp = rlp_skip(payload, fp).ok()?;
             let data = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
+            fp = rlp_skip(payload, fp).ok()?;
+            // accessList
+            let after_access_list = rlp_skip(payload, fp).ok()?;
+            // Build unsigned RLP: type_byte || RLP([fields without v,r,s])
+            let mut unsigned_rlp = vec![tx_type];
+            let fields_bytes = &payload[fields_start..after_access_list];
+            let flen = fields_bytes.len();
+            if flen <= 55 {
+                unsigned_rlp.push(0xc0 + flen as u8);
+            } else {
+                let lb = flen.to_be_bytes();
+                let ls = lb.iter().position(|&x| x != 0).unwrap_or(7);
+                let lsl = &lb[ls..];
+                unsigned_rlp.push(0xf7 + lsl.len() as u8);
+                unsigned_rlp.extend_from_slice(lsl);
+            }
+            unsigned_rlp.extend_from_slice(fields_bytes);
+
+            let v = rlp_read_u64(payload, after_access_list).unwrap_or(0);
+            fp = rlp_skip(payload, after_access_list).ok()?;
+            let r = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
+            fp = rlp_skip(payload, fp).ok()?;
+            let s = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
             Some(CChainRawTx {
                 tx_type: 2,
                 nonce,
@@ -891,6 +1129,10 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
                 to,
                 value,
                 data,
+                v,
+                r,
+                s,
+                unsigned_rlp,
             })
         }
         _ => None,
