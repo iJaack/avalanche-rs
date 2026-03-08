@@ -62,7 +62,7 @@ fn bench_pchain_block_parse(c: &mut Criterion) {
                 black_box(&block),
                 avalanche_rs::block::Chain::PChain,
             );
-            black_box(header);
+            let _ = black_box(header);
         })
     });
 }
@@ -76,7 +76,7 @@ fn bench_cchain_block_parse(c: &mut Criterion) {
                 black_box(&block),
                 avalanche_rs::block::Chain::CChain,
             );
-            black_box(header);
+            let _ = black_box(header);
         })
     });
 }
