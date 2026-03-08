@@ -137,6 +137,18 @@ harness = false
 name = "bloom_filter"
 harness = false
 
+[[bench]]
+name = "tls_handshake"
+harness = false
+
+[[bench]]
+name = "trie_hashing"
+harness = false
+
+[[bench]]
+name = "peer_serialization"
+harness = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

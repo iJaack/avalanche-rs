@@ -1,0 +1,86 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark Regression Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Measure compile time and binary size
+        id: compile_metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo build --release
+          end=$(date +%s)
+          compile_time=$((end - start))
+
+          if [ -f target/release/avalanche-rs ]; then
+            binary_size=$(stat -c%s target/release/avalanche-rs)
+          elif [ -f target/release/avalanche_rs ]; then
+            binary_size=$(stat -c%s target/release/avalanche_rs)
+          else
+            echo "release binary not found" >&2
+            exit 1
+          fi
+
+          echo "compile_time_s=${compile_time}" >> "$GITHUB_OUTPUT"
+          echo "binary_size_bytes=${binary_size}" >> "$GITHUB_OUTPUT"
+
+      - name: Measure test suite time
+        id: test_metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo test --all-features
+          end=$(date +%s)
+          echo "test_suite_time_s=$((end - start))" >> "$GITHUB_OUTPUT"
+
+      - name: Measure memory usage benchmark binary
+        id: memory_metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw_json=$(cargo run --release --bin bench_metrics -- --json)
+          echo "$raw_json" > /tmp/bench_metrics.json
+          rss_kb=$(python3 -c 'import json;print(json.load(open("/tmp/bench_metrics.json"))["memory_rss_kb"])')
+          echo "memory_rss_kb=${rss_kb}" >> "$GITHUB_OUTPUT"
+
+      - name: Run criterion micro-benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --bench tls_handshake --bench block_parsing --bench trie_hashing --bench bls_verify --bench peer_serialization
+
+      - name: Build current benchmark snapshot
+        shell: bash
+        run: |
+          cat > /tmp/current-bench.json <<EOF
+          {
+            "compile_time_s": ${{ steps.compile_metrics.outputs.compile_time_s }},
+            "binary_size_bytes": ${{ steps.compile_metrics.outputs.binary_size_bytes }},
+            "test_suite_time_s": ${{ steps.test_metrics.outputs.test_suite_time_s }},
+            "memory_rss_kb": ${{ steps.memory_metrics.outputs.memory_rss_kb }}
+          }
+          EOF
+
+      - name: Compare against baseline (fail on >10% regression)
+        run: |
+          python3 .github/scripts/compare_benchmarks.py benches/baseline.json /tmp/current-bench.json 10
