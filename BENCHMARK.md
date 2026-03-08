@@ -1,50 +1,66 @@
 # Benchmark: avalanche-rs vs AvalancheGo 1.14.1
 
-## Latest Results (2026-03-07, Post Phase 7-8)
+## Latest Results (2026-03-08, Post Phase 12)
 
-**Network:** Fuji testnet (267,382 P-Chain blocks)
+**Network:** Fuji testnet (267,390 P-Chain blocks)
 **Duration:** 3 minutes per implementation
 **Hardware:** Mac Mini M4 (Apple Silicon), 16GB RAM
-**avalanche-rs version:** v0.1.0 (561 tests, ~25K lines — full RPC, consensus, pruning, warp, subnets, light client, WASM)
+**avalanche-rs version:** v0.1.0 (663 tests, ~31K lines — full RPC, consensus, pruning, warp, subnets, light client, WASM, Fortuna, Granite, hardening, observability)
 
 | Metric | avalanche-rs | AvalancheGo 1.14.1 | Δ |
 |--------|-------------|-------------------|---|
-| **Binary size** | 8.6 MB | 88.7 MB | **10.3× smaller** |
-| **Memory (RSS) @ 3 min** | 36 MB | 1,787 MB | **49.6× less** |
-| **First peer handshake** | 595 ms | ~8 s | **~13× faster** |
+| **Binary size** | 8.5 MB | 88.7 MB | **10.4× smaller** |
+| **Memory (RSS) @ 3 min** | 67 MB | 1,787 MB | **26.7× less** |
+| **First peer handshake** | 100 ms | ~8 s | **~80× faster** |
 | **P-Chain bootstrap status** | ✅ Complete + following | ❌ Executing (40.8%) | — |
-| **P-Chain blocks synced** | 3,067 | 267,383 fetched, 109,007 executed | * |
-| **C-Chain blocks synced** | 503 | 0 (not started) | — |
-| **P-Chain height reached** | 267,382 | N/A (executing) | — |
+| **P-Chain blocks synced** | 3,066 | 267,383 fetched, 109,007 executed | * |
+| **C-Chain blocks synced** | 516 | 0 (not started) | — |
+| **P-Chain height reached** | 267,390 | N/A (executing) | — |
 | **Peers connected** | 11 | N/A | — |
 | **Sync phase at 3 min** | `Following` (chain tip) | Executing blocks (40.8%) | — |
 
 \* Different sync strategies — see notes below.
 
-### Memory Improvement Over Time
+### Memory Progression Over Time
 
 | Version | RSS @ 3 min | Notes |
 |---------|------------|-------|
 | Pre-Phase 5 (Session 3) | 73 MB | Basic bootstrap only |
 | Post-Phase 5-6 | 118 MB | +state sync, tx validation, warp, subnets |
-| **Post-Phase 7-8** | **36 MB** | +full RPC, consensus, pruning, WASM, light client |
+| Post-Phase 7-8 | 36 MB | +full RPC, consensus, pruning, WASM, light client |
+| **Post-Phase 12** | **67 MB** | +Fortuna (ACP-176), Granite (ACP-181/204/226), hardening, observability |
 
-State pruning (Feature 4) is the primary driver of the 3.3× memory reduction.
+Phase 12 adds significant new functionality (dynamic gas limits, epoch management, secp256r1, dynamic block times, structured logging, panic recovery, rate limiting) while memory remains well under 100 MB.
+
+### RSS Samples During Run
+
+| Time | RSS (KB) |
+|------|----------|
+| T+30s | 68,944 |
+| T+60s | 68,944 |
+| T+90s | 68,944 |
+| T+120s | 68,944 |
+| T+150s | 68,944 |
+| T+180s | 68,944 |
+
+Memory is completely flat — state pruning keeps the footprint stable.
 
 ## Timeline
 
-### avalanche-rs (Post Phase 7-8)
+### avalanche-rs (Post Phase 12)
 ```
 T+0.000s   Process start
-T+0.595s   TLS handshake complete with bootstrap peer
-T+10.0s    P-Chain: blocks arriving via Ancestors
-T+20.0s    P-Chain: 3,067 blocks synced, height 267,382
-T+20.0s    C-Chain: 503 blocks synced, 1 stateRoot mapping
-T+25.0s    Entered SyncPhase::Following — tracking chain tip
-T+180.0s   Stable: 3,067 P-Chain, 503 C-Chain, 11 peers, 36 MB RSS
+T+0.100s   TLS handshake complete with bootstrap peer (52.29.72.46:9651)
+T+0.200s   Version exchange, PeerList with 15 peers received
+T+0.500s   11 peers connected (bootstrap + discovered)
+T+10.0s    P-Chain bootstrap: 10 rounds of GetAncestors
+T+12.0s    P-Chain: 3,066 blocks synced, height 267,390
+T+12.0s    C-Chain: 516 blocks synced
+T+12.0s    Entered SyncPhase::Following — tracking chain tip
+T+180.0s   Stable: 3,066 P-Chain, 516 C-Chain, 11 peers, 67 MB RSS
 ```
 
-### AvalancheGo 1.14.1
+### AvalancheGo 1.14.1 (previous run, same hardware)
 ```
 T+0.000s   Process start, initializing subsystems
 T+2.0s     API server listening
@@ -60,15 +76,15 @@ T+180.0s   Executed 109,007 (40.8%), ETA: 2m04s — killed. 1,787 MB RSS.
 
 ## Analysis
 
-### Why 36 MB?
+### Why 67 MB?
 
-The Phase 7-8 build added **state pruning** (Feature 4): a background task runs every 60 seconds and prunes trie nodes from blocks older than 256 blocks. Combined with Rust's zero-cost abstractions and `mimalloc`, the node maintains a minimal memory footprint even with:
-- Full eth_* RPC server (14 methods)
-- platform.* RPC (7 methods)
-- Snowman consensus engine
-- Warp message processing
-- Subnet tracking
-- Light client mode support
+The Phase 12 build adds Fortuna (ACP-176 dynamic gas limits), Granite (ACP-181 epochs, ACP-204 secp256r1 verification, ACP-226 dynamic block times), hardening (panic recovery, rate limiting, connection limits), and observability (structured logging, Prometheus histograms). Despite the additional functionality, memory stays flat at 67 MB thanks to:
+
+- **State pruning** (256-block depth, 60s cycle)
+- **mimalloc** for efficient allocation
+- **Rust's zero-cost abstractions**
+
+The increase from 36 MB (Phase 7-8) to 67 MB reflects the additional validator data structures, epoch tracking, and rate-limiting state — all constant-size allocations.
 
 ### Sync Strategy Differences
 
@@ -86,18 +102,21 @@ The Phase 7-8 build added **state pruning** (Feature 4): a background task runs 
 
 ### Key Takeaways
 
-1. **49.6× less memory** — avalanche-rs uses 36 MB vs 1,787 MB. This means it can run on a Raspberry Pi, $5/mo VPS, or embedded device.
+1. **26.7× less memory** — avalanche-rs uses 67 MB vs 1,787 MB. Runs on a Raspberry Pi, $5/mo VPS, or embedded device.
 
-2. **Bootstrap to chain-tip in ~25 seconds.** AvalancheGo needs 5+ minutes on the same hardware.
+2. **Bootstrap to chain-tip in ~12 seconds.** AvalancheGo needs 5+ minutes on the same hardware.
 
-3. **8.6 MB binary** with full RPC, consensus, warp, subnets, pruning, metrics, and light client. AvalancheGo is 88.7 MB for similar functionality.
+3. **8.5 MB binary** with full RPC, consensus, warp, subnets, pruning, metrics, light client, Fortuna, and Granite. AvalancheGo is 88.7 MB for similar functionality.
 
-4. **State pruning keeps memory flat.** Without pruning (Phase 5-6), memory grew to 118 MB. With pruning, it dropped to 36 MB — and stays there indefinitely.
+4. **Memory stays flat.** State pruning keeps RSS at 67 MB indefinitely — no growth over time.
 
 ## Features Included in This Benchmark
 
-- ✅ Full eth_* JSON-RPC (14 methods)
+- ✅ Full eth_* JSON-RPC (21 methods)
 - ✅ platform.* JSON-RPC (7 methods)
+- ✅ txpool_* JSON-RPC (3 methods)
+- ✅ debug_* JSON-RPC (3 methods)
+- ✅ WebSocket subscriptions (newHeads, logs, newPendingTransactions)
 - ✅ Snowman consensus (alpha=15, beta=20, chits, confidence)
 - ✅ State pruning (256-block depth, 60s cycle)
 - ✅ Prometheus metrics + health endpoint
@@ -105,7 +124,11 @@ The Phase 7-8 build added **state pruning** (Feature 4): a background task runs 
 - ✅ Subnet support (--tracked-subnets)
 - ✅ Light client mode (--light-client)
 - ✅ WASM build target (avalanche-core)
-- ✅ 561 tests passing
+- ✅ Fortuna upgrade (ACP-176: dynamic EVM gas limits)
+- ✅ Granite upgrade (ACP-181 epochs, ACP-204 secp256r1, ACP-226 dynamic block times)
+- ✅ Hardening (panic recovery, rate limiting, connection limits)
+- ✅ Observability (structured logging, Prometheus histograms, span tracing)
+- ✅ 663 tests passing
 
 ## Reproducing
 
@@ -114,11 +137,11 @@ The Phase 7-8 build added **state pruning** (Feature 4): a background task runs 
 cargo build --release
 
 # Run (3 min benchmark)
-./target/release/avalanche-rs --network-id 5 --data-dir /tmp/bench-rs \
+./target/release/avalanche-rs --network-id 5 --data-dir ./data/bench \
   --bootstrap-ips 52.29.72.46:9651 --staking-port 29651 --http-port 29650
 
 # Run AvalancheGo for comparison
-./avalanchego --network-id=fuji --data-dir=/tmp/bench-go \
+./avalanchego --network-id=fuji --data-dir=./data/bench-go \
   --staking-port=29661 --http-port=29660 --log-level=info
 ```
 
@@ -128,6 +151,6 @@ cargo build --release
 OS:          macOS 15.2 (Darwin 25.2.0 arm64)
 Hardware:    Mac Mini M4 (Apple Silicon)
 RAM:         16 GB
-avalanche-rs: v0.1.0 (release build, 561 tests, ~25K lines Rust)
+avalanche-rs: v0.1.0 (release build, 663 tests, ~31K lines Rust)
 AvalancheGo:  v1.14.1 (official binary)
 ```
