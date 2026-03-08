@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use bs58;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use avalanche_rs::archive::ArchiveStore;
@@ -28,9 +29,11 @@ use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
 use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction};
 use avalanche_rs::identity::{self, NodeIdentity};
+use avalanche_rs::hardening::get_rss_bytes;
 use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
 use avalanche_rs::network::{
     BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, Peer, PeerInfo, PeerManager, PeerState,
+    PersistentPeerRecord,
 };
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
 use avalanche_rs::subnet::{SubnetId, SubnetTracker};
@@ -143,6 +146,10 @@ struct Cli {
     /// Maximum number of rotated log files to keep (default 10).
     #[arg(long, default_value = "10", env = "AVAX_LOG_MAX_FILES")]
     log_max_files: u32,
+
+    /// Max concurrent startup dials and steady outbound pool target.
+    #[arg(long, default_value = "8", env = "AVAX_CONNECTION_POOL_SIZE")]
+    connection_pool_size: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +255,17 @@ struct ChainMetrics {
     pub tip_height: u64,
     pub chain_length: u64,
     pub last_sync_time: Instant,
+}
+
+const META_SYNC_STATE: &[u8] = b"sync_state";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedSyncState {
+    current_block_height: u64,
+    p_chain_tip_height: u64,
+    c_chain_tip_height: u64,
+    bootstrap_state: String,
+    bootstrap_complete: bool,
 }
 
 impl Default for ChainMetrics {
@@ -477,6 +495,57 @@ struct NodeState {
     archive_store: Arc<ArchiveStore>,
     /// Subnet/L1 tracker for observed chains and validators.
     subnet_tracker: Arc<RwLock<SubnetTracker>>,
+    /// Last sync state loaded from disk and refreshed on shutdown.
+    persisted_sync_state: Arc<RwLock<Option<PersistedSyncState>>>,
+}
+
+fn load_persisted_sync_state(db: &Database) -> Option<PersistedSyncState> {
+    db.get_metadata(META_SYNC_STATE)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+async fn persist_sync_state(node: &NodeState) {
+    let current_block_height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+    let p_tip = node.p_chain_metrics.read().await.tip_height;
+    let c_tip = node.c_chain_metrics.read().await.tip_height;
+    let phase = node.sync_engine.phase().await;
+    let bootstrap_complete = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
+
+    let state = PersistedSyncState {
+        current_block_height,
+        p_chain_tip_height: p_tip,
+        c_chain_tip_height: c_tip,
+        bootstrap_state: phase.to_string(),
+        bootstrap_complete,
+    };
+
+    match serde_json::to_vec(&state) {
+        Ok(encoded) => {
+            if let Err(e) = node.db.put_metadata(META_SYNC_STATE, &encoded) {
+                warn!("Failed to persist sync state: {}", e);
+            } else {
+                *node.persisted_sync_state.write().await = Some(state);
+            }
+        }
+        Err(e) => warn!("Failed to encode sync state: {}", e),
+    }
+}
+
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        if let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            tokio::select! {
+                _ = signal::ctrl_c() => return "SIGINT",
+                _ = sigterm.recv() => return "SIGTERM",
+            }
+        }
+    }
+
+    let _ = signal::ctrl_c().await;
+    "SIGINT"
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +608,18 @@ async fn main() {
         "Database opened at {:?}, last accepted height: {}",
         db_path, last_height
     );
+
+    let persisted_sync_state = load_persisted_sync_state(&db);
+    if let Some(state) = &persisted_sync_state {
+        info!(
+            "Loaded persisted sync state: height={}, p_tip={}, c_tip={}, bootstrap={} ({})",
+            state.current_block_height,
+            state.p_chain_tip_height,
+            state.c_chain_tip_height,
+            state.bootstrap_complete,
+            state.bootstrap_state
+        );
+    }
 
     // Phase 8: verify block chain integrity on startup
     let (ok, bad) = integrity_check_pchain(&db);
@@ -676,7 +757,22 @@ async fn main() {
         light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
         archive_store,
         subnet_tracker,
+        persisted_sync_state: Arc::new(RwLock::new(persisted_sync_state.clone())),
     });
+
+    if let Some(state) = persisted_sync_state {
+        {
+            let mut p = node.p_chain_metrics.write().await;
+            p.tip_height = state.p_chain_tip_height;
+        }
+        {
+            let mut c = node.c_chain_metrics.write().await;
+            c.tip_height = state.c_chain_tip_height;
+        }
+        if state.bootstrap_complete {
+            info!("Resuming from persisted state; skipping full bootstrap replay");
+        }
+    }
 
     // Log light client mode
     if node.config.light_client {
@@ -783,14 +879,10 @@ async fn main() {
     );
 
     // 10. Graceful shutdown
-    match signal::ctrl_c().await {
-        Ok(_) => {
-            info!("Received SIGINT, shutting down gracefully...");
-        }
-        Err(e) => {
-            error!("Failed to listen for SIGINT: {}", e);
-        }
-    }
+    let sig = wait_for_shutdown_signal().await;
+    info!("Received {}, shutting down gracefully...", sig);
+
+    persist_sync_state(&node).await;
 
     let uptime = node.start_time.elapsed();
     info!("Shutting down after {:.1}s uptime", uptime.as_secs_f64());
@@ -907,9 +999,12 @@ async fn handle_inbound_connection(
 
     // Register peer
     let mut pm = node.peer_manager.write().await;
-    let mut peer = Peer::new(peer_node_id, peer_addr);
+    let mut peer = Peer::new(peer_node_id.clone(), peer_addr);
     peer.state = PeerState::Connected;
-    let _ = pm.add_peer(peer);
+    let reputation = peer.reputation;
+    if pm.add_peer(peer).is_ok() {
+        persist_connected_peer(&node, &peer_node_id, peer_addr, reputation, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -933,27 +1028,113 @@ async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
         node.config.bootstrap_ips.clone()
     };
 
-    if bootstrap_ips.is_empty() {
-        warn!("No bootstrap nodes configured, running in standalone mode");
-        return;
-    }
-
-    info!("Connecting to {} bootstrap nodes...", bootstrap_ips.len());
-
+    let mut startup_targets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for ip_str in &bootstrap_ips {
         match ip_str.parse::<SocketAddr>() {
             Ok(addr) => {
-                let node = node.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = connect_and_handshake(addr, node).await {
-                        warn!("Bootstrap {} failed: {}", addr, e);
-                    }
-                });
+                if seen.insert(addr) {
+                    startup_targets.push(StartupPeerTarget {
+                        addr,
+                        score: 0,
+                    });
+                }
             }
             Err(e) => {
                 warn!("Invalid bootstrap address '{}': {}", ip_str, e);
             }
         }
+    }
+
+    for target in load_persistent_peer_targets(&node.db, 256) {
+        if seen.insert(target.addr) {
+            startup_targets.push(target);
+        }
+    }
+
+    if startup_targets.is_empty() {
+        warn!("No startup peers available, running in standalone mode");
+        return;
+    }
+
+    startup_targets.sort_by(|a, b| b.score.cmp(&a.score));
+    let pool_size = node.config.connection_pool_size.max(1);
+    startup_targets.truncate(pool_size);
+
+    info!(
+        "Connecting to {} startup peers (pool_size={})",
+        startup_targets.len(),
+        pool_size
+    );
+
+    for target in startup_targets {
+        let addr = target.addr;
+        let node = node.clone();
+        tokio::spawn(async move {
+            if let Err(e) = connect_and_handshake(addr, node).await {
+                warn!("Startup peer {} failed: {}", addr, e);
+            }
+        });
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StartupPeerTarget {
+    addr: SocketAddr,
+    score: i64,
+}
+
+fn load_persistent_peer_targets(db: &Database, limit: usize) -> Vec<StartupPeerTarget> {
+    let mut records: Vec<_> = db
+        .load_all_peers()
+        .into_iter()
+        .filter_map(|(_key, value)| PersistentPeerRecord::decode(&value))
+        .collect();
+
+    records.sort_by(|a, b| {
+        peer_score(b).cmp(&peer_score(a))
+    });
+
+    records
+        .into_iter()
+        .take(limit)
+        .filter_map(|record| {
+            record.socket_addr().map(|addr| StartupPeerTarget {
+                addr,
+                score: peer_score(&record),
+            })
+        })
+        .collect()
+}
+
+fn persist_connected_peer(
+    node: &NodeState,
+    node_id: &NodeId,
+    addr: SocketAddr,
+    reputation: i32,
+    latency_ms: u64,
+) {
+    let mut record = PersistentPeerRecord::new(node_id.0, socket_addr_to_ip_bytes(addr), addr.port());
+    record.update_seen(reputation);
+    record.latency_ms = latency_ms;
+    if let Err(e) = node.db.put_peer(&node_id.0, &record.encode()) {
+        debug!("Failed to persist peer {}: {}", node_id, e);
+    }
+}
+
+fn peer_score(record: &PersistentPeerRecord) -> i64 {
+    let latency_component = (record.latency_ms as i64 / 10).min(10_000);
+    (record.reputation as i64 * 10) + record.reliability_score as i64 - latency_component
+}
+
+fn latency_to_reputation(latency_ms: u64) -> i32 {
+    (1000_i32 - (latency_ms.min(1000) as i32)).max(0)
+}
+
+fn socket_addr_to_ip_bytes(addr: SocketAddr) -> Vec<u8> {
+    match addr.ip() {
+        std::net::IpAddr::V4(ipv4) => ipv4.octets().to_vec(),
+        std::net::IpAddr::V6(ipv6) => ipv6.octets().to_vec(),
     }
 }
 
@@ -1056,6 +1237,7 @@ async fn connect_and_handshake(
     node: Arc<NodeState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Connecting to bootstrap node {}", addr);
+    let dial_started = Instant::now();
 
     // 1. TCP connect with timeout
     let tcp_stream = tokio::time::timeout(
@@ -1305,11 +1487,20 @@ async fn connect_and_handshake(
     // 5. Register peer
     let mut pm = node.peer_manager.write().await;
     let mut peer = Peer::new(peer_node_id.clone(), addr);
+    let handshake_latency_ms = dial_started.elapsed().as_millis() as u64;
+    peer.reputation = latency_to_reputation(handshake_latency_ms);
     peer.state = PeerState::Connected;
     peer.version = Some("unknown".to_string());
     peer.is_validator = false;
     if let Ok(()) = pm.add_peer(peer) {
         info!("Peer {} registered (NodeID: {})", addr, peer_node_id);
+        persist_connected_peer(
+            &node,
+            &peer_node_id,
+            addr,
+            latency_to_reputation(handshake_latency_ms),
+            handshake_latency_ms,
+        );
     }
 
     // 6. Keep connection alive — read messages in a loop
@@ -1322,16 +1513,32 @@ async fn connect_and_handshake(
     let mut last_ping_sent: Option<Instant> = None;
     let mut pong_received_since_last_ping = true; // start true so first ping isn't rejected
 
+    let resume_bootstrap = node
+        .persisted_sync_state
+        .read()
+        .await
+        .as_ref()
+        .map(|s| s.bootstrap_complete)
+        .unwrap_or(false);
+
     // Bootstrap state machine: send GetAcceptedFrontier after 10s delay
     let bootstrap_request_base: u32 = rand::thread_rng().gen::<u16>() as u32 * 10;
-    let mut bootstrap_state = BootstrapState::Idle;
+    let mut bootstrap_state = if resume_bootstrap {
+        BootstrapState::Done
+    } else {
+        BootstrapState::Idle
+    };
     let mut bootstrap_timer = Box::pin(tokio::time::sleep(Duration::from_secs(10)));
-    let mut bootstrap_timer_fired = false;
+    let mut bootstrap_timer_fired = resume_bootstrap;
     let mut p_chain_tip: Option<[u8; 32]> = None;
     let mut p_chain_ancestors_target: Option<[u8; 32]> = None; // block ID sent in GetAncestors
 
     // C-Chain bootstrap state
-    let mut cchain_bootstrap_state = CChainBootstrapState::Idle;
+    let mut cchain_bootstrap_state = if resume_bootstrap {
+        CChainBootstrapState::Done
+    } else {
+        CChainBootstrapState::Idle
+    };
     let mut cchain_frontier: Option<[u8; 32]> = None;
     let mut cchain_ancestors_target: Option<[u8; 32]> = None;
 
@@ -2754,30 +2961,95 @@ async fn handle_rpc_connection(
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; 131072];
     let n = match stream.read(&mut buf).await {
         Ok(n) if n > 0 => n,
         _ => return,
     };
 
-    // Simple HTTP JSON-RPC handler
-    let body = String::from_utf8_lossy(&buf[..n]);
-    let json_start = body.find('{');
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let mut lines = req.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
 
-    let response_body = if let Some(start) = json_start {
-        let json_str = &body[start..];
-        handle_rpc_request(json_str, &node).await
-    } else {
-        r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"parse error"},"id":null}"#.to_string()
+    let (content_type, response_body) = match path {
+        "/health" => {
+            let peers = node.peer_manager.read().await.connected_count();
+            let phase = node.sync_engine.phase().await.to_string();
+            let uptime_seconds = node.start_time.elapsed().as_secs();
+            let memory_rss_bytes = get_rss_bytes();
+            (
+                "application/json",
+                serde_json::json!({
+                    "healthy": peers > 0,
+                    "connected_peers": peers,
+                    "sync_state": phase,
+                    "memory_rss_bytes": memory_rss_bytes,
+                    "uptime_seconds": uptime_seconds,
+                })
+                .to_string(),
+            )
+        }
+        "/metrics" => ("text/plain; version=0.0.4", render_prometheus_metrics(&node).await),
+        _ => {
+            let body = req
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b)
+                .unwrap_or_default();
+            ("application/json", handle_rpc_request(body, &node).await)
+        }
     };
 
     let http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        content_type,
         response_body.len(),
         response_body
     );
 
     let _ = stream.write_all(http_response.as_bytes()).await;
+}
+
+async fn render_prometheus_metrics(node: &NodeState) -> String {
+    let phase = node.sync_engine.phase().await;
+    let sync_stats = node.sync_engine.stats().await;
+    let peer_count = node.peer_manager.read().await.connected_count() as u64;
+    let p_height = node.p_chain_metrics.read().await.tip_height;
+    let c_height = node.c_chain_metrics.read().await.tip_height;
+    let memory = get_rss_bytes();
+    let uptime = node.start_time.elapsed().as_secs();
+    let handshake_latency = average_handshake_latency_ms(&node.db);
+
+    format!(
+        "sync_progress {}\npeer_count {}\nblock_height_p_chain {}\nblock_height_c_chain {}\nmemory_rss_bytes {}\nuptime_seconds {}\nhandshake_latency_ms {}\n",
+        if matches!(phase, SyncPhase::Following | SyncPhase::Synced) {
+            1.0
+        } else {
+            sync_stats.progress_pct() / 100.0
+        },
+        peer_count,
+        p_height,
+        c_height,
+        memory,
+        uptime,
+        handshake_latency
+    )
+}
+
+fn average_handshake_latency_ms(db: &Database) -> u64 {
+    let mut latencies = Vec::new();
+    for (_, value) in db.load_all_peers() {
+        if let Some(record) = PersistentPeerRecord::decode(&value) {
+            if record.latency_ms > 0 {
+                latencies.push(record.latency_ms);
+            }
+        }
+    }
+    if latencies.is_empty() {
+        0
+    } else {
+        latencies.iter().sum::<u64>() / latencies.len() as u64
+    }
 }
 
 /// Parse a hex string (with or without 0x prefix) to bytes.
@@ -3304,7 +3576,45 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         }
 
         "platform.getSubnets" => {
-            rpc_ok("{\"subnets\":[{\"id\":\"11111111111111111111111111111111LpoYY\",\"controlKeys\":[],\"threshold\":\"0\"}]}", id)
+            let tracker = node.subnet_tracker.read().await;
+            let subnets: Vec<String> = tracker
+                .tracked_subnets()
+                .into_iter()
+                .map(|sid| format!("{{\"id\":\"{}\"}}", sid))
+                .collect();
+            rpc_ok(&format!("{{\"subnets\":[{}]}}", subnets.join(",")), id)
+        }
+
+        "platform.getBlockchainStatus" => {
+            let peers = node.peer_manager.read().await.connected_count();
+            let stats = node.sync_engine.stats().await;
+            let p_tip = node.p_chain_metrics.read().await.tip_height;
+            let c_tip = node.c_chain_metrics.read().await.tip_height;
+            let progress = stats.progress_pct();
+            rpc_ok(
+                &format!(
+                    "{{\"syncProgress\":{},\"blockHeight\":{},\"peerCount\":{},\"pChainHeight\":{},\"cChainHeight\":{}}}",
+                    progress,
+                    p_tip.max(c_tip),
+                    peers,
+                    p_tip,
+                    c_tip
+                ),
+                id,
+            )
+        }
+
+        "health" => {
+            let peers = node.peer_manager.read().await.connected_count();
+            let sync_state = node.sync_engine.phase().await.to_string();
+            let memory_rss = get_rss_bytes();
+            rpc_ok(
+                &format!(
+                    "{{\"connectedPeers\":{},\"syncState\":\"{}\",\"memoryRssBytes\":{}}}",
+                    peers, sync_state, memory_rss
+                ),
+                id,
+            )
         }
 
         "platform.getStake" => {
@@ -3755,6 +4065,74 @@ mod integration_tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    fn make_test_node(network_id: u32) -> Arc<NodeState> {
+        let identity = NodeIdentity::generate().expect("generate node identity");
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        let evm = Arc::new(RwLock::new(EvmExecutor::new(43114)));
+
+        let net_config = NetworkConfig {
+            network_id,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(RwLock::new(PeerManager::new(
+            net_config,
+            identity.node_id.clone(),
+        )));
+
+        let mut chain_id_bytes = [0u8; 32];
+        chain_id_bytes[31] = if network_id == 1 { 0x01 } else { 0x05 };
+        let sync_engine = Arc::new(SyncEngine::new(SyncConfig {
+            chain_id: ChainId(chain_id_bytes),
+            ..Default::default()
+        }));
+
+        Arc::new(NodeState {
+            identity,
+            db,
+            evm,
+            sync_engine,
+            peer_manager,
+            config: Cli {
+                network_id,
+                data_dir: PathBuf::from("./data/test-rpc"),
+                bootstrap_ips: vec![],
+                tracked_subnets: "".to_string(),
+                subnet_id: None,
+                staking_tls_cert_file: None,
+                staking_tls_key_file: None,
+                http_port: 0,
+                staking_port: 9651,
+                log_level: "info".to_string(),
+                log_format: "pretty".to_string(),
+                chain_id: 43114,
+                validator: false,
+                state_pruning_depth: 256,
+                light_client: false,
+                archive: false,
+                blob_retention_epochs: 4096,
+                txpool_size: 4096,
+                block_cache_size: 1024,
+                rpc_max_body_size: 5_242_880,
+                max_memory_mb: 0,
+                log_max_size: 100,
+                log_max_files: 10,
+                connection_pool_size: 8,
+            },
+            start_time: Instant::now(),
+            validators: std::collections::HashMap::new(),
+            validators_seen: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            total_stake_weight: Arc::new(RwLock::new(0u64)),
+            p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
+            pending_txs: Arc::new(RwLock::new(Vec::new())),
+            light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
+            archive_store: Arc::new(ArchiveStore::new(false)),
+            subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
+            persisted_sync_state: Arc::new(RwLock::new(None)),
+        })
+    }
+
     fn make_banff_std(parent: [u8; 32], height: u64) -> Vec<u8> {
         let mut raw = vec![0u8; 54];
         raw[2..6].copy_from_slice(&32u32.to_be_bytes());
@@ -3768,6 +4146,93 @@ mod integration_tests {
         let mut h = Sha256::new();
         h.update(data);
         h.finalize().into()
+    }
+
+    #[test]
+    fn test_load_persistent_peer_targets_sorted() {
+        let (db, _dir) = Database::open_temp().unwrap();
+
+        let mut a = PersistentPeerRecord::new([0xA1; 20], vec![10, 0, 0, 1], 9651);
+        a.reputation = 10;
+        a.last_seen_ms = 10;
+        db.put_peer(&a.node_id, &a.encode()).unwrap();
+
+        let mut b = PersistentPeerRecord::new([0xB2; 20], vec![10, 0, 0, 2], 9651);
+        b.reputation = 100;
+        b.last_seen_ms = 20;
+        db.put_peer(&b.node_id, &b.encode()).unwrap();
+
+        let mut c = PersistentPeerRecord::new([0xC3; 20], vec![10, 0, 0, 3], 9651);
+        c.reputation = 100;
+        c.last_seen_ms = 30;
+        db.put_peer(&c.node_id, &c.encode()).unwrap();
+
+        let loaded = load_persistent_peer_targets(&db, 2);
+        assert_eq!(loaded.len(), 2);
+        let addrs: std::collections::HashSet<SocketAddr> = loaded.into_iter().map(|t| t.addr).collect();
+        assert!(addrs.contains(&"10.0.0.3:9651".parse::<SocketAddr>().unwrap()));
+        assert!(addrs.contains(&"10.0.0.2:9651".parse::<SocketAddr>().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_persisted_sync_state_roundtrip() {
+        let (db, _dir) = Database::open_temp().unwrap();
+
+        let state = PersistedSyncState {
+            current_block_height: 42,
+            p_chain_tip_height: 40,
+            c_chain_tip_height: 41,
+            bootstrap_state: "following".to_string(),
+            bootstrap_complete: true,
+        };
+        db.put_metadata(META_SYNC_STATE, &serde_json::to_vec(&state).unwrap())
+            .unwrap();
+
+        let loaded = load_persisted_sync_state(&db).unwrap();
+        assert_eq!(loaded.current_block_height, 42);
+        assert!(loaded.bootstrap_complete);
+    }
+
+    #[test]
+    fn test_latency_to_reputation_prefers_low_latency() {
+        assert!(latency_to_reputation(20) > latency_to_reputation(400));
+        assert_eq!(latency_to_reputation(2000), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rpc_platform_endpoints() {
+        let node = make_test_node(1);
+
+        let validators_req = r#"{"jsonrpc":"2.0","method":"platform.getCurrentValidators","params":[],"id":1}"#;
+        let validators = handle_rpc_request(validators_req, &node).await;
+        assert!(validators.contains("validators"));
+
+        let subnets_req = r#"{"jsonrpc":"2.0","method":"platform.getSubnets","params":[],"id":2}"#;
+        let subnets = handle_rpc_request(subnets_req, &node).await;
+        assert!(subnets.contains("subnets"));
+
+        let status_req = r#"{"jsonrpc":"2.0","method":"platform.getBlockchainStatus","params":[],"id":3}"#;
+        let status = handle_rpc_request(status_req, &node).await;
+        assert!(status.contains("syncProgress"));
+        assert!(status.contains("peerCount"));
+
+        let health_req = r#"{"jsonrpc":"2.0","method":"health","params":[],"id":4}"#;
+        let health = handle_rpc_request(health_req, &node).await;
+        assert!(health.contains("connectedPeers"));
+        assert!(health.contains("memoryRssBytes"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_metrics_render_contains_required_series() {
+        let node = make_test_node(1);
+        let metrics = render_prometheus_metrics(&node).await;
+        assert!(metrics.contains("sync_progress"));
+        assert!(metrics.contains("peer_count"));
+        assert!(metrics.contains("block_height_p_chain"));
+        assert!(metrics.contains("block_height_c_chain"));
+        assert!(metrics.contains("memory_rss_bytes"));
+        assert!(metrics.contains("uptime_seconds"));
+        assert!(metrics.contains("handshake_latency_ms"));
     }
 
     #[tokio::test]
@@ -3825,6 +4290,7 @@ mod integration_tests {
                 max_memory_mb: 0,
                 log_max_size: 100,
                 log_max_files: 10,
+                connection_pool_size: 8,
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
@@ -3837,6 +4303,7 @@ mod integration_tests {
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
+            persisted_sync_state: Arc::new(RwLock::new(None)),
         });
 
         let mut handshake_complete = false;
@@ -3958,6 +4425,7 @@ mod integration_tests {
                 max_memory_mb: 0,
                 log_max_size: 100,
                 log_max_files: 10,
+                connection_pool_size: 8,
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
@@ -3970,6 +4438,7 @@ mod integration_tests {
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
+            persisted_sync_state: Arc::new(RwLock::new(None)),
         });
 
         let mut fetched_cchain_block = false;

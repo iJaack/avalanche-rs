@@ -1845,6 +1845,9 @@ pub struct PersistentPeerRecord {
     pub last_connected_ms: u64,
     /// Last time we saw this peer in gossip (Unix millis)
     pub last_seen_ms: u64,
+    /// Peer reputation score from live peer manager
+    #[serde(default)]
+    pub reputation: i32,
 }
 
 impl PersistentPeerRecord {
@@ -1863,6 +1866,7 @@ impl PersistentPeerRecord {
             failure_count: 0,
             last_connected_ms: 0,
             last_seen_ms: now_ms,
+            reputation: 0,
         }
     }
 
@@ -1886,6 +1890,15 @@ impl PersistentPeerRecord {
     pub fn record_failure(&mut self) {
         self.failure_count += 1;
         self.reliability_score = self.reliability_score.saturating_sub(100);
+    }
+
+    /// Update peer liveness and reputation from current runtime observations.
+    pub fn update_seen(&mut self, reputation: i32) {
+        self.last_seen_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.reputation = reputation;
     }
 
     /// Whether this peer should be evicted (too many failures, score too low).
@@ -3291,6 +3304,23 @@ mod tests {
         let record = PersistentPeerRecord::new([0xFF; 20], vec![192, 168, 1, 100], 9651);
         let addr = record.socket_addr().unwrap();
         assert_eq!(addr.port(), 9651);
+    }
+
+    #[test]
+    fn test_persistent_peer_record_update_seen_sets_reputation() {
+        let mut record = PersistentPeerRecord::new([0xAB; 20], vec![192, 168, 1, 7], 9651);
+        let before = record.last_seen_ms;
+        record.update_seen(77);
+        assert_eq!(record.reputation, 77);
+        assert!(record.last_seen_ms >= before);
+    }
+
+    #[test]
+    fn test_persistent_peer_record_decode_backward_compatible() {
+        let legacy = r#"{"node_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"ip_bytes":[127,0,0,1],"port":9651,"latency_ms":12,"reliability_score":600,"success_count":4,"failure_count":1,"last_connected_ms":10,"last_seen_ms":11}"#;
+        let decoded = PersistentPeerRecord::decode(legacy.as_bytes()).unwrap();
+        assert_eq!(decoded.reputation, 0);
+        assert_eq!(decoded.reliability_score, 600);
     }
 
     #[test]
