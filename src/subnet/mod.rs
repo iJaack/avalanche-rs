@@ -38,6 +38,21 @@ impl SubnetId {
         Some(Self(arr))
     }
 
+    /// Parse from either a 64-char hex string or CB58 subnet ID.
+    pub fn from_str_any(value: &str) -> Option<Self> {
+        if let Some(id) = Self::from_hex(value) {
+            return Some(id);
+        }
+
+        let decoded = bs58::decode(value).into_vec().ok()?;
+        if decoded.len() < 36 {
+            return None;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&decoded[..32]);
+        Some(Self(arr))
+    }
+
     /// Convert to hex string.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
@@ -84,6 +99,13 @@ pub struct ChainSyncState {
     pub target_height: u64,
     /// Connected peers tracking this chain
     pub peers: Vec<NodeId>,
+}
+
+/// Validator snapshot for a tracked subnet.
+#[derive(Debug, Clone)]
+pub struct SubnetValidators {
+    pub subnet_id: SubnetId,
+    pub validators: ValidatorSet,
 }
 
 impl ChainSyncState {
@@ -146,7 +168,7 @@ impl SubnetTracker {
         }
         cli_arg
             .split(',')
-            .filter_map(|s| SubnetId::from_hex(s.trim()))
+            .filter_map(|s| SubnetId::from_str_any(s.trim()))
             .collect()
     }
 
@@ -174,6 +196,23 @@ impl SubnetTracker {
         } else {
             false
         }
+    }
+
+    /// Observe an Avalanche L1/subnet chain with custom identifiers.
+    pub fn observe_l1_chain(
+        &mut self,
+        subnet_id: SubnetId,
+        chain_id: ChainId,
+        name: impl Into<String>,
+        vm_type: impl Into<String>,
+    ) {
+        self.add_subnet(subnet_id.clone());
+        let _ = self.add_chain(ChainConfig {
+            chain_id,
+            subnet_id,
+            name: name.into(),
+            vm_type: vm_type.into(),
+        });
     }
 
     /// Remove a chain from tracking.
@@ -234,6 +273,53 @@ impl SubnetTracker {
         self.subnets.get_mut(subnet_id).map(|s| &mut s.validators)
     }
 
+    /// Replace validator set for a subnet.
+    pub fn set_subnet_validators(&mut self, subnet_id: &SubnetId, validators: ValidatorSet) {
+        if let Some(subnet) = self.subnets.get_mut(subnet_id) {
+            subnet.validators = validators;
+        }
+    }
+
+    /// Get a typed validator snapshot for a subnet.
+    pub fn subnet_validators_snapshot(&self, subnet_id: &SubnetId) -> Option<SubnetValidators> {
+        self.subnets.get(subnet_id).map(|s| SubnetValidators {
+            subnet_id: s.id.clone(),
+            validators: s.validators.clone(),
+        })
+    }
+
+    /// Query P-Chain validators for a subnet and update tracker state.
+    #[cfg(feature = "rpc")]
+    pub async fn refresh_subnet_validators_from_rpc(
+        &mut self,
+        rpc: &crate::rpc::RpcClient,
+        subnet_id: &SubnetId,
+    ) -> Result<usize, String> {
+        let response = rpc
+            .p_get_current_validators(Some(&subnet_id.to_hex()))
+            .await
+            .map_err(|e| format!("platform.getCurrentValidators failed: {}", e))?;
+
+        let mut set = ValidatorSet::new();
+        for validator in response.validators {
+            if let Some(node_bytes) = parse_node_id_bytes(&validator.node_id) {
+                let weight = validator.stake.parse::<u64>().unwrap_or(0);
+                let start_time = validator.start_time.parse::<u64>().unwrap_or(0);
+                let end_time = validator.end_time.parse::<u64>().unwrap_or(u64::MAX);
+                set.add_validator(crate::validator::ValidatorInfo {
+                    node_id: NodeId(node_bytes),
+                    weight,
+                    start_time,
+                    end_time,
+                });
+            }
+        }
+
+        let count = set.count();
+        self.set_subnet_validators(subnet_id, set);
+        Ok(count)
+    }
+
     /// Get all tracked subnet IDs.
     pub fn tracked_subnets(&self) -> Vec<SubnetId> {
         self.subnets.keys().cloned().collect()
@@ -275,6 +361,18 @@ impl Default for SubnetTracker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(feature = "rpc")]
+fn parse_node_id_bytes(node_id: &str) -> Option<[u8; 20]> {
+    let raw = node_id.strip_prefix("NodeID-").unwrap_or(node_id);
+    let decoded = bs58::decode(raw).into_vec().ok()?;
+    if decoded.len() < 24 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&decoded[..20]);
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +418,12 @@ mod tests {
     }
 
     #[test]
+    fn test_subnet_id_from_str_any_cb58() {
+        let id = SubnetId::from_str_any("11111111111111111111111111111111LpoYY").unwrap();
+        assert_eq!(id.0, [0u8; 32]);
+    }
+
+    #[test]
     fn test_subnet_id_display() {
         let id = SubnetId([0xBB; 32]);
         let s = format!("{}", id);
@@ -335,6 +439,30 @@ mod tests {
         assert_eq!(subnets.len(), 2);
         assert_eq!(subnets[0].0, [0xAA; 32]);
         assert_eq!(subnets[1].0, [0xBB; 32]);
+    }
+
+    #[test]
+    fn test_observe_l1_chain() {
+        let mut tracker = SubnetTracker::new();
+        let subnet = SubnetId([0x55; 32]);
+        let chain = ChainId([0x66; 32]);
+
+        tracker.observe_l1_chain(subnet.clone(), chain.clone(), "Custom L1", "customvm");
+
+        assert_eq!(tracker.subnet_count(), 1);
+        assert_eq!(tracker.chain_count(), 1);
+        let state = tracker.chain_state(&chain).unwrap();
+        assert_eq!(state.config.subnet_id, subnet);
+    }
+
+    #[test]
+    fn test_subnet_validators_snapshot() {
+        let mut tracker = SubnetTracker::new();
+        let subnet = SubnetId([0x11; 32]);
+        tracker.add_subnet(subnet.clone());
+        let snapshot = tracker.subnet_validators_snapshot(&subnet).unwrap();
+        assert_eq!(snapshot.subnet_id, subnet);
+        assert_eq!(snapshot.validators.count(), 0);
     }
 
     #[test]
