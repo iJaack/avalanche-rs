@@ -8,6 +8,8 @@
 //! - UnsignedMessage and AddressedPayload types
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // BLS Aggregate Signatures
@@ -365,6 +367,185 @@ impl AddressedPayload {
     }
 }
 
+/// Relay output containing a signed Warp message and destination chain.
+#[derive(Debug, Clone)]
+pub struct RelayedWarpMessage {
+    pub destination_chain_id: [u8; 32],
+    pub warp_message: WarpMessage,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WarpRelayMetrics {
+    pub messages_relayed: u64,
+    pub signatures_collected: u64,
+    pub quorum_events: u64,
+    pub total_quorum_time_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct InflightWarpMessage {
+    unsigned: UnsignedWarpMessage,
+    destination_chain_id: [u8; 32],
+    started_at: Instant,
+    signatures: HashMap<usize, BlsSignature>,
+    completed: bool,
+}
+
+/// Warp relay manager for collecting validator signatures until quorum and
+/// forwarding signed messages to destination chains.
+#[derive(Debug, Clone)]
+pub struct WarpRelay {
+    validator_set: WarpValidatorSet,
+    quorum_num: u64,
+    quorum_den: u64,
+    inflight: HashMap<[u8; 32], InflightWarpMessage>,
+    seen_messages: HashSet<[u8; 32]>,
+    forward_queue: VecDeque<RelayedWarpMessage>,
+    metrics: WarpRelayMetrics,
+}
+
+impl WarpRelay {
+    pub fn new(validator_set: WarpValidatorSet) -> Self {
+        Self::with_quorum(validator_set, 67, 100)
+    }
+
+    pub fn with_quorum(validator_set: WarpValidatorSet, quorum_num: u64, quorum_den: u64) -> Self {
+        Self {
+            validator_set,
+            quorum_num,
+            quorum_den,
+            inflight: HashMap::new(),
+            seen_messages: HashSet::new(),
+            forward_queue: VecDeque::new(),
+            metrics: WarpRelayMetrics::default(),
+        }
+    }
+
+    /// Register an unsigned message for relay.
+    /// Returns `false` if the message has already been seen (dedup/replay protection).
+    pub fn receive_unsigned_message(
+        &mut self,
+        unsigned: UnsignedWarpMessage,
+        destination_chain_id: [u8; 32],
+    ) -> bool {
+        let hash = unsigned.hash();
+        if self.seen_messages.contains(&hash) {
+            return false;
+        }
+        self.seen_messages.insert(hash);
+        self.inflight.insert(
+            hash,
+            InflightWarpMessage {
+                unsigned,
+                destination_chain_id,
+                started_at: Instant::now(),
+                signatures: HashMap::new(),
+                completed: false,
+            },
+        );
+        true
+    }
+
+    /// Add a validator signature for an in-flight message.
+    /// Returns a relayed signed message once quorum is reached.
+    pub fn collect_signature(
+        &mut self,
+        message_hash: [u8; 32],
+        validator_index: usize,
+        signature: BlsSignature,
+    ) -> Result<Option<RelayedWarpMessage>, String> {
+        if validator_index >= self.validator_set.validators.len() {
+            return Err("validator index out of bounds".to_string());
+        }
+        let entry = self
+            .inflight
+            .get_mut(&message_hash)
+            .ok_or_else(|| "unknown warp message hash".to_string())?;
+
+        if entry.completed {
+            return Ok(None);
+        }
+
+        if entry.signatures.contains_key(&validator_index) {
+            return Ok(None);
+        }
+
+        entry.signatures.insert(validator_index, signature);
+        self.metrics.signatures_collected = self.metrics.signatures_collected.saturating_add(1);
+
+        let aggregate = Self::aggregate_signature(
+            &entry.signatures,
+            self.validator_set.validators.len(),
+            &self.validator_set,
+        );
+
+        if !aggregate.has_quorum(&self.validator_set, self.quorum_num, self.quorum_den)? {
+            return Ok(None);
+        }
+
+        entry.completed = true;
+        let quorum_ms = entry.started_at.elapsed().as_millis();
+
+        self.metrics.messages_relayed = self.metrics.messages_relayed.saturating_add(1);
+        self.metrics.quorum_events = self.metrics.quorum_events.saturating_add(1);
+        self.metrics.total_quorum_time_ms = self
+            .metrics
+            .total_quorum_time_ms
+            .saturating_add(quorum_ms);
+
+        let signed = WarpMessage::new(entry.unsigned.clone(), aggregate);
+        let relayed = RelayedWarpMessage {
+            destination_chain_id: entry.destination_chain_id,
+            warp_message: signed,
+        };
+        self.forward_queue.push_back(relayed.clone());
+        Ok(Some(relayed))
+    }
+
+    fn aggregate_signature(
+        signatures: &HashMap<usize, BlsSignature>,
+        validator_len: usize,
+        validator_set: &WarpValidatorSet,
+    ) -> BlsAggregateSignature {
+        let mut bitset = vec![0u8; validator_len.div_ceil(8)];
+        let mut agg = [0u8; 96];
+
+        for (validator_index, signature) in signatures {
+            let byte_idx = validator_index / 8;
+            let bit_idx = 7 - (validator_index % 8);
+            if byte_idx < bitset.len() {
+                bitset[byte_idx] |= 1 << bit_idx;
+            }
+
+            let weight = validator_set
+                .validators
+                .get(*validator_index)
+                .map(|v| v.weight as u8)
+                .unwrap_or(1);
+            for (i, b) in signature.0.iter().enumerate() {
+                agg[i] ^= b.wrapping_mul(weight.max(1));
+            }
+        }
+
+        BlsAggregateSignature {
+            signature: BlsSignature(agg),
+            signer_bitset: bitset,
+        }
+    }
+
+    pub fn pop_forwarded(&mut self) -> Option<RelayedWarpMessage> {
+        self.forward_queue.pop_front()
+    }
+
+    pub fn metrics(&self) -> WarpRelayMetrics {
+        self.metrics.clone()
+    }
+
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.values().filter(|m| !m.completed).count()
+    }
+}
+
 /// Generate an AppRequest message for relaying a warp message.
 pub fn warp_app_request(
     chain_id: crate::network::ChainId,
@@ -621,5 +802,131 @@ mod tests {
             signer_bitset: vec![0x80],
         };
         assert!(sig.has_quorum(&validator_set, 2, 0).is_err());
+    }
+
+    #[test]
+    fn test_warp_relay_flow_quorum_and_forward() {
+        let validator_set = WarpValidatorSet::new(vec![
+            WarpValidator {
+                public_key: BlsPublicKey([1u8; 48]),
+                weight: 34,
+            },
+            WarpValidator {
+                public_key: BlsPublicKey([2u8; 48]),
+                weight: 33,
+            },
+            WarpValidator {
+                public_key: BlsPublicKey([3u8; 48]),
+                weight: 33,
+            },
+        ]);
+
+        let mut relay = WarpRelay::new(validator_set);
+        let unsigned = UnsignedWarpMessage {
+            network_id: 1,
+            source_chain_id: [0xAB; 32],
+            payload: b"bridge-call".to_vec(),
+        };
+
+        assert!(relay.receive_unsigned_message(unsigned.clone(), [0xCD; 32]));
+        let hash = unsigned.hash();
+
+        let no_quorum = relay
+            .collect_signature(hash, 1, BlsSignature([0x11; 96]))
+            .unwrap();
+        assert!(no_quorum.is_none());
+
+        let quorum = relay
+            .collect_signature(hash, 0, BlsSignature([0x22; 96]))
+            .unwrap();
+        assert!(quorum.is_some());
+        let relayed = quorum.unwrap();
+        assert_eq!(relayed.destination_chain_id, [0xCD; 32]);
+        assert!(relayed.warp_message.signature.has_signed(0));
+        assert!(relayed.warp_message.signature.has_signed(1));
+        assert_eq!(relay.inflight_count(), 0);
+
+        let metrics = relay.metrics();
+        assert_eq!(metrics.messages_relayed, 1);
+        assert_eq!(metrics.signatures_collected, 2);
+        assert_eq!(metrics.quorum_events, 1);
+
+        let queued = relay.pop_forwarded().unwrap();
+        assert_eq!(queued.destination_chain_id, [0xCD; 32]);
+    }
+
+    #[test]
+    fn test_warp_relay_deduplicates_by_message_hash() {
+        let validator_set = WarpValidatorSet::new(vec![WarpValidator {
+            public_key: BlsPublicKey([1u8; 48]),
+            weight: 100,
+        }]);
+        let mut relay = WarpRelay::new(validator_set);
+        let unsigned = UnsignedWarpMessage {
+            network_id: 5,
+            source_chain_id: [0x11; 32],
+            payload: b"dup".to_vec(),
+        };
+
+        assert!(relay.receive_unsigned_message(unsigned.clone(), [0x22; 32]));
+        assert!(!relay.receive_unsigned_message(unsigned, [0x22; 32]));
+    }
+
+    #[test]
+    fn test_warp_relay_rejects_unknown_validator_index() {
+        let validator_set = WarpValidatorSet::new(vec![WarpValidator {
+            public_key: BlsPublicKey([1u8; 48]),
+            weight: 100,
+        }]);
+        let mut relay = WarpRelay::new(validator_set);
+        let unsigned = UnsignedWarpMessage {
+            network_id: 1,
+            source_chain_id: [0x44; 32],
+            payload: vec![1],
+        };
+        let hash = unsigned.hash();
+        assert!(relay.receive_unsigned_message(unsigned, [0x55; 32]));
+        assert!(relay
+            .collect_signature(hash, 3, BlsSignature([0xAA; 96]))
+            .is_err());
+    }
+
+    #[test]
+    fn test_warp_relay_weighted_quorum_detection() {
+        let validator_set = WarpValidatorSet::new(vec![
+            WarpValidator {
+                public_key: BlsPublicKey([1u8; 48]),
+                weight: 60,
+            },
+            WarpValidator {
+                public_key: BlsPublicKey([2u8; 48]),
+                weight: 20,
+            },
+            WarpValidator {
+                public_key: BlsPublicKey([3u8; 48]),
+                weight: 20,
+            },
+        ]);
+        let mut relay = WarpRelay::new(validator_set);
+        let unsigned = UnsignedWarpMessage {
+            network_id: 1,
+            source_chain_id: [0xAA; 32],
+            payload: vec![7, 8, 9],
+        };
+        let hash = unsigned.hash();
+        assert!(relay.receive_unsigned_message(unsigned, [0xBB; 32]));
+
+        assert!(relay
+            .collect_signature(hash, 1, BlsSignature([0x01; 96]))
+            .unwrap()
+            .is_none());
+        assert!(relay
+            .collect_signature(hash, 2, BlsSignature([0x02; 96]))
+            .unwrap()
+            .is_none());
+        assert!(relay
+            .collect_signature(hash, 0, BlsSignature([0x03; 96]))
+            .unwrap()
+            .is_some());
     }
 }
