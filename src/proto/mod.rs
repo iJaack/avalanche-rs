@@ -618,7 +618,7 @@ fn bytes_to_block_id(b: &[u8]) -> BlockId {
 
 fn parse_version(v: &str) -> (u32, u32, u32) {
     // Parse "avalanche/1.2.3" or "1.2.3"
-    let ver = v.split('/').last().unwrap_or(v);
+    let ver = v.split('/').next_back().unwrap_or(v);
     let parts: Vec<u32> = ver.split('.').filter_map(|s| s.parse().ok()).collect();
     (
         parts.first().copied().unwrap_or(0),
@@ -946,9 +946,9 @@ mod tests {
         for msg in &messages {
             let encoded = msg
                 .encode_proto()
-                .expect(&format!("encode {:?}", msg.name()));
-            let decoded =
-                NetworkMessage::decode_proto(&encoded).expect(&format!("decode {:?}", msg.name()));
+                .unwrap_or_else(|_| panic!("encode {:?}", msg.name()));
+            let decoded = NetworkMessage::decode_proto(&encoded)
+                .unwrap_or_else(|_| panic!("decode {:?}", msg.name()));
             assert_eq!(msg.name(), decoded.name());
         }
     }

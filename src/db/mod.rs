@@ -412,7 +412,7 @@ pub struct StateTrie {
 }
 
 /// RLP-encoded account state (balance, nonce, storage_root, code_hash).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AccountState {
     pub nonce: u64,
     pub balance: u128,
@@ -634,7 +634,7 @@ fn decode_account_rlp(rlp: &[u8]) -> AccountState {
             return [0u8; 32];
         }
         let b = data[*pos];
-        let len = if b >= 0x80 && b < 0xb8 {
+        let len = if (0x80..0xb8).contains(&b) {
             *pos += 1;
             (b - 0x80) as usize
         } else {
@@ -658,17 +658,6 @@ fn decode_account_rlp(rlp: &[u8]) -> AccountState {
         balance,
         storage_root,
         code_hash,
-    }
-}
-
-impl Default for AccountState {
-    fn default() -> Self {
-        Self {
-            nonce: 0,
-            balance: 0,
-            storage_root: [0u8; 32],
-            code_hash: [0u8; 32],
-        }
     }
 }
 

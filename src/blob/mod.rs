@@ -178,14 +178,14 @@ impl BlobStore {
         let (list_data, _) = decode_rlp_list(rlp)?;
 
         let mut pos = 0;
-        let chain_id = decode_rlp_uint(&list_data, &mut pos)? as u64;
-        let nonce = decode_rlp_uint(&list_data, &mut pos)? as u64;
-        let max_priority_fee = decode_rlp_uint(&list_data, &mut pos)?;
-        let max_fee = decode_rlp_uint(&list_data, &mut pos)?;
-        let gas_limit = decode_rlp_uint(&list_data, &mut pos)? as u64;
-        let to_bytes = decode_rlp_bytes(&list_data, &mut pos)?;
-        let value = decode_rlp_uint(&list_data, &mut pos)?;
-        let data = decode_rlp_bytes(&list_data, &mut pos)?;
+        let chain_id = decode_rlp_uint(list_data, &mut pos)? as u64;
+        let nonce = decode_rlp_uint(list_data, &mut pos)? as u64;
+        let max_priority_fee = decode_rlp_uint(list_data, &mut pos)?;
+        let max_fee = decode_rlp_uint(list_data, &mut pos)?;
+        let gas_limit = decode_rlp_uint(list_data, &mut pos)? as u64;
+        let to_bytes = decode_rlp_bytes(list_data, &mut pos)?;
+        let value = decode_rlp_uint(list_data, &mut pos)?;
+        let data = decode_rlp_bytes(list_data, &mut pos)?;
 
         let mut to = [0u8; 20];
         if to_bytes.len() == 20 {
@@ -193,12 +193,12 @@ impl BlobStore {
         }
 
         // Skip access_list (we don't fully parse it)
-        skip_rlp_item(&list_data, &mut pos)?;
+        skip_rlp_item(list_data, &mut pos)?;
 
-        let max_fee_per_blob_gas = decode_rlp_uint(&list_data, &mut pos)?;
+        let max_fee_per_blob_gas = decode_rlp_uint(list_data, &mut pos)?;
 
         // Parse blob_versioned_hashes (list of 32-byte hashes)
-        let hashes_data = decode_rlp_bytes_or_list(&list_data, &mut pos)?;
+        let hashes_data = decode_rlp_bytes_or_list(list_data, &mut pos)?;
         let mut blob_versioned_hashes = Vec::new();
         let mut hp = 0;
         while hp < hashes_data.len() {

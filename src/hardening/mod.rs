@@ -56,7 +56,7 @@ impl ConnectionRateLimiter {
         // Check per-IP rate
         {
             let mut ip_map = self.ip_connections.lock();
-            let timestamps = ip_map.entry(ip).or_insert_with(Vec::new);
+            let timestamps = ip_map.entry(ip).or_default();
             timestamps.retain(|t| *t > cutoff);
             if timestamps.len() >= self.max_per_ip_per_sec as usize {
                 return false;
@@ -104,7 +104,7 @@ impl RequestRateLimiter {
         let cutoff = now - Duration::from_secs(1);
 
         let mut ip_map = self.ip_requests.lock();
-        let timestamps = ip_map.entry(ip).or_insert_with(Vec::new);
+        let timestamps = ip_map.entry(ip).or_default();
         timestamps.retain(|t| *t > cutoff);
 
         if timestamps.len() >= self.max_per_sec as usize {

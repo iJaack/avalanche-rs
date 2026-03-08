@@ -11,7 +11,7 @@ struct BloomFilter {
 impl BloomFilter {
     fn with_capacity(expected_elements: usize, _fp_rate: f64) -> Self {
         let num_bits = (expected_elements * 10).max(64);
-        let byte_len = (num_bits + 7) / 8;
+        let byte_len = num_bits.div_ceil(8);
         Self {
             bits: vec![0u8; byte_len],
             num_bits,
@@ -22,7 +22,7 @@ impl BloomFilter {
     fn insert(&mut self, data: &[u8]) {
         for i in 0..self.num_hashes {
             let mut hasher = Sha256::new();
-            hasher.update(&[i]);
+            hasher.update([i]);
             hasher.update(data);
             let hash = hasher.finalize();
             let pos = u64::from_be_bytes(hash[..8].try_into().unwrap()) as usize % self.num_bits;
@@ -33,7 +33,7 @@ impl BloomFilter {
     fn may_contain(&self, data: &[u8]) -> bool {
         for i in 0..self.num_hashes {
             let mut hasher = Sha256::new();
-            hasher.update(&[i]);
+            hasher.update([i]);
             hasher.update(data);
             let hash = hasher.finalize();
             let pos = u64::from_be_bytes(hash[..8].try_into().unwrap()) as usize % self.num_bits;

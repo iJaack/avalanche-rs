@@ -8,7 +8,7 @@ fn bench_mpt_insert(c: &mut Criterion) {
             let mut trie: HashMap<[u8; 32], Vec<u8>> = HashMap::with_capacity(100);
             for i in 0u64..100 {
                 let mut key = [0u8; 32];
-                let hash = Sha256::digest(&i.to_be_bytes());
+                let hash = Sha256::digest(i.to_be_bytes());
                 key.copy_from_slice(&hash);
                 trie.insert(key, vec![i as u8; 32]);
             }
@@ -22,7 +22,7 @@ fn bench_mpt_lookup(c: &mut Criterion) {
     let mut keys = Vec::with_capacity(1000);
     for i in 0u64..1000 {
         let mut key = [0u8; 32];
-        let hash = Sha256::digest(&i.to_be_bytes());
+        let hash = Sha256::digest(i.to_be_bytes());
         key.copy_from_slice(&hash);
         trie.insert(key, vec![i as u8; 32]);
         keys.push(key);
@@ -44,8 +44,8 @@ fn bench_mpt_proof_generation(c: &mut Criterion) {
             let mut current = [0u8; 32];
             for level in 0u8..16 {
                 let mut hasher = Sha256::new();
-                hasher.update(&current);
-                hasher.update(&[level]);
+                hasher.update(current);
+                hasher.update([level]);
                 current = hasher.finalize().into();
             }
             black_box(current);

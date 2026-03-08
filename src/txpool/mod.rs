@@ -105,9 +105,9 @@ impl TransactionPool {
 
         // Determine if pending or queued based on nonce
         let is_pending = tx.nonce == account_nonce
-            || self.pending.get(&tx.from).map_or(false, |m| {
+            || self.pending.get(&tx.from).is_some_and(|m| {
                 // Check if this nonce is the next expected
-                m.keys().last().map_or(false, |&last| tx.nonce == last + 1)
+                m.keys().last().is_some_and(|&last| tx.nonce == last + 1)
             });
 
         let from = tx.from;
@@ -118,16 +118,10 @@ impl TransactionPool {
         let replaced = self.by_hash.contains_key(&hash);
 
         if is_pending {
-            self.pending
-                .entry(from)
-                .or_insert_with(BTreeMap::new)
-                .insert(nonce, tx);
+            self.pending.entry(from).or_default().insert(nonce, tx);
             self.by_hash.insert(hash, (from, nonce, true));
         } else {
-            self.queued
-                .entry(from)
-                .or_insert_with(BTreeMap::new)
-                .insert(nonce, tx);
+            self.queued.entry(from).or_default().insert(nonce, tx);
             self.by_hash.insert(hash, (from, nonce, false));
         }
 
@@ -155,10 +149,8 @@ impl TransactionPool {
                 if let Some(map) = self.pending.get_mut(&from) {
                     return map.remove(&nonce);
                 }
-            } else {
-                if let Some(map) = self.queued.get_mut(&from) {
-                    return map.remove(&nonce);
-                }
+            } else if let Some(map) = self.queued.get_mut(&from) {
+                return map.remove(&nonce);
             }
         }
         None
@@ -202,10 +194,7 @@ impl TransactionPool {
             loop {
                 if let Some(tx) = queued.remove(&nonce) {
                     let hash = tx.hash;
-                    self.pending
-                        .entry(*from)
-                        .or_insert_with(BTreeMap::new)
-                        .insert(nonce, tx);
+                    self.pending.entry(*from).or_default().insert(nonce, tx);
                     // Update lookup
                     if let Some(entry) = self.by_hash.get_mut(&hash) {
                         entry.2 = true; // mark as pending
@@ -278,14 +267,14 @@ impl TransactionPool {
             .pending
             .values()
             .flat_map(|m| m.values())
-            .map(|tx| pool_tx_info(tx))
+            .map(pool_tx_info)
             .collect();
 
         let queued_txs: Vec<PoolTxInfo> = self
             .queued
             .values()
             .flat_map(|m| m.values())
-            .map(|tx| pool_tx_info(tx))
+            .map(pool_tx_info)
             .collect();
 
         PoolContent {

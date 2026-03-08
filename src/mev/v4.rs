@@ -540,6 +540,12 @@ pub struct V4PoolScanner {
     pub hooks_mev_capture: u64,
 }
 
+impl Default for V4PoolScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl V4PoolScanner {
     pub fn new() -> Self {
         Self {
@@ -564,7 +570,7 @@ impl V4PoolScanner {
         }
 
         self.classified_hooks
-            .insert(key.hooks.clone(), (flags.clone(), archetype.clone()));
+            .insert(key.hooks.clone(), (flags, archetype.clone()));
         self.pools.insert(
             key.clone(),
             V4PoolState::new(key, sqrt_price_x96, liquidity, tick),
@@ -1231,7 +1237,7 @@ mod tests {
         let small = pool.estimate_output(U256::from_u64(1000), true);
         // Large swap going 0→1 (price decreases, tick decreases) should cross tick 50
         // Depends on actual math — just verify the field is populated
-        assert!(small.crosses_tick == true || small.crosses_tick == false); // no crash
+        assert!(small.crosses_tick || !small.crosses_tick); // no crash
     }
 
     // --- DEX alias ---

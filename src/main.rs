@@ -3,6 +3,22 @@
 //! Phase 6: Wire everything into a production binary.
 //! Supports bootstrapping from peers, EVM execution, and JSON-RPC serving.
 
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::overly_complex_bool_expr,
+    clippy::assertions_on_constants,
+    clippy::if_same_then_else,
+    clippy::large_enum_variant,
+    clippy::match_like_matches_macro,
+    clippy::module_inception,
+    clippy::single_match,
+    clippy::unnecessary_sort_by,
+    clippy::vec_init_then_push,
+    clippy::while_let_loop,
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments
+)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +33,6 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use bs58;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1761,7 +1776,7 @@ async fn connect_and_handshake(
                                                 if Some(request_id) == continuous_sync_req {
                                                     continuous_sync_req = None;
                                                     if container_id.0 != [0u8; 32] {
-                                                        let is_new = last_known_tip.map_or(true, |t| t != container_id.0);
+                                                        let is_new = last_known_tip != Some(container_id.0);
                                                         if is_new {
                                                             info!("Continuous sync: new tip detected {} from {}", container_id, addr);
                                                             last_known_tip = Some(container_id.0);
@@ -1983,7 +1998,7 @@ async fn connect_and_handshake(
                                                             // Use block parser to determine if oldest block is genesis
                                                             // (handles both raw RLP and Avalanche-wrapped format)
                                                             let should_recurse = depth < 10
-                                                                && oldest_container.as_ref().map_or(false, |c| {
+                                                                && oldest_container.as_ref().is_some_and(|c| {
                                                                     match avalanche_rs::block::BlockHeader::parse(c, avalanche_rs::block::Chain::CChain) {
                                                                         Ok(h) => !h.is_genesis(),
                                                                         Err(_) => !c.is_empty() && c[0] >= 0xc0,
@@ -2094,7 +2109,7 @@ async fn connect_and_handshake(
 
                                                             // Use type-aware parent extraction (handles Apricot and Banff)
                                                             let should_recurse = depth < 10
-                                                                && oldest_container.as_ref().map_or(false, |c| {
+                                                                && oldest_container.as_ref().is_some_and(|c| {
                                                                     match avalanche_rs::block::BlockHeader::extract_parent_id(c) {
                                                                         Some(parent) => parent != [0u8; 32],
                                                                         None => false,
@@ -3470,7 +3485,7 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                     rpc_ok(
                         &format!(
                             "{{\"number\":\"0x{:x}\",\"hash\":\"0x{}\",\"size\":\"0x{:x}\",\"transactions\":[]}}",
-                            block_num, hex::encode(&hash_bytes), block_data.len()
+                            block_num, hex::encode(hash_bytes), block_data.len()
                         ),
                         id,
                     )
@@ -3527,11 +3542,10 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                 })
                 .unwrap_or(0);
             let to_block = filter_obj["toBlock"].as_str()
-                .map(|s| {
+                .and_then(|s| {
                     let s = s.strip_prefix("0x").unwrap_or(s);
                     u64::from_str_radix(s, 16).ok()
-                })
-                .flatten();
+                });
             let addresses: Vec<[u8; 20]> = match &filter_obj["address"] {
                 serde_json::Value::String(s) => parse_hex_address(s).into_iter().collect(),
                 serde_json::Value::Array(arr) => arr.iter()
@@ -3858,7 +3872,7 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                         hasher.update(&tx_bytes);
                         hasher.finalize()
                     };
-                    let tx_id = hex::encode(&tx_hash);
+                    let tx_id = hex::encode(tx_hash);
                     // Store in DB for retrieval
                     let key = format!("atomic:{}", tx_id);
                     let _ = node.db.put_cf(avalanche_rs::db::CF_BLOCKS, key.as_bytes(), &tx_bytes);
@@ -4098,6 +4112,27 @@ fn analyze_chain_graphs(node: &NodeState) {
     }
 
     info!("Chain graph analysis complete.");
+}
+
+fn init_logging(level: &str, format: &str) {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    match format {
+        "json" => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4690,26 +4725,5 @@ mod integration_tests {
         let parsed: serde_json::Value = serde_json::from_str(result).unwrap();
         assert!(parsed["accessList"].as_array().unwrap().is_empty());
         assert_eq!(parsed["gasUsed"], "0x5208");
-    }
-}
-
-fn init_logging(level: &str, format: &str) {
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-
-    match format {
-        "json" => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .json()
-                .init();
-        }
-        _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .init();
-        }
     }
 }

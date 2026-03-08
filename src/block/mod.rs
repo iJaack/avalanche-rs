@@ -192,7 +192,7 @@ impl BlockHeader {
                     None
                 }
             }
-            30 | 31 | 32 => {
+            30..=32 => {
                 // BanffAbort/Commit/Standard: ts(8) + parent(32) @ [14..46]
                 if raw.len() >= 46 {
                     raw[14..46].try_into().ok()
@@ -294,7 +294,7 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
             let h = u64::from_be_bytes(raw[50..58].try_into().unwrap());
             (pid, h, ts)
         }
-        30 | 31 | 32 => {
+        30..=32 => {
             // BanffAbortBlock / BanffCommitBlock / BanffStandardBlock:
             // [6..14]=Time, [14..46]=PrntID, [46..54]=Hght
             if raw.len() < 54 {

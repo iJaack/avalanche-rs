@@ -170,7 +170,7 @@ impl LightClient {
 
         for node in &proof.proof_nodes {
             let mut h = Sha256::new();
-            h.update(&current_hash);
+            h.update(current_hash);
             h.update(node);
             let result = h.finalize();
             current_hash.copy_from_slice(&result);
@@ -255,8 +255,8 @@ mod tests {
 
     fn make_light_header(height: u64, parent_hash: [u8; 32]) -> LightHeader {
         let mut hasher = Sha256::new();
-        hasher.update(&height.to_be_bytes());
-        hasher.update(&parent_hash);
+        hasher.update(height.to_be_bytes());
+        hasher.update(parent_hash);
         let hash_result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&hash_result);
@@ -385,7 +385,7 @@ mod tests {
         // One proof node
         let proof_node = vec![0xAA; 32];
         let mut hasher2 = Sha256::new();
-        hasher2.update(&leaf_hash);
+        hasher2.update(leaf_hash);
         hasher2.update(&proof_node);
         let expected_root_hash = hasher2.finalize();
         let mut state_root = [0u8; 32];
@@ -440,7 +440,7 @@ mod tests {
         let leaf = hasher.finalize();
         let node = vec![0xBB; 32];
         let mut hasher2 = Sha256::new();
-        hasher2.update(&leaf);
+        hasher2.update(leaf);
         hasher2.update(&node);
         let root = hasher2.finalize();
         let mut state_root = [0u8; 32];

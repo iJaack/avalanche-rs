@@ -371,17 +371,17 @@ mod tests {
         let state = DynamicGasState::genesis();
         // Try to change q by 100 — should clamp to MAX_Q_CHANGE
         let next = state.apply_block(0, 100, 1);
-        assert_eq!(next.q, MAX_Q_CHANGE as i64);
+        assert_eq!(next.q, MAX_Q_CHANGE);
         // Negative clamping
         let next = state.apply_block(0, -100, 1);
-        assert_eq!(next.q, -(MAX_Q_CHANGE as i64));
+        assert_eq!(next.q, -MAX_Q_CHANGE);
     }
 
     #[test]
     fn test_calc_next_q() {
         // Moving toward desired, clamped
-        assert_eq!(DynamicGasState::calc_next_q(0, 20), MAX_Q_CHANGE as i64);
-        assert_eq!(DynamicGasState::calc_next_q(0, -20), -(MAX_Q_CHANGE as i64));
+        assert_eq!(DynamicGasState::calc_next_q(0, 20), MAX_Q_CHANGE);
+        assert_eq!(DynamicGasState::calc_next_q(0, -20), -MAX_Q_CHANGE);
         // Already at desired
         assert_eq!(DynamicGasState::calc_next_q(5, 5), 5);
         // Small step

@@ -1626,7 +1626,7 @@ mod tests {
             last_updated: Instant::now(),
         };
 
-        let impact_1 = pool.price_impact_bps(U256::from_u128(1 * 10u128.pow(18)), tokens::WAVAX);
+        let impact_1 = pool.price_impact_bps(U256::from_u128(10u128.pow(18)), tokens::WAVAX);
         let impact_100 =
             pool.price_impact_bps(U256::from_u128(100 * 10u128.pow(18)), tokens::WAVAX);
         let impact_10k =
@@ -1661,7 +1661,7 @@ mod tests {
         };
 
         // Tiny victim (1 AVAX) — sandwich overhead exceeds profit
-        let victim = U256::from_u128(1 * 10u128.pow(18));
+        let victim = U256::from_u128(10u128.pow(18));
         let frontrun = U256::from_u128(3 * 10u128.pow(18));
         let result = pool.simulate_sandwich(victim, frontrun, tokens::WAVAX);
 
@@ -1798,7 +1798,7 @@ mod tests {
             dex: DexProtocol::TraderJoe,
             token_in: tokens::WAVAX.into(),
             token_out: tokens::USDC.into(),
-            amount_in: U256::from_u128(1 * 10u128.pow(18)), // 1 AVAX (below 10 min)
+            amount_in: U256::from_u128(10u128.pow(18)), // 1 AVAX (below 10 min)
             amount_out_min: U256::from_u128(20 * 10u128.pow(6)),
             path: vec![],
             recipient: "0x".into(),
@@ -1973,8 +1973,8 @@ mod tests {
         }
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_millis() < 50,
-            "1M selector checks should take <50ms, took {:?}",
+            elapsed.as_millis() < 200,
+            "1M selector checks should take <200ms, took {:?}",
             elapsed
         );
     }

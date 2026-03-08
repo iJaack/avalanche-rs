@@ -3,6 +3,21 @@
 //! A fast, type-safe, async client for interacting with Avalanche blockchains.
 
 #![allow(missing_docs)]
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::overly_complex_bool_expr,
+    clippy::assertions_on_constants,
+    clippy::if_same_then_else,
+    clippy::large_enum_variant,
+    clippy::match_like_matches_macro,
+    clippy::module_inception,
+    clippy::single_match,
+    clippy::unnecessary_sort_by,
+    clippy::vec_init_then_push,
+    clippy::while_let_loop,
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments
+)]
 #![warn(rust_2018_idioms)]
 // We need unsafe for RocksDB FFI bindings and revm's EVM internals
 // #![forbid(unsafe_code)]

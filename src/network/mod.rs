@@ -1262,6 +1262,12 @@ pub struct ValidatorSet {
     total_weight: u64,
 }
 
+impl Default for ValidatorSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ValidatorSet {
     pub fn new() -> Self {
         Self {
@@ -1587,7 +1593,7 @@ impl SnowmanConsensus {
         }
 
         // Add to conflict set for this height
-        let conflict_set = self.conflict_sets.entry(height).or_insert_with(Vec::new);
+        let conflict_set = self.conflict_sets.entry(height).or_default();
         conflict_set.push(id.clone());
 
         // Initialize Snowball if this is the first block at this height

@@ -513,8 +513,8 @@ mod tests {
                     gas_cost: U256::from_u64(10),
                     net_profit: U256::from_u64(90 + i),
                 },
-                detected_at_ms: i as u64 * 100,
-                block_number: i as u64,
+                detected_at_ms: i * 100,
+                block_number: i,
                 status: OpportunityStatus::Detected,
             };
             engine.add_opportunity(opp).await;

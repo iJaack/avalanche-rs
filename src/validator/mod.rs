@@ -300,7 +300,7 @@ pub fn verify_pchain_signature(
     // Derive the address: ripemd160(sha256(compressed_pubkey))
     let pubkey_bytes = recovered_key.to_sec1_bytes();
     let sha_hash = Sha256::digest(&pubkey_bytes);
-    let ripemd_hash = Ripemd160::digest(&sha_hash);
+    let ripemd_hash = Ripemd160::digest(sha_hash);
 
     let mut derived_address = [0u8; 20];
     derived_address.copy_from_slice(&ripemd_hash);
@@ -463,10 +463,10 @@ pub fn compute_receipt_root(receipts: &[crate::evm::TxReceipt]) -> [u8; 32] {
     for (i, receipt) in receipts.iter().enumerate() {
         cumulative_gas += receipt.gas_used;
         // Hash: index + success + cumulative_gas + logs_count
-        hasher.update(&(i as u32).to_be_bytes());
-        hasher.update(&[if receipt.success { 1 } else { 0 }]);
-        hasher.update(&cumulative_gas.to_be_bytes());
-        hasher.update(&(receipt.logs.len() as u32).to_be_bytes());
+        hasher.update((i as u32).to_be_bytes());
+        hasher.update([if receipt.success { 1 } else { 0 }]);
+        hasher.update(cumulative_gas.to_be_bytes());
+        hasher.update((receipt.logs.len() as u32).to_be_bytes());
     }
 
     let hash = hasher.finalize();
@@ -665,7 +665,7 @@ mod tests {
         // Derive address
         let pubkey_bytes = verifying_key.to_sec1_bytes();
         let sha_hash = Sha256::digest(&pubkey_bytes);
-        let ripemd_hash = Ripemd160::digest(&sha_hash);
+        let ripemd_hash = Ripemd160::digest(sha_hash);
         let mut address = [0u8; 20];
         address.copy_from_slice(&ripemd_hash);
 

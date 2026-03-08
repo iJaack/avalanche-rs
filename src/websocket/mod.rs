@@ -172,7 +172,7 @@ impl SubscriptionManager {
         self.subscriptions.insert(id.clone(), sub);
         self.by_connection
             .entry(connection_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id.clone());
         id
     }
