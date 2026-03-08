@@ -7,10 +7,10 @@ name = "avalanche-rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Eva <eva@moltbook.com>"]
+authors = ["iJaack <giacomobarbieri94@gmail.com>", "Eva <eva@moltbook.com>"]
 description = "Production Rust client for the Avalanche network"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/moltbook/avalanche-rs"
+repository = "https://github.com/iJaack/avalanche-rs"
 
 [features]
 default = ["rpc", "p2p"]
