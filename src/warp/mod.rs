@@ -488,10 +488,8 @@ impl WarpRelay {
 
         self.metrics.messages_relayed = self.metrics.messages_relayed.saturating_add(1);
         self.metrics.quorum_events = self.metrics.quorum_events.saturating_add(1);
-        self.metrics.total_quorum_time_ms = self
-            .metrics
-            .total_quorum_time_ms
-            .saturating_add(quorum_ms);
+        self.metrics.total_quorum_time_ms =
+            self.metrics.total_quorum_time_ms.saturating_add(quorum_ms);
 
         let signed = WarpMessage::new(entry.unsigned.clone(), aggregate);
         let relayed = RelayedWarpMessage {

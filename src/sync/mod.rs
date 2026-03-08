@@ -822,7 +822,10 @@ impl StateSyncEngine {
     }
 
     /// Handle app-level response bytes encoded as `StateSummaryChunk`.
-    pub async fn handle_state_summary_chunk_bytes(&self, app_bytes: &[u8]) -> Result<usize, String> {
+    pub async fn handle_state_summary_chunk_bytes(
+        &self,
+        app_bytes: &[u8],
+    ) -> Result<usize, String> {
         let chunk = StateSummaryChunk::decode(app_bytes)
             .ok_or_else(|| "invalid state summary chunk bytes".to_string())?;
         self.handle_state_summary_chunk(chunk).await
@@ -1008,11 +1011,20 @@ impl StateSyncEngine {
     }
 
     /// Persist resumable state-sync checkpoint.
-    pub async fn persist_checkpoint(&self, db: &crate::db::Database) -> Result<(), crate::db::DbError> {
+    pub async fn persist_checkpoint(
+        &self,
+        db: &crate::db::Database,
+    ) -> Result<(), crate::db::DbError> {
         let checkpoint = StateSyncCheckpoint {
             state_root: *self.state_root.read().await,
             phase: self.current_phase().await.to_string(),
-            needed_trie_nodes: self.needed_trie_nodes.read().await.iter().copied().collect(),
+            needed_trie_nodes: self
+                .needed_trie_nodes
+                .read()
+                .await
+                .iter()
+                .copied()
+                .collect(),
             next_cursor: *self.next_summary_cursor.read().await,
             downloaded_nodes: self.trie_stats.read().await.nodes_downloaded,
             verified_nodes: self.trie_stats.read().await.nodes_verified,
@@ -1024,12 +1036,15 @@ impl StateSyncEngine {
     }
 
     /// Restore resumable state-sync checkpoint.
-    pub async fn restore_checkpoint(&self, db: &crate::db::Database) -> Result<bool, crate::db::DbError> {
+    pub async fn restore_checkpoint(
+        &self,
+        db: &crate::db::Database,
+    ) -> Result<bool, crate::db::DbError> {
         let Some(raw) = db.get_metadata(META_STATE_SYNC_CHECKPOINT)? else {
             return Ok(false);
         };
-        let checkpoint: StateSyncCheckpoint = serde_json::from_slice(&raw)
-            .map_err(|e| crate::db::DbError::Read(e.to_string()))?;
+        let checkpoint: StateSyncCheckpoint =
+            serde_json::from_slice(&raw).map_err(|e| crate::db::DbError::Read(e.to_string()))?;
 
         *self.state_root.write().await = checkpoint.state_root;
         *self.next_summary_cursor.write().await = checkpoint.next_cursor;
@@ -1226,7 +1241,10 @@ mod tests {
                 return vec![0x80];
             }
             let bytes = value.to_be_bytes();
-            let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+            let start = bytes
+                .iter()
+                .position(|&b| b != 0)
+                .unwrap_or(bytes.len() - 1);
             let data = &bytes[start..];
             if data.len() == 1 && data[0] < 0x80 {
                 vec![data[0]]
@@ -1289,10 +1307,17 @@ mod tests {
         let bad = build_cchain_block([9u8; 32], 2, 1_700_000_004);
 
         let good = vec![block2.clone(), block1.clone(), genesis.clone()];
-        assert!(SyncEngine::validate_cchain_ancestor_chain(&good, Sha256::digest(&block2).into()).is_ok());
+        assert!(
+            SyncEngine::validate_cchain_ancestor_chain(&good, Sha256::digest(&block2).into())
+                .is_ok()
+        );
 
         let bad_chain = vec![bad, block1, genesis];
-        assert!(SyncEngine::validate_cchain_ancestor_chain(&bad_chain, Sha256::digest(&block2).into()).is_err());
+        assert!(SyncEngine::validate_cchain_ancestor_chain(
+            &bad_chain,
+            Sha256::digest(&block2).into()
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -1748,7 +1773,9 @@ mod tests {
         let (db, _dir) = crate::db::Database::open_temp().unwrap();
 
         engine.set_target_state_root([0x42; 32]).await;
-        engine.add_needed_trie_nodes(vec![[0x01; 32], [0x02; 32]]).await;
+        engine
+            .add_needed_trie_nodes(vec![[0x01; 32], [0x02; 32]])
+            .await;
         engine.persist_checkpoint(&db).await.unwrap();
 
         let restored = StateSyncEngine::new();

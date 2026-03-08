@@ -168,8 +168,7 @@ impl DynamicGasState {
         let new_excess = if consumed > target_for_period {
             self.excess_gas.saturating_add(consumed - target_for_period)
         } else {
-            self.excess_gas
-                .saturating_sub(target_for_period - consumed)
+            self.excess_gas.saturating_sub(target_for_period - consumed)
         };
 
         // 4. Update q and derive new T, K, C, R
@@ -427,10 +426,7 @@ mod tests {
     #[test]
     fn test_legacy_base_fee_floor() {
         // Very low fee can't go below minimum
-        assert_eq!(
-            legacy_base_fee(MIN_BASE_FEE, 0, 15_000_000),
-            MIN_BASE_FEE
-        );
+        assert_eq!(legacy_base_fee(MIN_BASE_FEE, 0, 15_000_000), MIN_BASE_FEE);
     }
 
     #[test]

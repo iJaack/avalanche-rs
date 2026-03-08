@@ -21,5 +21,9 @@ fn bench_tls_config_build(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_tls_identity_generation, bench_tls_config_build);
+criterion_group!(
+    benches,
+    bench_tls_identity_generation,
+    bench_tls_config_build
+);
 criterion_main!(benches);

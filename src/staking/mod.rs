@@ -73,10 +73,23 @@ pub struct UnstakeResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StakingError {
-    StakeAmountTooLow { min: u64, provided: u64 },
-    InvalidDelegationFee { min_percent: f64, provided: f64 },
-    InvalidStakingPeriod { min_days: u16, max_days: u16, provided: u16 },
-    StakeNotMatured { end_time: u64, current_time: u64 },
+    StakeAmountTooLow {
+        min: u64,
+        provided: u64,
+    },
+    InvalidDelegationFee {
+        min_percent: f64,
+        provided: f64,
+    },
+    InvalidStakingPeriod {
+        min_days: u16,
+        max_days: u16,
+        provided: u16,
+    },
+    StakeNotMatured {
+        end_time: u64,
+        current_time: u64,
+    },
     SignatureFailed(String),
 }
 
@@ -84,7 +97,11 @@ impl std::fmt::Display for StakingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StakeAmountTooLow { min, provided } => {
-                write!(f, "stake amount too low: min={}, provided={}", min, provided)
+                write!(
+                    f,
+                    "stake amount too low: min={}, provided={}",
+                    min, provided
+                )
             }
             Self::InvalidDelegationFee {
                 min_percent,
@@ -354,7 +371,8 @@ mod tests {
         assert_eq!(signed.unsigned.tx_type, StakingTxType::AddValidator);
         assert_eq!(signed.signature.len(), 65);
 
-        let message_hash: [u8; 32] = Sha256::digest(serialize_unsigned_staking_tx(&unsigned)).into();
+        let message_hash: [u8; 32] =
+            Sha256::digest(serialize_unsigned_staking_tx(&unsigned)).into();
         let verified =
             verify_pchain_signature(&message_hash, &signed.signature, &signed.signer_address)
                 .unwrap();

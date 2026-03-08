@@ -28,12 +28,12 @@ use avalanche_rs::block::{
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
 use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction};
-use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::hardening::get_rss_bytes;
+use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
 use avalanche_rs::network::{
-    BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, Peer, PeerInfo, PeerManager, PeerState,
-    PersistentPeerRecord,
+    BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, Peer, PeerInfo, PeerManager,
+    PeerState, PersistentPeerRecord,
 };
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
 use avalanche_rs::subnet::{SubnetId, SubnetTracker};
@@ -552,7 +552,9 @@ async fn persist_sync_state(node: &NodeState) {
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
-        if let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             tokio::select! {
                 _ = signal::ctrl_c() => return "SIGINT",
                 _ = sigterm.recv() => return "SIGTERM",
@@ -1050,10 +1052,7 @@ async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
         match ip_str.parse::<SocketAddr>() {
             Ok(addr) => {
                 if seen.insert(addr) {
-                    startup_targets.push(StartupPeerTarget {
-                        addr,
-                        score: 0,
-                    });
+                    startup_targets.push(StartupPeerTarget { addr, score: 0 });
                 }
             }
             Err(e) => {
@@ -1107,9 +1106,7 @@ fn load_persistent_peer_targets(db: &Database, limit: usize) -> Vec<StartupPeerT
         .filter_map(|(_key, value)| PersistentPeerRecord::decode(&value))
         .collect();
 
-    records.sort_by(|a, b| {
-        peer_score(b).cmp(&peer_score(a))
-    });
+    records.sort_by(|a, b| peer_score(b).cmp(&peer_score(a)));
 
     records
         .into_iter()
@@ -1130,7 +1127,8 @@ fn persist_connected_peer(
     reputation: i32,
     latency_ms: u64,
 ) {
-    let mut record = PersistentPeerRecord::new(node_id.0, socket_addr_to_ip_bytes(addr), addr.port());
+    let mut record =
+        PersistentPeerRecord::new(node_id.0, socket_addr_to_ip_bytes(addr), addr.port());
     record.update_seen(reputation);
     record.latency_ms = latency_ms;
     if let Err(e) = node.db.put_peer(&node_id.0, &record.encode()) {
@@ -3037,7 +3035,10 @@ async fn handle_rpc_connection(
                 .to_string(),
             )
         }
-        "/metrics" => ("text/plain; version=0.0.4", render_prometheus_metrics(&node).await),
+        "/metrics" => (
+            "text/plain; version=0.0.4",
+            render_prometheus_metrics(&node).await,
+        ),
         _ => {
             let body = req
                 .split_once("\r\n\r\n")
@@ -4220,7 +4221,8 @@ mod integration_tests {
 
         let loaded = load_persistent_peer_targets(&db, 2);
         assert_eq!(loaded.len(), 2);
-        let addrs: std::collections::HashSet<SocketAddr> = loaded.into_iter().map(|t| t.addr).collect();
+        let addrs: std::collections::HashSet<SocketAddr> =
+            loaded.into_iter().map(|t| t.addr).collect();
         assert!(addrs.contains(&"10.0.0.3:9651".parse::<SocketAddr>().unwrap()));
         assert!(addrs.contains(&"10.0.0.2:9651".parse::<SocketAddr>().unwrap()));
     }
@@ -4254,7 +4256,8 @@ mod integration_tests {
     async fn test_rpc_platform_endpoints() {
         let node = make_test_node(1);
 
-        let validators_req = r#"{"jsonrpc":"2.0","method":"platform.getCurrentValidators","params":[],"id":1}"#;
+        let validators_req =
+            r#"{"jsonrpc":"2.0","method":"platform.getCurrentValidators","params":[],"id":1}"#;
         let validators = handle_rpc_request(validators_req, &node).await;
         assert!(validators.contains("validators"));
 
@@ -4262,7 +4265,8 @@ mod integration_tests {
         let subnets = handle_rpc_request(subnets_req, &node).await;
         assert!(subnets.contains("subnets"));
 
-        let status_req = r#"{"jsonrpc":"2.0","method":"platform.getBlockchainStatus","params":[],"id":3}"#;
+        let status_req =
+            r#"{"jsonrpc":"2.0","method":"platform.getBlockchainStatus","params":[],"id":3}"#;
         let status = handle_rpc_request(status_req, &node).await;
         assert!(status.contains("syncProgress"));
         assert!(status.contains("peerCount"));
@@ -4377,7 +4381,8 @@ mod integration_tests {
             while tokio::time::Instant::now() < deadline {
                 {
                     let pm = node.peer_manager.read().await;
-                    if pm.connected_count() > 0 && pm.active_peer_addrs().contains(&bootstrap_addr) {
+                    if pm.connected_count() > 0 && pm.active_peer_addrs().contains(&bootstrap_addr)
+                    {
                         saw_connected_this_attempt = true;
                         handshake_complete = true;
                     }
@@ -4503,17 +4508,17 @@ mod integration_tests {
         let mut fetched_cchain_block = false;
 
         for bootstrap_ip in FUJI_BOOTSTRAP_IPS.iter().take(4) {
-            let bootstrap_addr: SocketAddr = bootstrap_ip.parse().expect("valid fuji bootstrap address");
+            let bootstrap_addr: SocketAddr =
+                bootstrap_ip.parse().expect("valid fuji bootstrap address");
             let handle = tokio::spawn(connect_and_handshake(bootstrap_addr, node.clone()));
             let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
 
             while tokio::time::Instant::now() < deadline {
-                if node
-                    .db
-                    .iter_cf_owned(CF_BLOCKS)
-                    .iter()
-                    .any(|(k, raw)| k.len() == 34 && &k[..2] == b"c:" && BlockHeader::parse(raw, Chain::CChain).is_ok())
-                {
+                if node.db.iter_cf_owned(CF_BLOCKS).iter().any(|(k, raw)| {
+                    k.len() == 34
+                        && &k[..2] == b"c:"
+                        && BlockHeader::parse(raw, Chain::CChain).is_ok()
+                }) {
                     fetched_cchain_block = true;
                     break;
                 }

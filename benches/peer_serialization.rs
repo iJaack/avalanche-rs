@@ -34,5 +34,9 @@ fn bench_peer_message_deserialize(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_peer_message_serialize, bench_peer_message_deserialize);
+criterion_group!(
+    benches,
+    bench_peer_message_serialize,
+    bench_peer_message_deserialize
+);
 criterion_main!(benches);

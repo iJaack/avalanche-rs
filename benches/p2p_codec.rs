@@ -1,5 +1,4 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use prost::Message;
 
 fn bench_proto_encode_ping(c: &mut Criterion) {
     use avalanche_rs::network::NetworkMessage;
@@ -29,7 +28,7 @@ fn bench_proto_decode_ping(c: &mut Criterion) {
 }
 
 fn bench_proto_encode_put(c: &mut Criterion) {
-    use avalanche_rs::network::{BlockId, ChainId, NetworkMessage};
+    use avalanche_rs::network::{ChainId, NetworkMessage};
 
     let msg = NetworkMessage::Put {
         chain_id: ChainId([0xCC; 32]),
@@ -46,7 +45,7 @@ fn bench_proto_encode_put(c: &mut Criterion) {
 }
 
 fn bench_proto_decode_put(c: &mut Criterion) {
-    use avalanche_rs::network::{BlockId, ChainId, NetworkMessage};
+    use avalanche_rs::network::{ChainId, NetworkMessage};
 
     let msg = NetworkMessage::Put {
         chain_id: ChainId([0xCC; 32]),
