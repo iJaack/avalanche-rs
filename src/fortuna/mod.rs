@@ -19,7 +19,7 @@ pub const FORTUNA_FUJI_TIMESTAMP: u64 = 1741878000;
 pub const FORTUNA_MAINNET_TIMESTAMP: u64 = 1744127600;
 
 /// Granite activation timestamps (for latest-upgrade handshake).
-pub const GRANITE_MAINNET_TIMESTAMP: u64 = 1765296000;
+pub const GRANITE_MAINNET_TIMESTAMP: u64 = 1763568000;
 pub const GRANITE_FUJI_TIMESTAMP: u64 = 1761750000;
 
 /// Returns the latest activated upgrade timestamp for a given network.
