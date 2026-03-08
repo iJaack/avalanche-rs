@@ -181,6 +181,16 @@ struct Cli {
     /// Hex reward address where staking rewards should be sent.
     #[arg(long, env = "AVAX_REWARD_ADDRESS")]
     reward_address: Option<String>,
+
+    /// Enable PostgreSQL indexer for explorer backends.
+    #[cfg(feature = "indexer")]
+    #[arg(long, env = "INDEXER_ENABLED")]
+    indexer_enabled: bool,
+
+    /// PostgreSQL connection URL for the indexer.
+    #[cfg(feature = "indexer")]
+    #[arg(long, env = "DATABASE_URL", default_value = "postgres://indexer:indexer_pass@localhost/avalanche_indexer")]
+    database_url: String,
 }
 
 // ---------------------------------------------------------------------------

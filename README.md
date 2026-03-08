@@ -163,6 +163,24 @@ docker run -p 9650:9650 -p 9651:9651 avalanche-rs \
 docker compose up
 ```
 
+## Indexer Mode (Optional)
+
+Enable PostgreSQL indexing for explorer backends:
+
+```bash
+# Start database
+docker compose --profile indexer up -d
+
+# Build with indexer
+cargo build --release --features indexer
+
+# Run with indexer
+./target/release/avalanche-rs \
+  --network-id 5 \
+  --indexer-enabled \
+  --database-url postgres://indexer:indexer_pass@localhost/avalanche_indexer
+```
+
 ## Architecture
 
 ```

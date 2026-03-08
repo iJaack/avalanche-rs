@@ -58,6 +58,9 @@ pub mod validator;
 pub mod warp;
 pub mod websocket;
 
+#[cfg(feature = "indexer")]
+pub mod indexer;
+
 // Re-export common types for convenience
 pub use types::{
     AvalancheError, Block, BlockID, ChainID, NodeID, Result, Transaction, TransactionID, ID, UTXO,

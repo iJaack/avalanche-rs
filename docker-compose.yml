@@ -43,6 +43,22 @@ services:
         limits:
           memory: 8G
 
+  # Indexer database (used with --features indexer)
+  indexer-db:
+    image: timescale/timescaledb:latest-pg16
+    profiles: ["indexer"]
+    container_name: avalanche-indexer-db
+    environment:
+      POSTGRES_DB: avalanche_indexer
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: indexer_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: postgres -c shared_preload_libraries=timescaledb
+
 volumes:
   fuji-data:
   mainnet-data:
+  postgres_data:
