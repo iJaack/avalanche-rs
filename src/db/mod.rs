@@ -50,11 +50,62 @@ pub const META_LAST_ACCEPTED_HASH: &[u8] = b"last_accepted_hash";
 pub const META_STATE_ROOT: &[u8] = b"state_root";
 pub const META_CHAIN_ID: &[u8] = b"chain_id";
 
+const TRIE_NODE_RECORD_MAGIC: &[u8; 4] = b"MPT1";
+
 type RocksDB = DBWithThreadMode<MultiThreaded>;
 
 /// The database wrapper around RocksDB.
 pub struct Database {
     db: Arc<RocksDB>,
+}
+
+/// Persistent Merkle Patricia Trie node record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrieNodeRecord {
+    pub hash: [u8; 32],
+    pub node_bytes: Vec<u8>,
+    pub child_hashes: Vec<[u8; 32]>,
+}
+
+impl TrieNodeRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(42 + self.node_bytes.len() + self.child_hashes.len() * 32);
+        out.extend_from_slice(TRIE_NODE_RECORD_MAGIC);
+        out.extend_from_slice(&(self.child_hashes.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(self.node_bytes.len() as u32).to_be_bytes());
+        for child in &self.child_hashes {
+            out.extend_from_slice(child);
+        }
+        out.extend_from_slice(&self.node_bytes);
+        out
+    }
+
+    pub fn decode(hash: [u8; 32], bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 10 || &bytes[..4] != TRIE_NODE_RECORD_MAGIC {
+            return None;
+        }
+        let child_count = u16::from_be_bytes(bytes[4..6].try_into().ok()?) as usize;
+        let node_len = u32::from_be_bytes(bytes[6..10].try_into().ok()?) as usize;
+        let children_len = child_count.checked_mul(32)?;
+        let total = 10usize.checked_add(children_len)?.checked_add(node_len)?;
+        if bytes.len() < total {
+            return None;
+        }
+        let mut child_hashes = Vec::with_capacity(child_count);
+        let mut offset = 10;
+        for _ in 0..child_count {
+            let mut child = [0u8; 32];
+            child.copy_from_slice(&bytes[offset..offset + 32]);
+            child_hashes.push(child);
+            offset += 32;
+        }
+        let node_bytes = bytes[offset..offset + node_len].to_vec();
+        Some(Self {
+            hash,
+            node_bytes,
+            child_hashes,
+        })
+    }
 }
 
 impl Database {
@@ -293,6 +344,19 @@ impl Database {
     /// Get a trie node by hash.
     pub fn get_trie_node(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, DbError> {
         self.get_cf(CF_TRIE_NODES, hash)
+    }
+
+    /// Store a typed trie node record with explicit parent/child linkage metadata.
+    pub fn put_trie_node_record(&self, record: &TrieNodeRecord) -> Result<(), DbError> {
+        self.put_trie_node(&record.hash, &record.encode())
+    }
+
+    /// Load a typed trie node record.
+    pub fn get_trie_node_record(&self, hash: &[u8; 32]) -> Result<Option<TrieNodeRecord>, DbError> {
+        let Some(raw) = self.get_trie_node(hash)? else {
+            return Ok(None);
+        };
+        Ok(TrieNodeRecord::decode(*hash, &raw))
     }
 
     // -----------------------------------------------------------------------
@@ -840,6 +904,28 @@ mod tests {
         let node_data = b"trie node rlp";
         db.put_trie_node(&hash, node_data).unwrap();
         assert_eq!(db.get_trie_node(&hash).unwrap().unwrap(), node_data);
+    }
+
+    #[test]
+    fn test_trie_node_record_roundtrip() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let record = TrieNodeRecord {
+            hash: [0xCD; 32],
+            node_bytes: vec![1, 2, 3, 4, 5],
+            child_hashes: vec![[0x01; 32], [0x02; 32]],
+        };
+
+        db.put_trie_node_record(&record).unwrap();
+        let loaded = db.get_trie_node_record(&record.hash).unwrap().unwrap();
+        assert_eq!(loaded, record);
+    }
+
+    #[test]
+    fn test_trie_node_record_decode_rejects_plain_node_bytes() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let hash = [0xEF; 32];
+        db.put_trie_node(&hash, b"legacy-raw-node").unwrap();
+        assert!(db.get_trie_node_record(&hash).unwrap().is_none());
     }
 
     #[test]
