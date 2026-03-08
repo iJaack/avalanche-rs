@@ -33,7 +33,8 @@ use avalanche_rs::network::{
     BlockId, ChainId, NetworkConfig, NetworkMessage, NodeId, Peer, PeerInfo, PeerManager, PeerState,
 };
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
-use avalanche_rs::sync::{SyncConfig, SyncEngine, SyncPhase};
+use avalanche_rs::subnet::{SubnetId, SubnetTracker};
+use avalanche_rs::sync::{BlockFetchMode, SyncConfig, SyncEngine, SyncPhase};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -44,7 +45,8 @@ use avalanche_rs::sync::{SyncConfig, SyncEngine, SyncPhase};
 #[command(
     name = "avalanche-rs",
     version = "0.1.0",
-    about = "Production Avalanche full node"
+    about = "Production Avalanche full node",
+    after_help = "Examples:\n  avalanche-rs --network-id 1\n  avalanche-rs --network-id 5 --log-level debug\n  avalanche-rs --network-id 5 --subnet-id <SUBNET_ID> --tracked-subnets <SUBNET_ID>"
 )]
 struct Cli {
     /// Network ID (1 = mainnet, 5 = fuji)
@@ -58,6 +60,14 @@ struct Cli {
     /// Bootstrap node addresses (comma-separated ip:port)
     #[arg(long, value_delimiter = ',', env = "AVAX_BOOTSTRAP_IPS")]
     bootstrap_ips: Vec<String>,
+
+    /// Tracked subnet IDs (comma-separated, hex or CB58).
+    #[arg(long, default_value = "", env = "AVAX_TRACKED_SUBNETS")]
+    tracked_subnets: String,
+
+    /// Observe a specific Avalanche L1/subnet ID (hex or CB58).
+    #[arg(long, env = "AVAX_SUBNET_ID")]
+    subnet_id: Option<String>,
 
     /// Path to TLS certificate file (PEM)
     #[arg(long, env = "AVAX_TLS_CERT_FILE")]
@@ -465,6 +475,8 @@ struct NodeState {
     light_client: Arc<RwLock<avalanche_rs::light::LightClient>>,
     /// Archive store for historical state queries
     archive_store: Arc<ArchiveStore>,
+    /// Subnet/L1 tracker for observed chains and validators.
+    subnet_tracker: Arc<RwLock<SubnetTracker>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +604,9 @@ async fn main() {
     chain_id_bytes[31] = if cli.network_id == 1 { 0x01 } else { 0x05 };
     let sync_config = SyncConfig {
         chain_id: ChainId(chain_id_bytes),
+        block_fetch_mode: BlockFetchMode::GetAncestors {
+            max_containers_size: 2_000_000,
+        },
         ..Default::default()
     };
     let sync_engine = Arc::new(SyncEngine::new(sync_config));
@@ -627,6 +642,22 @@ async fn main() {
         info!("Archive mode enabled — all historical state will be preserved");
     }
 
+    let mut subnet_tracker = SubnetTracker::new();
+    subnet_tracker.add_subnet(SubnetId::primary_network());
+    for subnet in SubnetTracker::parse_tracked_subnets(&cli.tracked_subnets) {
+        subnet_tracker.add_subnet(subnet);
+    }
+    if let Some(subnet_id) = cli.subnet_id.as_deref().and_then(SubnetId::from_str_any) {
+        subnet_tracker.observe_l1_chain(
+            subnet_id.clone(),
+            ChainId(chain_id_bytes),
+            format!("L1-{}", &subnet_id.to_hex()[..8]),
+            "customvm",
+        );
+        info!("Tracking requested subnet/L1 {}", subnet_id);
+    }
+    let subnet_tracker = Arc::new(RwLock::new(subnet_tracker));
+
     let node = Arc::new(NodeState {
         identity,
         db,
@@ -644,6 +675,7 @@ async fn main() {
         pending_txs: Arc::new(RwLock::new(Vec::new())),
         light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
         archive_store,
+        subnet_tracker,
     });
 
     // Log light client mode
@@ -1109,6 +1141,19 @@ async fn connect_and_handshake(
     bloom_filter_bytes.extend_from_slice(&bloom_seed.to_be_bytes()); // 8-byte seed
     bloom_filter_bytes.push(0u8); // 1 byte of entries (empty = we know nobody)
 
+    let mut tracked_subnets = SubnetTracker::parse_tracked_subnets(&node.config.tracked_subnets);
+    if let Some(subnet_id) = &node.config.subnet_id {
+        if let Some(parsed) = SubnetId::from_str_any(subnet_id) {
+            tracked_subnets.push(parsed);
+        }
+    }
+    tracked_subnets.sort_by_key(|s| s.0);
+    tracked_subnets.dedup();
+    let tracked_subnet_bytes: Vec<bytes::Bytes> = tracked_subnets
+        .iter()
+        .map(|s| bytes::Bytes::from(s.0.to_vec()))
+        .collect();
+
     let bloom_salt: [u8; 8] = rand::thread_rng().gen();
     let handshake_proto = pb::Message {
         message: Some(pb::message::Message::Handshake(pb::Handshake {
@@ -1120,7 +1165,7 @@ async fn connect_and_handshake(
             upgrade_time,
             ip_signing_time: now,
             ip_node_id_sig: bytes::Bytes::from(ip_sig),
-            tracked_subnets: vec![],
+            tracked_subnets: tracked_subnet_bytes.clone(),
             client: Some(pb::Client {
                 name: "avalanchego".into(),
                 major: 1,
@@ -1134,7 +1179,7 @@ async fn connect_and_handshake(
                 salt: bytes::Bytes::from(bloom_salt.to_vec()),
             }),
             ip_bls_sig: bytes::Bytes::from(bls_sig),
-            all_subnets: true,
+            all_subnets: tracked_subnet_bytes.is_empty(),
         })),
     };
 
@@ -1288,6 +1333,7 @@ async fn connect_and_handshake(
     // C-Chain bootstrap state
     let mut cchain_bootstrap_state = CChainBootstrapState::Idle;
     let mut cchain_frontier: Option<[u8; 32]> = None;
+    let mut cchain_ancestors_target: Option<[u8; 32]> = None;
 
     // Continuous sync: check for new blocks every 2s after bootstrap completes
     let mut sync_timer = tokio::time::interval(Duration::from_secs(2));
@@ -1567,6 +1613,7 @@ async fn connect_and_handshake(
                                                         if !container_ids.is_empty() {
                                                             let new_req = req + 1;
                                                             let target = container_ids.into_iter().next().unwrap();
+                                                            let target_id = target.0;
                                                             let get_ancestors = NetworkMessage::GetAncestors {
                                                                 chain_id: ChainId(cchain_id),
                                                                 request_id: new_req,
@@ -1578,6 +1625,7 @@ async fn connect_and_handshake(
                                                                 if tls_stream.write_all(&encoded).await.is_ok() {
                                                                     let _ = tls_stream.flush().await;
                                                                     info!("C-Chain Bootstrap: sent GetAncestors (req={}) to {}", new_req, addr);
+                                                                    cchain_ancestors_target = Some(target_id);
                                                                     cchain_bootstrap_state = CChainBootstrapState::WaitingAncestors(new_req);
                                                                 }
                                                             }
@@ -1637,6 +1685,14 @@ async fn connect_and_handshake(
 
                                                     if let Some((req, depth, prev_total)) = expected_req {
                                                         if request_id == req {
+                                                            if let Some(target_id) = cchain_ancestors_target {
+                                                                if let Err(e) = SyncEngine::validate_cchain_ancestor_chain(&containers, target_id) {
+                                                                    warn!("C-Chain Bootstrap: invalid ancestor hash chain: {}", e);
+                                                                    cchain_bootstrap_state = CChainBootstrapState::Done;
+                                                                    continue;
+                                                                }
+                                                            }
+
                                                             let mut stored = 0u32;
                                                             let mut oldest_container: Option<Vec<u8>> = None;
 
@@ -1734,6 +1790,7 @@ async fn connect_and_handshake(
                                                                             "C-Chain Bootstrap: recursive GetAncestors depth={} req={} (total: {})",
                                                                             new_depth, new_req, new_total
                                                                         );
+                                                                        cchain_ancestors_target = Some(oldest_id);
                                                                         cchain_bootstrap_state = CChainBootstrapState::FetchingAncestors {
                                                                             req: new_req,
                                                                             depth: new_depth,
@@ -3748,6 +3805,8 @@ mod integration_tests {
                 network_id: 1,
                 data_dir: PathBuf::from("./data/test-mainnet-sync"),
                 bootstrap_ips: vec![],
+                tracked_subnets: "".to_string(),
+                subnet_id: None,
                 staking_tls_cert_file: None,
                 staking_tls_key_file: None,
                 http_port: 0,
@@ -3777,6 +3836,7 @@ mod integration_tests {
             pending_txs: Arc::new(RwLock::new(Vec::new())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
+            subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
         });
 
         let mut handshake_complete = false;
@@ -3837,6 +3897,117 @@ mod integration_tests {
         assert!(
             fetched_pchain_block,
             "expected to fetch at least one P-Chain block from mainnet bootstrap"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires outbound fuji connectivity"]
+    async fn test_fuji_sync_fetches_cchain_blocks() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let identity = NodeIdentity::generate().expect("generate node identity");
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        let evm = Arc::new(RwLock::new(EvmExecutor::new(43113)));
+
+        let net_config = NetworkConfig {
+            network_id: 5,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(RwLock::new(PeerManager::new(
+            net_config,
+            identity.node_id.clone(),
+        )));
+
+        let mut chain_id_bytes = [0u8; 32];
+        chain_id_bytes[31] = 0x05;
+        let sync_engine = Arc::new(SyncEngine::new(SyncConfig {
+            chain_id: ChainId(chain_id_bytes),
+            block_fetch_mode: BlockFetchMode::GetAncestors {
+                max_containers_size: 2_000_000,
+            },
+            ..Default::default()
+        }));
+
+        let node = Arc::new(NodeState {
+            identity,
+            db,
+            evm,
+            sync_engine,
+            peer_manager,
+            config: Cli {
+                network_id: 5,
+                data_dir: PathBuf::from("./data/test-fuji-sync"),
+                bootstrap_ips: vec![],
+                tracked_subnets: "".to_string(),
+                subnet_id: None,
+                staking_tls_cert_file: None,
+                staking_tls_key_file: None,
+                http_port: 0,
+                staking_port: 9651,
+                log_level: "info".to_string(),
+                log_format: "pretty".to_string(),
+                chain_id: 43113,
+                validator: false,
+                state_pruning_depth: 256,
+                light_client: false,
+                archive: false,
+                blob_retention_epochs: 4096,
+                txpool_size: 4096,
+                block_cache_size: 1024,
+                rpc_max_body_size: 5_242_880,
+                max_memory_mb: 0,
+                log_max_size: 100,
+                log_max_files: 10,
+            },
+            start_time: Instant::now(),
+            validators: std::collections::HashMap::new(),
+            validators_seen: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            total_stake_weight: Arc::new(RwLock::new(0u64)),
+            p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
+            pending_txs: Arc::new(RwLock::new(Vec::new())),
+            light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
+            archive_store: Arc::new(ArchiveStore::new(false)),
+            subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
+        });
+
+        let mut fetched_cchain_block = false;
+
+        for bootstrap_ip in FUJI_BOOTSTRAP_IPS.iter().take(4) {
+            let bootstrap_addr: SocketAddr = bootstrap_ip.parse().expect("valid fuji bootstrap address");
+            let handle = tokio::spawn(connect_and_handshake(bootstrap_addr, node.clone()));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+
+            while tokio::time::Instant::now() < deadline {
+                if node
+                    .db
+                    .iter_cf_owned(CF_BLOCKS)
+                    .iter()
+                    .any(|(k, raw)| k.len() == 34 && &k[..2] == b"c:" && BlockHeader::parse(raw, Chain::CChain).is_ok())
+                {
+                    fetched_cchain_block = true;
+                    break;
+                }
+
+                if handle.is_finished() {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            handle.abort();
+            let _ = handle.await;
+
+            if fetched_cchain_block {
+                break;
+            }
+        }
+
+        assert!(
+            fetched_cchain_block,
+            "expected to fetch at least one C-Chain block from fuji bootstrap"
         );
     }
 

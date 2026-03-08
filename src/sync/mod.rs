@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::network::{BlockId, ChainId, NetworkMessage, NodeId};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -170,6 +171,17 @@ pub struct SyncConfig {
     pub max_pending_requests: usize,
     /// Maximum number of retries per request.
     pub max_retries: u32,
+    /// Strategy for fetching blocks during bootstrap.
+    pub block_fetch_mode: BlockFetchMode,
+}
+
+/// Strategy to fetch historical blocks.
+#[derive(Debug, Clone)]
+pub enum BlockFetchMode {
+    /// Fetch one container per request.
+    Get,
+    /// Fetch a linked ancestor batch per request.
+    GetAncestors { max_containers_size: u32 },
 }
 
 impl Default for SyncConfig {
@@ -180,6 +192,7 @@ impl Default for SyncConfig {
             max_ancestors_per_request: 256,
             max_pending_requests: 32,
             max_retries: 3,
+            block_fetch_mode: BlockFetchMode::Get,
         }
     }
 }
@@ -419,15 +432,58 @@ impl SyncEngine {
                 current
             };
 
-            let msg = NetworkMessage::Get {
-                chain_id: self.config.chain_id.clone(),
-                request_id: req_id,
-                deadline: self.config.request_timeout.as_nanos() as u64,
-                container_id: block_id,
+            let msg = match self.config.block_fetch_mode {
+                BlockFetchMode::Get => NetworkMessage::Get {
+                    chain_id: self.config.chain_id.clone(),
+                    request_id: req_id,
+                    deadline: self.config.request_timeout.as_nanos() as u64,
+                    container_id: block_id,
+                },
+                BlockFetchMode::GetAncestors {
+                    max_containers_size,
+                } => NetworkMessage::GetAncestors {
+                    chain_id: self.config.chain_id.clone(),
+                    request_id: req_id,
+                    deadline: self.config.request_timeout.as_nanos() as u64,
+                    container_id: block_id,
+                    max_containers_size,
+                },
             };
             messages.push((peer.clone(), msg));
         }
         messages
+    }
+
+    /// Validate a C-Chain ancestor response as a linked hash chain.
+    ///
+    /// For `GetAncestors(target)`, container[0] must hash to `target` and every
+    /// subsequent container must hash to the previous block's parent hash.
+    pub fn validate_cchain_ancestor_chain(
+        containers: &[Vec<u8>],
+        target_id: [u8; 32],
+    ) -> Result<(), String> {
+        if containers.is_empty() {
+            return Err("empty ancestor container list".to_string());
+        }
+
+        let mut expected_id = target_id;
+        for (index, container) in containers.iter().enumerate() {
+            let block_id: [u8; 32] = Sha256::digest(container).into();
+            if block_id != expected_id {
+                return Err(format!(
+                    "hash-chain mismatch at index {}: expected {:02x?}, got {:02x?}",
+                    index,
+                    &expected_id[..4],
+                    &block_id[..4]
+                ));
+            }
+
+            let header = crate::block::BlockHeader::parse(container, crate::block::Chain::CChain)
+                .map_err(|e| format!("failed to parse C-Chain block {}: {}", index, e))?;
+            expected_id = header.parent_id;
+        }
+
+        Ok(())
     }
 
     /// Check if sync is complete.
@@ -849,6 +905,113 @@ mod tests {
         let messages = engine.generate_fetch_requests(&peers).await;
         assert_eq!(messages.len(), 3);
         assert_eq!(engine.phase().await, SyncPhase::Fetching);
+        assert!(matches!(messages[0].1, NetworkMessage::Get { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_generate_fetch_requests_cchain_ancestors_mode() {
+        let config = SyncConfig {
+            chain_id: test_chain_id(),
+            max_pending_requests: 10,
+            block_fetch_mode: BlockFetchMode::GetAncestors {
+                max_containers_size: 2_000_000,
+            },
+            ..Default::default()
+        };
+        let engine = SyncEngine::new(config);
+        let peers = test_peers();
+
+        let peer = NodeId([1; 20]);
+        let ids = vec![BlockId([1; 32]), BlockId([2; 32]), BlockId([3; 32])];
+        engine.handle_accepted(&peer, &ids).await;
+
+        let messages = engine.generate_fetch_requests(&peers).await;
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[0].1, NetworkMessage::GetAncestors { .. }));
+    }
+
+    #[test]
+    fn test_validate_cchain_ancestor_chain() {
+        fn encode_len(len: usize, offset: u8) -> Vec<u8> {
+            if len <= 55 {
+                vec![offset + len as u8]
+            } else {
+                vec![offset + 56, len as u8]
+            }
+        }
+
+        fn enc_u64(value: u64) -> Vec<u8> {
+            if value == 0 {
+                return vec![0x80];
+            }
+            let bytes = value.to_be_bytes();
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+            let data = &bytes[start..];
+            if data.len() == 1 && data[0] < 0x80 {
+                vec![data[0]]
+            } else {
+                let mut out = vec![0x80 + data.len() as u8];
+                out.extend_from_slice(data);
+                out
+            }
+        }
+
+        fn enc_bytes(data: &[u8]) -> Vec<u8> {
+            if data.len() == 1 && data[0] < 0x80 {
+                vec![data[0]]
+            } else {
+                let mut out = encode_len(data.len(), 0x80);
+                out.extend_from_slice(data);
+                out
+            }
+        }
+
+        fn enc_list(items: Vec<Vec<u8>>) -> Vec<u8> {
+            let payload_len: usize = items.iter().map(Vec::len).sum();
+            let mut out = encode_len(payload_len, 0xc0);
+            for item in items {
+                out.extend_from_slice(&item);
+            }
+            out
+        }
+
+        fn build_cchain_block(parent: [u8; 32], number: u64, timestamp: u64) -> Vec<u8> {
+            let header = enc_list(vec![
+                enc_bytes(&parent),
+                enc_bytes(&[0u8; 32]),
+                enc_bytes(&[0u8; 20]),
+                enc_bytes(&[1u8; 32]),
+                enc_bytes(&[2u8; 32]),
+                enc_bytes(&[3u8; 32]),
+                enc_bytes(&[0u8; 256]),
+                enc_u64(0),
+                enc_u64(number),
+                enc_u64(15_000_000),
+                enc_u64(21_000),
+                enc_u64(timestamp),
+                enc_bytes(&[]),
+                enc_bytes(&[0u8; 32]),
+                enc_bytes(&[0u8; 8]),
+                enc_u64(0),
+                enc_u64(0),
+            ]);
+            let txs = enc_list(vec![]);
+            let uncles = enc_list(vec![]);
+            enc_list(vec![header, txs, uncles])
+        }
+
+        let genesis = build_cchain_block([0u8; 32], 0, 1_700_000_000);
+        let genesis_id: [u8; 32] = Sha256::digest(&genesis).into();
+        let block1 = build_cchain_block(genesis_id, 1, 1_700_000_002);
+        let block1_id: [u8; 32] = Sha256::digest(&block1).into();
+        let block2 = build_cchain_block(block1_id, 2, 1_700_000_004);
+        let bad = build_cchain_block([9u8; 32], 2, 1_700_000_004);
+
+        let good = vec![block2.clone(), block1.clone(), genesis.clone()];
+        assert!(SyncEngine::validate_cchain_ancestor_chain(&good, Sha256::digest(&block2).into()).is_ok());
+
+        let bad_chain = vec![bad, block1, genesis];
+        assert!(SyncEngine::validate_cchain_ancestor_chain(&bad_chain, Sha256::digest(&block2).into()).is_err());
     }
 
     #[tokio::test]
