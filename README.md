@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml)
 
-A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 31K lines of Rust, 663 tests, 8.5 MB binary.
+A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 31.6K lines of Rust, 670 tests, 8.5 MB binary.
 
 ## Benchmarks vs AvalancheGo 1.14.1
 
@@ -112,9 +112,26 @@ cargo build --release
 # Run on mainnet
 ./target/release/avalanche-rs \
   --network-id 1 \
-  --bootstrap-ips "54.94.43.49:9651" \
+  --bootstrap-ips "54.232.137.108:9651" \
   --staking-port 9651 \
   --http-port 9650
+
+# Run as a mainnet observer (all default subnets)
+./target/release/avalanche-rs \
+  --network-id 1 \
+  --log-level info
+
+# Run as a Fuji dev tool with explicit bootstrap + debug logs
+./target/release/avalanche-rs \
+  --network-id 5 \
+  --bootstrap-ips "52.29.72.46:9651" \
+  --log-level debug
+
+# Monitor a specific subnet/L1
+./target/release/avalanche-rs \
+  --network-id 5 \
+  --subnet-id 11111111111111111111111111111111LpoYY \
+  --tracked-subnets 11111111111111111111111111111111LpoYY
 
 # Light client mode (headers only, minimal memory)
 ./target/release/avalanche-rs \
@@ -250,7 +267,7 @@ Targets: `protobuf_parse`, `block_parse`, `rpc_input`, `bloom_parse`, `rlp_decod
 ## Development
 
 ```bash
-# Run all tests (663 tests)
+# Run all tests (670 tests)
 cargo test
 
 # Run with clippy
@@ -269,7 +286,7 @@ cargo build --release
 ## Stats
 
 - **30,832 lines** of Rust (src + crates)
-- **663 tests** passing
+- **670 tests** passing
 - **8.5 MB** release binary (LTO + strip)
 - **67 MB** RSS at steady state (26.7× less than AvalancheGo)
 

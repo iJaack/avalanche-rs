@@ -9,9 +9,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify tests and features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+
   build-linux-amd64:
     name: Build linux-amd64
     runs-on: ubuntu-latest
+    needs: [verify]
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
@@ -31,6 +44,7 @@ jobs:
   build-linux-arm64:
     name: Build linux-arm64
     runs-on: ubuntu-latest
+    needs: [verify]
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
@@ -61,6 +75,7 @@ jobs:
   build-darwin-arm64:
     name: Build darwin-arm64
     runs-on: macos-latest
+    needs: [verify]
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
