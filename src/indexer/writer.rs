@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 /// Data types for indexing — mapped from core types to DB schema.
 
@@ -86,12 +86,22 @@ impl IndexerWriter {
         // Spawn background batch processor
         let bg_pool = pool.clone();
         tokio::spawn(batch_processor(bg_pool, rx));
+        info!("Indexer batch processor started");
 
         Ok(Self { pool, tx })
     }
 
     /// Send a block to the indexing queue. Non-blocking.
     pub async fn index_block(&self, block: IndexedBlock) {
+        debug!(
+            "Indexer: enqueuing block #{} (hash={:02x}{:02x}{:02x}{:02x}..., {} txs)",
+            block.number,
+            block.hash.get(0).unwrap_or(&0),
+            block.hash.get(1).unwrap_or(&0),
+            block.hash.get(2).unwrap_or(&0),
+            block.hash.get(3).unwrap_or(&0),
+            block.transactions.len()
+        );
         if let Err(e) = self.tx.send(block).await {
             error!("Failed to enqueue block for indexing: {}", e);
         }
@@ -112,20 +122,25 @@ async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
     let mut batch: Vec<IndexedBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut flush_interval = tokio::time::interval(FLUSH_INTERVAL);
     flush_interval.tick().await; // skip immediate tick
+    
+    info!("Indexer batch processor: waiting for blocks...");
 
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
                     Some(block) => {
+                        debug!("Batch processor: received block #{}", block.number);
                         batch.push(block);
                         if batch.len() >= BATCH_SIZE {
+                            info!("Batch processor: reached {} blocks, flushing...", batch.len());
                             flush_batch(&pool, &mut batch).await;
                         }
                     }
                     None => {
                         // Channel closed — flush remaining and exit
                         if !batch.is_empty() {
+                            info!("Batch processor: channel closed, flushing {} remaining blocks", batch.len());
                             flush_batch(&pool, &mut batch).await;
                         }
                         info!("Indexer batch processor shutting down");
@@ -135,6 +150,7 @@ async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
             }
             _ = flush_interval.tick() => {
                 if !batch.is_empty() {
+                    info!("Batch processor: {} blocks pending, flushing on timer...", batch.len());
                     flush_batch(&pool, &mut batch).await;
                 }
             }
@@ -144,23 +160,31 @@ async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
 
 async fn flush_batch(pool: &PgPool, batch: &mut Vec<IndexedBlock>) {
     let count = batch.len();
+    let first_num = batch.first().map(|b| b.number).unwrap_or(0);
+    let last_num = batch.last().map(|b| b.number).unwrap_or(0);
+    
+    debug!("Flushing batch of {} blocks (#{} to #{})", count, first_num, last_num);
+    
     if let Err(e) = write_batch(pool, batch).await {
         error!("Failed to write batch of {} blocks: {}", count, e);
     } else {
-        info!("Indexed batch of {} blocks", count);
+        info!("✅ Indexed batch of {} blocks (#{} to #{})", count, first_num, last_num);
     }
     batch.clear();
 }
 
 async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let mut blocks_inserted = 0;
+    let mut txs_inserted = 0;
+    let mut logs_inserted = 0;
 
     for block in blocks {
-        // 1. Insert block
-        sqlx::query(
+        // 1. Insert block (ON CONFLICT with both hash AND timestamp for TimescaleDB)
+        let result = sqlx::query(
             "INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count, size)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (hash) DO NOTHING",
+             ON CONFLICT (hash, timestamp) DO NOTHING",
         )
         .bind(block.number)
         .bind(&block.hash)
@@ -172,13 +196,17 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx:
         .bind(block.size)
         .execute(&mut *tx)
         .await?;
+        
+        if result.rows_affected() > 0 {
+            blocks_inserted += 1;
+        }
 
         // 2. Insert transactions
         for txn in &block.transactions {
-            sqlx::query(
+            let result = sqlx::query(
                 "INSERT INTO transactions (hash, block_hash, block_number, from_address, to_address, value, gas_price, gas_limit, gas_used, input, nonce, status, tx_index, timestamp)
                  VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9, $10, $11, $12, $13, $14)
-                 ON CONFLICT (hash) DO NOTHING",
+                 ON CONFLICT (hash, timestamp) DO NOTHING",
             )
             .bind(&txn.hash)
             .bind(&txn.block_hash)
@@ -196,13 +224,17 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx:
             .bind(txn.timestamp)
             .execute(&mut *tx)
             .await?;
+            
+            if result.rows_affected() > 0 {
+                txs_inserted += 1;
+            }
 
             // 3. Insert logs
             for log in &txn.logs {
-                sqlx::query(
+                let result = sqlx::query(
                     "INSERT INTO logs (transaction_hash, block_number, log_index, address, topic0, topic1, topic2, topic3, data, timestamp)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                     ON CONFLICT (transaction_hash, log_index) DO NOTHING",
+                     ON CONFLICT (transaction_hash, log_index, timestamp) DO NOTHING",
                 )
                 .bind(&log.transaction_hash)
                 .bind(log.block_number)
@@ -216,6 +248,10 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx:
                 .bind(log.timestamp)
                 .execute(&mut *tx)
                 .await?;
+                
+                if result.rows_affected() > 0 {
+                    logs_inserted += 1;
+                }
             }
 
             // 4. Update address balances (from_address always exists)
@@ -227,6 +263,10 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx:
     }
 
     tx.commit().await?;
+    debug!(
+        "DB write complete: {} blocks, {} txs, {} logs inserted",
+        blocks_inserted, txs_inserted, logs_inserted
+    );
     Ok(())
 }
 
