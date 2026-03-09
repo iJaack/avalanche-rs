@@ -189,7 +189,11 @@ struct Cli {
 
     /// PostgreSQL connection URL for the indexer.
     #[cfg(feature = "indexer")]
-    #[arg(long, env = "DATABASE_URL", default_value = "postgres://indexer:indexer_pass@localhost/avalanche_indexer")]
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        default_value = "postgres://indexer:indexer_pass@localhost/avalanche_indexer"
+    )]
     database_url: String,
 }
 
@@ -4316,6 +4320,10 @@ mod integration_tests {
                 stake_duration: None,
                 delegation_fee: None,
                 reward_address: None,
+                #[cfg(feature = "indexer")]
+                indexer_enabled: false,
+                #[cfg(feature = "indexer")]
+                database_url: String::new(),
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
@@ -4497,6 +4505,10 @@ mod integration_tests {
                 stake_duration: None,
                 delegation_fee: None,
                 reward_address: None,
+                #[cfg(feature = "indexer")]
+                indexer_enabled: false,
+                #[cfg(feature = "indexer")]
+                database_url: String::new(),
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
@@ -4637,6 +4649,10 @@ mod integration_tests {
                 stake_duration: None,
                 delegation_fee: None,
                 reward_address: None,
+                #[cfg(feature = "indexer")]
+                indexer_enabled: false,
+                #[cfg(feature = "indexer")]
+                database_url: String::new(),
             },
             start_time: Instant::now(),
             validators: std::collections::HashMap::new(),
