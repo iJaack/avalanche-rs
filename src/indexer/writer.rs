@@ -1,8 +1,72 @@
+use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+
+/// Data types for indexing — mapped from core types to DB schema.
+
+#[derive(Debug, Clone)]
+pub struct IndexedBlock {
+    pub number: i64,
+    pub hash: Vec<u8>,
+    pub parent_hash: Vec<u8>,
+    pub timestamp: DateTime<Utc>,
+    pub gas_used: i64,
+    pub gas_limit: i64,
+    pub transaction_count: i32,
+    pub size: i64,
+    pub transactions: Vec<IndexedTransaction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedTransaction {
+    pub hash: Vec<u8>,
+    pub block_hash: Vec<u8>,
+    pub block_number: i64,
+    pub from_address: Vec<u8>,
+    pub to_address: Option<Vec<u8>>,
+    pub value: String, // NUMERIC(78,0) as string
+    pub gas_price: Option<i64>,
+    pub gas_limit: Option<i64>,
+    pub gas_used: Option<i64>,
+    pub input: Option<Vec<u8>>,
+    pub nonce: Option<i64>,
+    pub status: Option<i16>,
+    pub tx_index: i32,
+    pub timestamp: DateTime<Utc>,
+    pub logs: Vec<IndexedLog>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedLog {
+    pub transaction_hash: Vec<u8>,
+    pub block_number: i64,
+    pub log_index: i32,
+    pub address: Vec<u8>,
+    pub topic0: Option<Vec<u8>>,
+    pub topic1: Option<Vec<u8>>,
+    pub topic2: Option<Vec<u8>>,
+    pub topic3: Option<Vec<u8>>,
+    pub data: Option<Vec<u8>>,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BalanceUpdate {
+    pub address: Vec<u8>,
+    pub balance: String, // NUMERIC(78,0) as string
+    pub nonce: i64,
+    pub block_number: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+const BATCH_SIZE: usize = 100;
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct IndexerWriter {
     pool: PgPool,
+    tx: mpsc::Sender<IndexedBlock>,
 }
 
 impl IndexerWriter {
@@ -17,10 +81,173 @@ impl IndexerWriter {
         // Run migrations
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        Ok(Self { pool })
+        let (tx, rx) = mpsc::channel::<IndexedBlock>(1024);
+
+        // Spawn background batch processor
+        let bg_pool = pool.clone();
+        tokio::spawn(batch_processor(bg_pool, rx));
+
+        Ok(Self { pool, tx })
+    }
+
+    /// Send a block to the indexing queue. Non-blocking.
+    pub async fn index_block(&self, block: IndexedBlock) {
+        if let Err(e) = self.tx.send(block).await {
+            error!("Failed to enqueue block for indexing: {}", e);
+        }
+    }
+
+    /// Get a clone of the connection pool (for IndexerQuery).
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
     }
 
     pub async fn close(self) {
+        drop(self.tx); // signal shutdown to batch processor
         self.pool.close().await;
     }
+}
+
+async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
+    let mut batch: Vec<IndexedBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut flush_interval = tokio::time::interval(FLUSH_INTERVAL);
+    flush_interval.tick().await; // skip immediate tick
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Some(block) => {
+                        batch.push(block);
+                        if batch.len() >= BATCH_SIZE {
+                            flush_batch(&pool, &mut batch).await;
+                        }
+                    }
+                    None => {
+                        // Channel closed — flush remaining and exit
+                        if !batch.is_empty() {
+                            flush_batch(&pool, &mut batch).await;
+                        }
+                        info!("Indexer batch processor shutting down");
+                        return;
+                    }
+                }
+            }
+            _ = flush_interval.tick() => {
+                if !batch.is_empty() {
+                    flush_batch(&pool, &mut batch).await;
+                }
+            }
+        }
+    }
+}
+
+async fn flush_batch(pool: &PgPool, batch: &mut Vec<IndexedBlock>) {
+    let count = batch.len();
+    if let Err(e) = write_batch(pool, batch).await {
+        error!("Failed to write batch of {} blocks: {}", count, e);
+    } else {
+        info!("Indexed batch of {} blocks", count);
+    }
+    batch.clear();
+}
+
+async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    for block in blocks {
+        // 1. Insert block
+        sqlx::query(
+            "INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count, size)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (hash) DO NOTHING",
+        )
+        .bind(block.number)
+        .bind(&block.hash)
+        .bind(&block.parent_hash)
+        .bind(block.timestamp)
+        .bind(block.gas_used)
+        .bind(block.gas_limit)
+        .bind(block.transaction_count)
+        .bind(block.size)
+        .execute(&mut *tx)
+        .await?;
+
+        // 2. Insert transactions
+        for txn in &block.transactions {
+            sqlx::query(
+                "INSERT INTO transactions (hash, block_hash, block_number, from_address, to_address, value, gas_price, gas_limit, gas_used, input, nonce, status, tx_index, timestamp)
+                 VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9, $10, $11, $12, $13, $14)
+                 ON CONFLICT (hash) DO NOTHING",
+            )
+            .bind(&txn.hash)
+            .bind(&txn.block_hash)
+            .bind(txn.block_number)
+            .bind(&txn.from_address)
+            .bind(&txn.to_address)
+            .bind(&txn.value)
+            .bind(txn.gas_price)
+            .bind(txn.gas_limit)
+            .bind(txn.gas_used)
+            .bind(&txn.input)
+            .bind(txn.nonce)
+            .bind(txn.status)
+            .bind(txn.tx_index)
+            .bind(txn.timestamp)
+            .execute(&mut *tx)
+            .await?;
+
+            // 3. Insert logs
+            for log in &txn.logs {
+                sqlx::query(
+                    "INSERT INTO logs (transaction_hash, block_number, log_index, address, topic0, topic1, topic2, topic3, data, timestamp)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     ON CONFLICT (transaction_hash, log_index) DO NOTHING",
+                )
+                .bind(&log.transaction_hash)
+                .bind(log.block_number)
+                .bind(log.log_index)
+                .bind(&log.address)
+                .bind(&log.topic0)
+                .bind(&log.topic1)
+                .bind(&log.topic2)
+                .bind(&log.topic3)
+                .bind(&log.data)
+                .bind(log.timestamp)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // 4. Update address balances (from_address always exists)
+            update_balance(&mut tx, &txn.from_address, txn.block_number, txn.timestamp).await?;
+            if let Some(to_addr) = &txn.to_address {
+                update_balance(&mut tx, to_addr, txn.block_number, txn.timestamp).await?;
+            }
+        }
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn update_balance(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    address: &[u8],
+    block_number: i64,
+    timestamp: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    // Upsert: only update if block_number is newer
+    sqlx::query(
+        "INSERT INTO address_balances (address, balance, nonce, last_updated_block, last_updated_at)
+         VALUES ($1, 0, 0, $2, $3)
+         ON CONFLICT (address) DO UPDATE
+         SET last_updated_block = GREATEST(address_balances.last_updated_block, $2),
+             last_updated_at = CASE WHEN $2 > address_balances.last_updated_block THEN $3 ELSE address_balances.last_updated_at END",
+    )
+    .bind(address)
+    .bind(block_number)
+    .bind(timestamp)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }

@@ -59,6 +59,8 @@ pub mod warp;
 pub mod websocket;
 
 #[cfg(feature = "indexer")]
+pub mod api;
+#[cfg(feature = "indexer")]
 pub mod indexer;
 
 // Re-export common types for convenience

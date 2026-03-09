@@ -6,4 +6,4 @@ pub mod writer;
 #[cfg(feature = "indexer")]
 pub use query::IndexerQuery;
 #[cfg(feature = "indexer")]
-pub use writer::IndexerWriter;
+pub use writer::{IndexedBlock, IndexedLog, IndexedTransaction, IndexerWriter};

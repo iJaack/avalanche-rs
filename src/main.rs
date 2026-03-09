@@ -54,6 +54,11 @@ use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
 use avalanche_rs::subnet::{SubnetId, SubnetTracker};
 use avalanche_rs::sync::{BlockFetchMode, SyncConfig, SyncEngine, SyncPhase};
 
+#[cfg(feature = "indexer")]
+use avalanche_rs::api;
+#[cfg(feature = "indexer")]
+use avalanche_rs::indexer::{IndexerQuery, IndexerWriter};
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -922,12 +927,39 @@ async fn main() {
         info!("State pruning enabled: depth={}", prune_depth);
     }
 
+    // 11. Start indexer and REST API (when --indexer-enabled)
+    #[cfg(feature = "indexer")]
+    let _indexer_handles = {
+        if node.config.indexer_enabled {
+            match IndexerWriter::new(&node.config.database_url).await {
+                Ok(writer) => {
+                    let query = IndexerQuery::new(writer.pool());
+                    let api_router = api::router(query);
+                    let api_addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+                    info!("Starting REST API server on {}", api_addr);
+                    let api_handle = tokio::spawn(async move {
+                        let listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
+                        axum::serve(listener, api_router).await.unwrap();
+                    });
+                    info!("PostgreSQL indexer enabled, REST API on port 8080");
+                    Some((writer, api_handle))
+                }
+                Err(e) => {
+                    error!("Failed to initialize indexer: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     info!(
         "Node started: p2p=:{}, http=:{}, node_id={}",
         node.config.staking_port, node.config.http_port, node.identity.node_id
     );
 
-    // 10. Graceful shutdown
+    // 12. Graceful shutdown
     let sig = wait_for_shutdown_signal().await;
     info!("Received {}, shutting down gracefully...", sig);
 
