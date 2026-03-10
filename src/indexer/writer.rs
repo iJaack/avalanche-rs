@@ -100,7 +100,7 @@ impl IndexerWriter {
         debug!(
             "Indexer: enqueuing block #{} (hash={:02x}{:02x}{:02x}{:02x}..., {} txs)",
             block.number,
-            block.hash.get(0).unwrap_or(&0),
+            block.hash.first().unwrap_or(&0),
             block.hash.get(1).unwrap_or(&0),
             block.hash.get(2).unwrap_or(&0),
             block.hash.get(3).unwrap_or(&0),

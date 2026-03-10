@@ -116,11 +116,11 @@ mod tests {
 
     #[test]
     fn test_block_range_filters() {
-        let from_block: Option<u64> = Some(100);
-        let to_block: Option<u64> = Some(200);
-        
+        let from_block = 100u64;
+        let to_block = 200u64;
+
         assert!(from_block < to_block);
-        assert_eq!(to_block.unwrap() - from_block.unwrap(), 100);
+        assert_eq!(to_block - from_block, 100);
     }
 
     // ======================================================================
@@ -129,15 +129,16 @@ mod tests {
 
     #[test]
     fn test_address_20_bytes() {
-        let addr = vec![0xAAu8; 20];
+        let addr = [0xAAu8; 20];
         assert_eq!(addr.len(), 20);
     }
 
     #[test]
     fn test_address_hex_encoding() {
-        let addr = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 
-                        0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
-                        0xAA, 0xBB, 0xCC, 0xDD];
+        let addr = vec![
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+        ];
         let hex = format!("0x{}", hex::encode(&addr));
         assert!(hex.starts_with("0x"));
         assert_eq!(hex.len(), 2 + 40); // 20 bytes = 40 hex chars
@@ -152,7 +153,7 @@ mod tests {
         let metric_name = "indexer_blocks_indexed_total";
         let value = 12345u64;
         let line = format!("{} {}", metric_name, value);
-        
+
         assert!(line.contains(metric_name));
         assert!(line.contains("12345"));
     }
@@ -196,7 +197,7 @@ mod tests {
         use chrono::{TimeZone, Utc};
         let ts = Utc.with_ymd_and_hms(2024, 1, 15, 12, 30, 45).unwrap();
         let rfc3339 = ts.to_rfc3339();
-        
+
         assert!(rfc3339.contains("2024-01-15"));
         assert!(rfc3339.contains("12:30:45"));
         // Format is "2024-01-15T12:30:45+00:00"
@@ -223,7 +224,7 @@ mod tests {
         let gas_price: u128 = 25_000_000_000; // 25 gwei
         let gas_fee = gas_used as u128 * gas_price;
         let total_debit = value + gas_fee;
-        
+
         // Total debit = 1 AVAX + (21000 * 25 gwei) = 1.000525 AVAX
         assert_eq!(total_debit, 1_000_525_000_000_000_000);
         // 1_000_525_000_000_000_000 as string is 19 characters
@@ -257,7 +258,7 @@ mod tests {
     #[test]
     fn test_hash_uniqueness() {
         use std::collections::HashSet;
-        let block_hashes = vec![
+        let block_hashes = [
             "0xaabbccdd",
             "0xaabbccdd", // duplicate
             "0xddeeffaa",
