@@ -270,8 +270,10 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
             .execute(&mut *tx)
             .await?;
 
-            if result.rows_affected() > 0 {
+            let txn_inserted = result.rows_affected() > 0;
+            if txn_inserted {
                 txs_inserted += 1;
+                super::balance::apply_transaction_balance_update(&mut tx, txn).await?;
             }
 
             // 3. Insert logs
@@ -299,9 +301,6 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
                 }
             }
         }
-
-        // 4. Compute and apply AVAX balance deltas for this block
-        super::balance::apply_balance_updates(&mut tx, block).await?;
     }
 
     tx.commit().await?;

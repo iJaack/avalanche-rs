@@ -1,74 +1,80 @@
 use sqlx::PgPool;
 use tracing::info;
 
-use super::writer::IndexedBlock;
+use super::writer::{IndexedBlock, IndexedTransaction};
 
-/// Compute AVAX balance deltas from a block's transactions and apply them.
+/// Apply AVAX balance deltas for a single newly-inserted transaction.
 ///
-/// For each transaction:
-/// - Sender: balance -= (value + gas_used * gas_price)  [fee burn]
-/// - Receiver: balance += value
-///
-/// Uses PostgreSQL NUMERIC(78,0) arithmetic for wei-precision.
-pub async fn apply_balance_updates(
+/// This must only be called for transactions that were actually inserted into
+/// the `transactions` table. Replayed/conflicting transactions must not reapply
+/// balance deltas or restart/resume will double-count balances.
+pub async fn apply_transaction_balance_update(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    block: &IndexedBlock,
+    txn: &IndexedTransaction,
 ) -> Result<usize, sqlx::Error> {
     let mut updates = 0usize;
 
-    for txn in &block.transactions {
-        // Compute gas fee: gas_used * gas_price
-        let gas_fee = match (txn.gas_used, txn.gas_price) {
-            (Some(used), Some(price)) => {
-                // Both are i64, product fits in u128
-                let fee = used as u128 * price as u128;
-                fee.to_string()
-            }
-            _ => "0".to_string(),
-        };
+    let gas_fee = match (txn.gas_used, txn.gas_price) {
+        (Some(used), Some(price)) => {
+            let fee = used as u128 * price as u128;
+            fee.to_string()
+        }
+        _ => "0".to_string(),
+    };
 
-        // Debit sender: subtract value + gas fee
+    sqlx::query(
+        "INSERT INTO address_balances (address, balance, nonce, last_updated_block, last_updated_at)
+         VALUES ($1, -($2::numeric + $3::numeric), COALESCE($4, 0), $5, $6)
+         ON CONFLICT (address) DO UPDATE SET
+             balance = address_balances.balance - ($2::numeric + $3::numeric),
+             nonce = GREATEST(address_balances.nonce, COALESCE($4, address_balances.nonce)),
+             last_updated_block = GREATEST(address_balances.last_updated_block, $5),
+             last_updated_at = CASE WHEN $5 > address_balances.last_updated_block
+                 THEN $6 ELSE address_balances.last_updated_at END",
+    )
+    .bind(&txn.from_address)
+    .bind(&txn.value)
+    .bind(&gas_fee)
+    .bind(txn.nonce)
+    .bind(txn.block_number)
+    .bind(txn.timestamp)
+    .execute(&mut **tx)
+    .await?;
+    updates += 1;
+
+    if let Some(ref to_addr) = txn.to_address {
         sqlx::query(
             "INSERT INTO address_balances (address, balance, nonce, last_updated_block, last_updated_at)
-             VALUES ($1, -($2::numeric + $3::numeric), COALESCE($4, 0), $5, $6)
+             VALUES ($1, $2::numeric, 0, $3, $4)
              ON CONFLICT (address) DO UPDATE SET
-                 balance = address_balances.balance - ($2::numeric + $3::numeric),
-                 nonce = GREATEST(address_balances.nonce, COALESCE($4, address_balances.nonce)),
-                 last_updated_block = GREATEST(address_balances.last_updated_block, $5),
-                 last_updated_at = CASE WHEN $5 > address_balances.last_updated_block
-                     THEN $6 ELSE address_balances.last_updated_at END",
+                 balance = address_balances.balance + $2::numeric,
+                 last_updated_block = GREATEST(address_balances.last_updated_block, $3),
+                 last_updated_at = CASE WHEN $3 > address_balances.last_updated_block
+                     THEN $4 ELSE address_balances.last_updated_at END",
         )
-        .bind(&txn.from_address)
+        .bind(to_addr)
         .bind(&txn.value)
-        .bind(&gas_fee)
-        .bind(txn.nonce)
         .bind(txn.block_number)
         .bind(txn.timestamp)
         .execute(&mut **tx)
         .await?;
         updates += 1;
-
-        // Credit receiver: add value (no gas fee)
-        if let Some(ref to_addr) = txn.to_address {
-            sqlx::query(
-                "INSERT INTO address_balances (address, balance, nonce, last_updated_block, last_updated_at)
-                 VALUES ($1, $2::numeric, 0, $3, $4)
-                 ON CONFLICT (address) DO UPDATE SET
-                     balance = address_balances.balance + $2::numeric,
-                     last_updated_block = GREATEST(address_balances.last_updated_block, $3),
-                     last_updated_at = CASE WHEN $3 > address_balances.last_updated_block
-                         THEN $4 ELSE address_balances.last_updated_at END",
-            )
-            .bind(to_addr)
-            .bind(&txn.value)
-            .bind(txn.block_number)
-            .bind(txn.timestamp)
-            .execute(&mut **tx)
-            .await?;
-            updates += 1;
-        }
     }
 
+    Ok(updates)
+}
+
+/// Compute AVAX balance deltas from a block's transactions and apply them.
+///
+/// Kept for full-block callers; this applies all tx deltas in the block.
+pub async fn apply_balance_updates(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    block: &IndexedBlock,
+) -> Result<usize, sqlx::Error> {
+    let mut updates = 0usize;
+    for txn in &block.transactions {
+        updates += apply_transaction_balance_update(tx, txn).await?;
+    }
     Ok(updates)
 }
 

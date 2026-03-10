@@ -312,7 +312,7 @@ async fn test_idempotent_inserts() {
 
 #[serial]
 #[tokio::test]
-async fn test_restart_resume_preserves_state() {
+async fn test_restart_resume_preserves_state_and_balances() {
     let pool = setup_pool().await;
 
     let writer1 = avalanche_rs::indexer::IndexerWriter::new(&test_database_url())
@@ -333,11 +333,12 @@ async fn test_restart_resume_preserves_state() {
             .unwrap();
     assert_eq!(initial_state.0, 3);
 
-    // Restart and continue forward (no replay of block 3).
+    // Replay the last block and continue forward after restart.
     let writer2 = avalanche_rs::indexer::IndexerWriter::new(&test_database_url())
         .await
         .expect("writer restart");
 
+    writer2.index_block(make_block(3, 1)).await;
     writer2.index_block(make_block(4, 1)).await;
     writer2.index_block(make_block(5, 1)).await;
     writer2.close().await;
@@ -353,7 +354,60 @@ async fn test_restart_resume_preserves_state() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(block_count.0, 5, "should have 5 unique blocks after restart+resume");
+    assert_eq!(block_count.0, 5, "replayed block should not duplicate rows");
+
+    let tx_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tx_count.0, 5);
+
+    let log_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(log_count.0, 5);
+
+    let from_address = {
+        let mut a = vec![0u8; 20];
+        a[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        a
+    };
+    let to_address = {
+        let mut a = vec![0u8; 20];
+        a[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        a
+    };
+
+    let from_balance: (String,) =
+        sqlx::query_as("SELECT balance::text FROM address_balances WHERE address = $1")
+            .bind(&from_address)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let to_balance: (String,) =
+        sqlx::query_as("SELECT balance::text FROM address_balances WHERE address = $1")
+            .bind(&to_address)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let tx_value = 1_000_000_000_000_000_000i128;
+    let gas_fee_per_tx = 21_000i128 * 25_000_000_000i128;
+    let total_gas_fees = gas_fee_per_tx * 5i128;
+    let expected_from = -(tx_value * 5 + total_gas_fees);
+    let expected_to = tx_value * 5;
+
+    assert_eq!(
+        from_balance.0,
+        expected_from.to_string(),
+        "sender balance should be debited once per unique block"
+    );
+    assert_eq!(
+        to_balance.0,
+        expected_to.to_string(),
+        "recipient balance should be credited once per unique block"
+    );
 
     pool.close().await;
 }
