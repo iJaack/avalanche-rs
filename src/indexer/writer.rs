@@ -96,6 +96,7 @@ impl IndexerWriter {
 
     /// Send a block to the indexing queue. Non-blocking.
     pub async fn index_block(&self, block: IndexedBlock) {
+        let metrics = IndexerMetrics::global();
         debug!(
             "Indexer: enqueuing block #{} (hash={:02x}{:02x}{:02x}{:02x}..., {} txs)",
             block.number,
@@ -108,6 +109,8 @@ impl IndexerWriter {
         if let Err(e) = self.tx.send(block).await {
             error!("Failed to enqueue block for indexing: {}", e);
         }
+        let queued_blocks = self.tx.max_capacity().saturating_sub(self.tx.capacity()) as i64;
+        metrics.queue_depth.set(queued_blocks);
     }
 
     /// Get a clone of the connection pool (for IndexerQuery).
@@ -123,6 +126,7 @@ impl IndexerWriter {
 }
 
 async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
+    let metrics = IndexerMetrics::global();
     let mut batch: Vec<IndexedBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut flush_interval = tokio::time::interval(FLUSH_INTERVAL);
     flush_interval.tick().await; // skip immediate tick
@@ -136,9 +140,11 @@ async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
                     Some(block) => {
                         debug!("Batch processor: received block #{}", block.number);
                         batch.push(block);
+                        metrics.queue_depth.set(rx.len() as i64);
                         if batch.len() >= BATCH_SIZE {
                             info!("Batch processor: reached {} blocks, flushing...", batch.len());
                             flush_batch(&pool, &mut batch).await;
+                            metrics.queue_depth.set(rx.len() as i64);
                         }
                     }
                     None => {
@@ -147,6 +153,7 @@ async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
                             info!("Batch processor: channel closed, flushing {} remaining blocks", batch.len());
                             flush_batch(&pool, &mut batch).await;
                         }
+                        metrics.queue_depth.set(0);
                         info!("Indexer batch processor shutting down");
                         return;
                     }
@@ -157,6 +164,7 @@ async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
                     info!("Batch processor: {} blocks pending, flushing on timer...", batch.len());
                     flush_batch(&pool, &mut batch).await;
                 }
+                metrics.queue_depth.set(rx.len() as i64);
             }
         }
     }

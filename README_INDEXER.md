@@ -227,6 +227,6 @@ The indexer runs in the background and doesn't block the main node. If PostgreSQ
 ## Next Steps
 
 - **Deployment**: Docker Compose template with PostgreSQL + pgAdmin
-- **Monitoring**: Prometheus metrics for indexing lag, query latency
+- **Monitoring**: Prometheus metrics and operator runbook in [`docs/indexer-observability-runbook.md`](docs/indexer-observability-runbook.md)
 - **Caching**: Redis layer for hot queries
 - **GraphQL**: High-level query interface built on REST API

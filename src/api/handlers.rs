@@ -291,6 +291,18 @@ pub async fn prometheus_metrics() -> impl IntoResponse {
         metrics.indexer_height.get()
     ));
     buffer.push_str(&format!(
+        "# HELP indexer_lag_blocks Blocks behind chain tip (0 = caught up)\n\
+         # TYPE indexer_lag_blocks gauge\n\
+         indexer_lag_blocks {}\n",
+        metrics.indexer_lag_blocks.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_queue_depth Blocks waiting in the indexer channel\n\
+         # TYPE indexer_queue_depth gauge\n\
+         indexer_queue_depth {}\n",
+        metrics.queue_depth.get()
+    ));
+    buffer.push_str(&format!(
         "# HELP indexer_write_errors_total Total batch write failures\n\
          # TYPE indexer_write_errors_total counter\n\
          indexer_write_errors_total {}\n",
@@ -307,6 +319,36 @@ pub async fn prometheus_metrics() -> impl IntoResponse {
          # TYPE indexer_catchup_blocks_per_sec gauge\n\
          indexer_catchup_blocks_per_sec {}\n",
         metrics.catchup_blocks_per_sec.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_storage_bytes_estimate Estimated storage usage in bytes\n\
+         # TYPE indexer_storage_bytes_estimate gauge\n\
+         indexer_storage_bytes_estimate {}\n",
+        metrics.storage_bytes_estimate.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_batch_size_count Total observed batch size samples\n\
+         # TYPE indexer_batch_size_count counter\n\
+         indexer_batch_size_count {}\n",
+        metrics.batch_size.get_sample_count()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_batch_size_sum Sum of observed blocks per batch\n\
+         # TYPE indexer_batch_size_sum gauge\n\
+         indexer_batch_size_sum {}\n",
+        metrics.batch_size.get_sample_sum()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_batch_write_duration_seconds_count Total observed batch write duration samples\n\
+         # TYPE indexer_batch_write_duration_seconds_count counter\n\
+         indexer_batch_write_duration_seconds_count {}\n",
+        metrics.batch_write_duration.get_sample_count()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_batch_write_duration_seconds_sum Sum of batch write durations in seconds\n\
+         # TYPE indexer_batch_write_duration_seconds_sum gauge\n\
+         indexer_batch_write_duration_seconds_sum {}\n",
+        metrics.batch_write_duration.get_sample_sum()
     ));
     (
         StatusCode::OK,

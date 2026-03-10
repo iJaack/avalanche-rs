@@ -212,6 +212,7 @@ cargo build --release --features indexer
 - Recommended test database URL: `postgres://test:test@localhost:5433/indexer_test`
 - Real DB suites now validate writer flush behavior, route matching, duplicate handling, gap detection, balances, and query correctness
 - See [`docs/indexer-architecture.md`](docs/indexer-architecture.md) for system design notes
+- See [`docs/indexer-observability-runbook.md`](docs/indexer-observability-runbook.md) for Prometheus metrics, alert ideas, and operator checks
 - See [`docs/indexer-next-steps.md`](docs/indexer-next-steps.md) for the recommended production follow-up plan
 
 ## Architecture

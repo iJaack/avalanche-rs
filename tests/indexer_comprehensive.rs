@@ -665,9 +665,10 @@ async fn test_indexer_writer_graceful_shutdown() {
         .get_block_by_number(500)
         .await
         .expect("query");
-
-    // May or may not be present depending on timing, but shouldn't panic
-    let _ = fetched;
+    assert!(
+        fetched.is_some(),
+        "graceful shutdown should flush pending queued blocks"
+    );
 
     pool.close().await;
 }

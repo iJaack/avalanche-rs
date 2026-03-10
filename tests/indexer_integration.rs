@@ -312,6 +312,54 @@ async fn test_idempotent_inserts() {
 
 #[serial]
 #[tokio::test]
+async fn test_restart_resume_preserves_state() {
+    let pool = setup_pool().await;
+
+    let writer1 = avalanche_rs::indexer::IndexerWriter::new(&test_database_url())
+        .await
+        .expect("writer init");
+
+    for number in 1..=3 {
+        writer1.index_block(make_block(number, 1)).await;
+    }
+
+    // Graceful shutdown should flush queued blocks.
+    writer1.close().await;
+
+    let initial_state: (i64,) =
+        sqlx::query_as("SELECT value_int FROM indexer_state WHERE key = 'last_indexed_block'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(initial_state.0, 3);
+
+    // Restart and continue forward (no replay of block 3).
+    let writer2 = avalanche_rs::indexer::IndexerWriter::new(&test_database_url())
+        .await
+        .expect("writer restart");
+
+    writer2.index_block(make_block(4, 1)).await;
+    writer2.index_block(make_block(5, 1)).await;
+    writer2.close().await;
+
+    let final_state: (i64,) =
+        sqlx::query_as("SELECT value_int FROM indexer_state WHERE key = 'last_indexed_block'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(final_state.0, 5, "resume should advance state monotonically");
+
+    let block_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blocks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(block_count.0, 5, "should have 5 unique blocks after restart+resume");
+
+    pool.close().await;
+}
+
+#[serial]
+#[tokio::test]
 async fn test_query_address_transactions() {
     let pool = setup_pool().await;
 

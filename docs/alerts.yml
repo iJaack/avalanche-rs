@@ -52,3 +52,35 @@ groups:
           description: >-
             Memory usage is above 80% of the configured limit
             ({{ $value | printf "%.1f" }}%). The node may become unstable.
+
+  - name: avalanche-rs-indexer-alerts
+    rules:
+      - alert: IndexerWriteErrors
+        expr: increase(indexer_write_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer write failures detected"
+          description: >-
+            Indexer write errors increased in the last 5 minutes.
+
+      - alert: IndexerStalled
+        expr: increase(indexer_blocks_indexed_total[15m]) == 0 and indexer_lag_blocks > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer stalled while behind"
+          description: >-
+            No new blocks were indexed for 15 minutes while indexer lag remains non-zero.
+
+      - alert: IndexerQueueBackpressure
+        expr: indexer_queue_depth > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Indexer queue depth elevated"
+          description: >-
+            Indexer queue depth has remained above 500 for 10 minutes.

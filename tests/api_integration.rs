@@ -553,6 +553,9 @@ async fn test_metrics_endpoint() {
 
     // Prometheus format: should contain HELP and TYPE lines
     assert!(text.contains("indexer_blocks_indexed_total"));
+    assert!(text.contains("indexer_queue_depth"));
+    assert!(text.contains("indexer_lag_blocks"));
+    assert!(text.contains("indexer_batch_write_duration_seconds_count"));
 
     pool.close().await;
 }
