@@ -20,6 +20,7 @@ pub fn router(query: IndexerQuery) -> Router {
 
     Router::new()
         .route("/health", get(handlers::health))
+        .route("/metrics", get(handlers::prometheus_metrics))
         .route("/api/blocks/{number}", get(handlers::get_block_by_number))
         .route("/api/blocks/hash/{hash}", get(handlers::get_block_by_hash))
         .route("/api/tx/{hash}", get(handlers::get_transaction))
@@ -28,6 +29,18 @@ pub fn router(query: IndexerQuery) -> Router {
             get(handlers::get_address_transactions),
         )
         .route("/api/logs", get(handlers::get_logs))
+        .route(
+            "/api/stats/hourly",
+            get(handlers::get_hourly_stats),
+        )
+        .route(
+            "/api/stats/daily",
+            get(handlers::get_daily_stats),
+        )
+        .route(
+            "/api/address/{addr}/balance",
+            get(handlers::get_address_balance),
+        )
         .layer(cors)
         .with_state(state)
 }

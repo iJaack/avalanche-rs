@@ -257,6 +257,132 @@ pub async fn get_logs(
 // Helpers
 // ---------------------------------------------------------------------------
 
+pub async fn prometheus_metrics() -> impl IntoResponse {
+    let metrics = crate::indexer::IndexerMetrics::global();
+    let mut buffer = String::new();
+    buffer.push_str(&format!(
+        "# HELP indexer_blocks_indexed_total Total blocks written to PostgreSQL\n\
+         # TYPE indexer_blocks_indexed_total counter\n\
+         indexer_blocks_indexed_total {}\n",
+        metrics.blocks_indexed.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_transactions_indexed_total Total transactions written\n\
+         # TYPE indexer_transactions_indexed_total counter\n\
+         indexer_transactions_indexed_total {}\n",
+        metrics.transactions_indexed.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_logs_indexed_total Total event logs written\n\
+         # TYPE indexer_logs_indexed_total counter\n\
+         indexer_logs_indexed_total {}\n",
+        metrics.logs_indexed.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_batches_flushed_total Total batch flushes\n\
+         # TYPE indexer_batches_flushed_total counter\n\
+         indexer_batches_flushed_total {}\n",
+        metrics.batches_flushed.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_height Highest block number indexed\n\
+         # TYPE indexer_height gauge\n\
+         indexer_height {}\n",
+        metrics.indexer_height.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_write_errors_total Total batch write failures\n\
+         # TYPE indexer_write_errors_total counter\n\
+         indexer_write_errors_total {}\n",
+        metrics.write_errors.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_catchup_blocks_remaining Blocks remaining in catchup sync\n\
+         # TYPE indexer_catchup_blocks_remaining gauge\n\
+         indexer_catchup_blocks_remaining {}\n",
+        metrics.catchup_blocks_remaining.get()
+    ));
+    buffer.push_str(&format!(
+        "# HELP indexer_catchup_blocks_per_sec Catchup sync throughput\n\
+         # TYPE indexer_catchup_blocks_per_sec gauge\n\
+         indexer_catchup_blocks_per_sec {}\n",
+        metrics.catchup_blocks_per_sec.get()
+    ));
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        buffer,
+    )
+}
+
+#[derive(Serialize)]
+pub struct HourlyStatsJson {
+    pub bucket: String,
+    pub block_count: i64,
+    pub tx_count: i64,
+    pub total_gas_used: i64,
+    pub avg_gas_used: i64,
+    pub total_size: i64,
+}
+
+pub async fn get_hourly_stats(
+    State(query): State<AppState>,
+    Query(params): Query<StatsParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(24).min(168); // max 7 days hourly
+    match query.get_hourly_stats(limit).await {
+        Ok(rows) => Json(serde_json::to_value(rows).unwrap()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn get_daily_stats(
+    State(query): State<AppState>,
+    Query(params): Query<StatsParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(30).min(365);
+    match query.get_daily_stats(limit).await {
+        Ok(rows) => Json(serde_json::to_value(rows).unwrap()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct StatsParams {
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct BalanceJson {
+    pub address: String,
+    pub balance: String,
+    pub nonce: i64,
+    pub last_updated_block: i64,
+}
+
+pub async fn get_address_balance(
+    State(query): State<AppState>,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    let bytes = match parse_hex(&addr) {
+        Some(b) => b,
+        None => return (StatusCode::BAD_REQUEST, "Invalid hex address").into_response(),
+    };
+    match query.get_balance(&bytes).await {
+        Ok(Some(row)) => {
+            let json = BalanceJson {
+                address: hex(&bytes),
+                balance: row.balance.to_string(),
+                nonce: row.nonce,
+                last_updated_block: row.last_updated_block,
+            };
+            Json(serde_json::to_value(json).unwrap()).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     hex::decode(s).ok()

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use sqlx::types::BigDecimal;
 use sqlx::PgPool;
 
 /// Row types returned from queries, matching the DB schema.
@@ -176,4 +177,86 @@ impl IndexerQuery {
 
         q.fetch_all(&self.pool).await
     }
+
+    // -----------------------------------------------------------------------
+    // Continuous aggregate queries
+    // -----------------------------------------------------------------------
+
+    pub async fn get_hourly_stats(&self, limit: usize) -> Result<Vec<HourlyStatsRow>, sqlx::Error> {
+        sqlx::query_as::<_, HourlyStatsRow>(
+            "SELECT bucket, block_count, tx_count, total_gas_used, avg_gas_used, total_size
+             FROM blocks_hourly
+             ORDER BY bucket DESC
+             LIMIT $1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_daily_stats(&self, limit: usize) -> Result<Vec<HourlyStatsRow>, sqlx::Error> {
+        sqlx::query_as::<_, HourlyStatsRow>(
+            "SELECT bucket, block_count, tx_count, total_gas_used, avg_gas_used, total_size
+             FROM blocks_daily
+             ORDER BY bucket DESC
+             LIMIT $1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Balance queries
+    // -----------------------------------------------------------------------
+
+    pub async fn get_balance(&self, address: &[u8]) -> Result<Option<BalanceRow>, sqlx::Error> {
+        sqlx::query_as::<_, BalanceRow>(
+            "SELECT address, balance, nonce, last_updated_block, last_updated_at
+             FROM address_balances WHERE address = $1",
+        )
+        .bind(address)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Indexer state (for catchup)
+    // -----------------------------------------------------------------------
+
+    pub async fn get_last_indexed_block(&self) -> Result<i64, sqlx::Error> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT value_int FROM indexer_state WHERE key = 'last_indexed_block'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.0).unwrap_or(0))
+    }
+
+    pub async fn get_max_block_number(&self) -> Result<i64, sqlx::Error> {
+        let row: (Option<i64>,) =
+            sqlx::query_as("SELECT MAX(number) FROM blocks")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0.unwrap_or(0))
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct HourlyStatsRow {
+    pub bucket: DateTime<Utc>,
+    pub block_count: i64,
+    pub tx_count: i64,
+    pub total_gas_used: i64,
+    pub avg_gas_used: i64,
+    pub total_size: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BalanceRow {
+    pub address: Vec<u8>,
+    pub balance: BigDecimal,
+    pub nonce: i64,
+    pub last_updated_block: i64,
+    pub last_updated_at: DateTime<Utc>,
 }

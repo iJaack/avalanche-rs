@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
+
+use super::metrics::IndexerMetrics;
 
 /// Data types for indexing — mapped from core types to DB schema.
 
@@ -162,18 +164,41 @@ async fn flush_batch(pool: &PgPool, batch: &mut Vec<IndexedBlock>) {
     let count = batch.len();
     let first_num = batch.first().map(|b| b.number).unwrap_or(0);
     let last_num = batch.last().map(|b| b.number).unwrap_or(0);
-    
+    let metrics = IndexerMetrics::global();
+
     debug!("Flushing batch of {} blocks (#{} to #{})", count, first_num, last_num);
-    
-    if let Err(e) = write_batch(pool, batch).await {
-        error!("Failed to write batch of {} blocks: {}", count, e);
-    } else {
-        info!("✅ Indexed batch of {} blocks (#{} to #{})", count, first_num, last_num);
+
+    let start = std::time::Instant::now();
+    match write_batch(pool, batch).await {
+        Ok(stats) => {
+            let elapsed = start.elapsed();
+            metrics.batches_flushed.inc();
+            metrics.batch_size.observe(count as f64);
+            metrics.batch_write_duration.observe(elapsed.as_secs_f64());
+            metrics.blocks_indexed.inc_by(stats.blocks as u64);
+            metrics.transactions_indexed.inc_by(stats.txs as u64);
+            metrics.logs_indexed.inc_by(stats.logs as u64);
+            metrics.indexer_height.set(last_num);
+            info!(
+                "Indexed batch of {} blocks (#{} to #{}) in {:.1}ms",
+                count, first_num, last_num, elapsed.as_secs_f64() * 1000.0
+            );
+        }
+        Err(e) => {
+            metrics.write_errors.inc();
+            error!("Failed to write batch of {} blocks: {}", count, e);
+        }
     }
     batch.clear();
 }
 
-async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx::Error> {
+struct BatchStats {
+    blocks: usize,
+    txs: usize,
+    logs: usize,
+}
+
+async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStats, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let mut blocks_inserted = 0;
     let mut txs_inserted = 0;
@@ -267,7 +292,11 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<(), sqlx:
         "DB write complete: {} blocks, {} txs, {} logs inserted",
         blocks_inserted, txs_inserted, logs_inserted
     );
-    Ok(())
+    Ok(BatchStats {
+        blocks: blocks_inserted,
+        txs: txs_inserted,
+        logs: logs_inserted,
+    })
 }
 
 async fn update_balance(
