@@ -27,28 +27,48 @@ fn test_database_name() -> String {
         .clone()
 }
 
-async fn ensure_test_database() {
+async fn ensure_test_database() -> bool {
     let db_name = test_database_name();
-    let admin_pool = PgPoolOptions::new()
+    let admin_pool = match PgPoolOptions::new()
         .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect("postgresql:///postgres")
         .await
-        .expect("connect to postgres admin db");
+    {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("Skipping DB-backed test: failed to connect to postgres admin db: {e}");
+            return false;
+        }
+    };
 
-    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
-        .bind(&db_name)
-        .fetch_optional(&admin_pool)
-        .await
-        .expect("check test database existence");
+    let exists: Option<(i32,)> =
+        match sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
+            .bind(&db_name)
+            .fetch_optional(&admin_pool)
+            .await
+        {
+            Ok(exists) => exists,
+            Err(e) => {
+                eprintln!("Skipping DB-backed test: failed to check test database existence: {e}");
+                admin_pool.close().await;
+                return false;
+            }
+        };
 
     if exists.is_none() {
-        sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
+        if let Err(e) = sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
             .execute(&admin_pool)
             .await
-            .expect("create test database");
+        {
+            eprintln!("Skipping DB-backed test: failed to create test database: {e}");
+            admin_pool.close().await;
+            return false;
+        }
     }
 
     admin_pool.close().await;
+    true
 }
 
 fn test_database_url() -> String {
@@ -56,7 +76,9 @@ fn test_database_url() -> String {
 }
 
 async fn setup_pool() -> Option<PgPool> {
-    ensure_test_database().await;
+    if !ensure_test_database().await {
+        return None;
+    }
     let url = test_database_url();
     let pool = match PgPoolOptions::new()
         .max_connections(5)
