@@ -1,4 +1,6 @@
 #[cfg(feature = "indexer")]
+pub mod balance;
+#[cfg(feature = "indexer")]
 pub mod catchup;
 #[cfg(feature = "indexer")]
 pub mod metrics;

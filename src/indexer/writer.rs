@@ -283,12 +283,10 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
                 }
             }
 
-            // 4. Update address balances (from_address always exists)
-            update_balance(&mut tx, &txn.from_address, txn.block_number, txn.timestamp).await?;
-            if let Some(to_addr) = &txn.to_address {
-                update_balance(&mut tx, to_addr, txn.block_number, txn.timestamp).await?;
-            }
         }
+
+        // 4. Compute and apply AVAX balance deltas for this block
+        super::balance::apply_balance_updates(&mut tx, block).await?;
     }
 
     tx.commit().await?;
@@ -303,24 +301,3 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
     })
 }
 
-async fn update_balance(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    address: &[u8],
-    block_number: i64,
-    timestamp: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    // Upsert: only update if block_number is newer
-    sqlx::query(
-        "INSERT INTO address_balances (address, balance, nonce, last_updated_block, last_updated_at)
-         VALUES ($1, 0, 0, $2, $3)
-         ON CONFLICT (address) DO UPDATE
-         SET last_updated_block = GREATEST(address_balances.last_updated_block, $2),
-             last_updated_at = CASE WHEN $2 > address_balances.last_updated_block THEN $3 ELSE address_balances.last_updated_at END",
-    )
-    .bind(address)
-    .bind(block_number)
-    .bind(timestamp)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
