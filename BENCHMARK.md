@@ -2,6 +2,9 @@
 
 ## Latest Results (2026-03-08, Post Phase 12)
 
+> Network sync benchmark below was run on a **Mac mini M4**.
+> A fresh **Mac mini M1** indexer validation benchmark was added on **2026-03-10**; see the dedicated section below for current DB-backed indexer numbers.
+
 **Network:** Fuji testnet (267,390 P-Chain blocks)
 **Duration:** 3 minutes per implementation
 **Hardware:** Mac Mini M4 (Apple Silicon), 16GB RAM
@@ -44,6 +47,32 @@ Phase 12 adds significant new functionality (dynamic gas limits, epoch managemen
 | T+180s | 68,944 |
 
 Memory is completely flat — state pruning keeps the footprint stable.
+
+### Mac mini M1 Indexer Validation (2026-03-10)
+
+This benchmark measures the production indexer validation path on the current development host, a **Mac mini M1 (16 GB RAM)**, using local **Postgres 17 + TimescaleDB**.
+
+| Metric | Result |
+|--------|--------|
+| Release build (`cargo build --release --features indexer`) | **4m36s** |
+| Release binary size (`target/release/avalanche-rs`) | **11 MB** |
+| Full DB-backed integration suite | **149.75s** |
+| Test count | **32/32 passed** |
+| Peak test memory footprint | **~106 MB** |
+
+Validated suites:
+
+- `api_integration` — 11 tests
+- `indexer_integration` — 9 tests
+- `indexer_comprehensive` — 12 tests
+
+What this benchmark proves:
+
+- Axum REST routes are wired correctly for the indexer API
+- Writer shutdown flushes data reliably before process exit
+- Gap detection, duplicate handling, balances, and query paths all pass against a real database
+- The current indexer stack is stable enough for the next productionization pass
+
 
 ## Timeline
 
@@ -128,7 +157,8 @@ The increase from 36 MB (Phase 7-8) to 67 MB reflects the additional validator d
 - ✅ Granite upgrade (ACP-181 epochs, ACP-204 secp256r1, ACP-226 dynamic block times)
 - ✅ Hardening (panic recovery, rate limiting, connection limits)
 - ✅ Observability (structured logging, Prometheus histograms, span tracing)
-- ✅ 663 tests passing
+- ✅ 663+ tests passing
+- ✅ 32/32 DB-backed indexer/API validation tests passing on Mac mini M1
 
 ## Reproducing
 
@@ -149,7 +179,8 @@ cargo build --release
 
 ```
 OS:          macOS 15.2 (Darwin 25.2.0 arm64)
-Hardware:    Mac Mini M4 (Apple Silicon)
+Hardware:    Mac Mini M4 (Apple Silicon) for network sync benchmark
+Indexer host: Mac mini M1 (Apple Silicon), 16 GB RAM for DB-backed validation benchmark
 RAM:         16 GB
 avalanche-rs: v0.1.0 (release build, 663 tests, ~31K lines Rust)
 AvalancheGo:  v1.14.1 (official binary)

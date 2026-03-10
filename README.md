@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/iJaack/avalanche-rs/actions/workflows/ci.yml)
 
-A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. 31.6K lines of Rust, 670 tests, 8.5 MB binary.
+A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. Includes an optional PostgreSQL/TimescaleDB-backed indexer for explorer-style APIs, catchup, balances, and Prometheus metrics. 31.6K lines of Rust, 670+ tests, ~11 MB release binary with indexer enabled.
 
 ## Benchmarks vs AvalancheGo 1.14.1
 
@@ -21,6 +21,8 @@ Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, **3 minutes each** (2026-03
 avalanche-rs completes full P-Chain + C-Chain bootstrap in **~12 seconds**, then tracks the chain tip. AvalancheGo is still executing blocks after 3 minutes.
 
 > Full benchmark details: [`BENCHMARK.md`](BENCHMARK.md)
+>
+> **Indexer validation on Mac mini M1 (2026-03-10):** full real DB-backed indexer/API suite (`api_integration`, `indexer_integration`, `indexer_comprehensive`) passed **32/32** tests in **149.75s** with peak memory footprint of about **106 MB**.
 
 ## Features
 
@@ -165,7 +167,19 @@ docker compose up
 
 ## Indexer Mode (Optional)
 
-Enable PostgreSQL indexing for explorer backends:
+Enable PostgreSQL/TimescaleDB indexing for explorer backends and analytics APIs.
+
+### Current production status
+
+- ✅ Startup catchup wired into the main event loop
+- ✅ Gap detection for missed block ranges
+- ✅ Native AVAX balance tracking from indexed transfers
+- ✅ Prometheus metrics + REST stats endpoints
+- ✅ Compression / retention oriented schema for large-scale storage
+- ✅ Real DB-backed validation passing on local Postgres 17 + TimescaleDB
+- ✅ REST integration tests passing: **32/32** across API + writer/query suites
+
+### Build and run
 
 ```bash
 # Start database
@@ -180,6 +194,25 @@ cargo build --release --features indexer
   --indexer-enabled \
   --database-url postgres://indexer:indexer_pass@localhost/avalanche_indexer
 ```
+
+### Key endpoints
+
+- `GET /metrics`
+- `GET /api/blocks/{number}`
+- `GET /api/blocks/hash/{hash}`
+- `GET /api/tx/{hash}`
+- `GET /api/address/{addr}/transactions`
+- `GET /api/address/{addr}/balance`
+- `GET /api/logs`
+- `GET /api/stats/hourly`
+- `GET /api/stats/daily`
+
+### Notes
+
+- Recommended test database URL: `postgres://test:test@localhost:5433/indexer_test`
+- Real DB suites now validate writer flush behavior, route matching, duplicate handling, gap detection, balances, and query correctness
+- See [`docs/indexer-architecture.md`](docs/indexer-architecture.md) for system design notes
+- See [`docs/indexer-next-steps.md`](docs/indexer-next-steps.md) for the recommended production follow-up plan
 
 ## Architecture
 
