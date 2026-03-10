@@ -179,6 +179,10 @@ async fn flush_batch(pool: &PgPool, batch: &mut Vec<IndexedBlock>) {
             metrics.transactions_indexed.inc_by(stats.txs as u64);
             metrics.logs_indexed.inc_by(stats.logs as u64);
             metrics.indexer_height.set(last_num);
+            // Update indexer_state for catchup gap detection
+            if let Err(e) = super::catchup::update_indexer_state(pool, last_num).await {
+                debug!("Failed to update indexer_state: {}", e);
+            }
             info!(
                 "Indexed batch of {} blocks (#{} to #{}) in {:.1}ms",
                 count, first_num, last_num, elapsed.as_secs_f64() * 1000.0
