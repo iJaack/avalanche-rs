@@ -198,19 +198,14 @@ async fn test_health_endpoint() {
 #[tokio::test]
 async fn test_get_block_by_number() {
     let pool = setup_pool().await;
-    let db_url = test_database_url();
-    eprintln!("TEST_DB_URL: {}", db_url);
-
-    let writer = IndexerWriter::new(&db_url)
+    let writer = IndexerWriter::new(&test_database_url())
         .await
         .unwrap();
 
     let block = make_block(42, 2);
     writer.index_block(block).await;
-    eprintln!("Block indexed, sleeping 6s...");
 
     tokio::time::sleep(StdDuration::from_secs(6)).await;
-    eprintln!("Sleep done, querying...");
 
     let query = IndexerQuery::new(pool.clone());
     let app = routes::router(query);

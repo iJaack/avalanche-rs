@@ -133,20 +133,12 @@ pub async fn get_block_by_number(
     State(query): State<AppState>,
     Path(number): Path<u64>,
 ) -> impl IntoResponse {
-    eprintln!("Handler: get_block_by_number({})", number);
     match query.get_block_by_number(number).await {
         Ok(Some(block)) => {
-            eprintln!("Handler: found block #{}", block.number);
             Json(serde_json::to_value(BlockJson::from(block)).unwrap()).into_response()
         }
-        Ok(None) => {
-            eprintln!("Handler: block not found");
-            StatusCode::NOT_FOUND.into_response()
-        }
-        Err(e) => {
-            eprintln!("Handler: error {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

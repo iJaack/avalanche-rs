@@ -225,7 +225,7 @@ async fn test_write_and_query_single_block() {
         .expect("query")
         .expect("tx should exist");
     assert_eq!(tx.block_number, 1);
-    assert_eq!(tx.value.to_string(), "1000000000000000000");
+    assert_eq!(tx.value.to_plain_string(), "1000000000000000000");
 
     writer.close().await;
     pool.close().await;
