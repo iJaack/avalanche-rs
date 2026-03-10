@@ -9,21 +9,55 @@
 
 #![cfg(feature = "indexer")]
 
+use std::sync::OnceLock;
 use avalanche_rs::indexer::{IndexedBlock, IndexedLog, IndexedTransaction, IndexerQuery, IndexerWriter};
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration as StdDuration;
+use serial_test::serial;
 
 // ============================================================================
 // SETUP & HELPERS
 // ============================================================================
 
+static TEST_DB_NAME: OnceLock<String> = OnceLock::new();
+
+fn test_database_name() -> String {
+    TEST_DB_NAME
+        .get_or_init(|| format!("indexer_comprehensive_{}", std::process::id()))
+        .clone()
+}
+
+async fn ensure_test_database() {
+    let db_name = test_database_name();
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect("postgresql:///postgres")
+        .await
+        .expect("connect to postgres admin db");
+
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
+        .bind(&db_name)
+        .fetch_optional(&admin_pool)
+        .await
+        .expect("check test database existence");
+
+    if exists.is_none() {
+        sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
+            .execute(&admin_pool)
+            .await
+            .expect("create test database");
+    }
+
+    admin_pool.close().await;
+}
+
 fn test_database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://test:test@localhost:5433/indexer_test".to_string())
+    format!("postgresql:///{}", test_database_name())
 }
 
 async fn setup_pool() -> PgPool {
+    ensure_test_database().await;
     let url = test_database_url();
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -145,6 +179,7 @@ async fn wait_for_batch_flush(millis: u64) {
 // TEST: Single block write and query
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_single_block_write_and_query() {
     let pool = setup_pool().await;
@@ -194,6 +229,7 @@ async fn test_single_block_write_and_query() {
 // TEST: Batch processing at scale
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_batch_processing_large_blocks() {
     let pool = setup_pool().await;
@@ -238,6 +274,7 @@ async fn test_batch_processing_large_blocks() {
 // TEST: Balance updates from transactions
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_balance_updates_on_transfer() {
     let pool = setup_pool().await;
@@ -286,7 +323,7 @@ async fn test_balance_updates_on_transfer() {
         .expect("query")
         .expect("receiver balance should exist");
     // Balance should be positive: +1 AVAX = 1_000_000_000_000_000_000 wei
-    assert_eq!(receiver_balance.balance.to_string(), "1000000000000000000");
+    assert_eq!(receiver_balance.balance.to_plain_string(), "1000000000000000000");
 
     writer.close().await;
     pool.close().await;
@@ -296,6 +333,7 @@ async fn test_balance_updates_on_transfer() {
 // TEST: Logs indexing
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_logs_indexing_and_query() {
     let pool = setup_pool().await;
@@ -343,6 +381,7 @@ async fn test_logs_indexing_and_query() {
 // TEST: Gap detection (catchup)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_gap_detection_missing_block() {
     let pool = setup_pool().await;
@@ -378,6 +417,7 @@ async fn test_gap_detection_missing_block() {
 // TEST: Duplicate block prevention (ON CONFLICT handling)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_duplicate_block_ignored() {
     let pool = setup_pool().await;
@@ -412,6 +452,7 @@ async fn test_duplicate_block_ignored() {
 // TEST: Address transaction history
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_address_transaction_history() {
     let pool = setup_pool().await;
@@ -449,6 +490,7 @@ async fn test_address_transaction_history() {
 // TEST: Hourly and daily stats (continuous aggregates)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_continuous_aggregate_stats() {
     let pool = setup_pool().await;
@@ -485,6 +527,7 @@ async fn test_continuous_aggregate_stats() {
 // TEST: Block by hash retrieval
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_block_by_hash_retrieval() {
     let pool = setup_pool().await;
@@ -518,6 +561,7 @@ async fn test_block_by_hash_retrieval() {
 // TEST: Timestamp ordering
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_blocks_ordered_by_timestamp() {
     let pool = setup_pool().await;
@@ -556,6 +600,7 @@ async fn test_blocks_ordered_by_timestamp() {
 // TEST: Large transaction value handling (NUMERIC precision)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_large_transaction_values() {
     let pool = setup_pool().await;
@@ -598,6 +643,7 @@ async fn test_large_transaction_values() {
 // TEST: Shutdown signal handling
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_indexer_writer_graceful_shutdown() {
     let pool = setup_pool().await;

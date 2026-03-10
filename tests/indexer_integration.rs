@@ -9,20 +9,54 @@
 
 #![cfg(feature = "indexer")]
 
+use std::sync::OnceLock;
 use chrono::{TimeZone, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
+use serial_test::serial;
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
+static TEST_DB_NAME: OnceLock<String> = OnceLock::new();
+
+fn test_database_name() -> String {
+    TEST_DB_NAME
+        .get_or_init(|| format!("indexer_integration_{}", std::process::id()))
+        .clone()
+}
+
+async fn ensure_test_database() {
+    let db_name = test_database_name();
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect("postgresql:///postgres")
+        .await
+        .expect("connect to postgres admin db");
+
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
+        .bind(&db_name)
+        .fetch_optional(&admin_pool)
+        .await
+        .expect("check test database existence");
+
+    if exists.is_none() {
+        sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
+            .execute(&admin_pool)
+            .await
+            .expect("create test database");
+    }
+
+    admin_pool.close().await;
+}
+
 fn test_database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://test:test@localhost:5433/indexer_test".to_string())
+    format!("postgresql:///{}", test_database_name())
 }
 
 async fn setup_pool() -> PgPool {
+    ensure_test_database().await;
     let url = test_database_url();
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -55,6 +89,10 @@ async fn setup_pool() -> PgPool {
         .await
         .unwrap();
     sqlx::query("DELETE FROM indexer_state WHERE key NOT IN ('indexer_version')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO indexer_state (key, value_int, updated_at) VALUES ('last_indexed_block', 0, NOW()) ON CONFLICT (key) DO UPDATE SET value_int = 0, updated_at = NOW()")
         .execute(&pool)
         .await
         .unwrap();
@@ -147,6 +185,7 @@ fn make_block(number: i64, tx_count: usize) -> avalanche_rs::indexer::IndexedBlo
 // Tests
 // ---------------------------------------------------------------------------
 
+#[serial]
 #[tokio::test]
 async fn test_write_and_query_single_block() {
     let pool = setup_pool().await;
@@ -192,6 +231,7 @@ async fn test_write_and_query_single_block() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_batch_processing_at_scale() {
     let pool = setup_pool().await;
@@ -243,6 +283,7 @@ async fn test_batch_processing_at_scale() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_idempotent_inserts() {
     let pool = setup_pool().await;
@@ -269,6 +310,7 @@ async fn test_idempotent_inserts() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_query_address_transactions() {
     let pool = setup_pool().await;
@@ -308,6 +350,7 @@ async fn test_query_address_transactions() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_query_logs_with_filters() {
     let pool = setup_pool().await;
@@ -347,6 +390,7 @@ async fn test_query_logs_with_filters() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_timescaledb_compression_setup() {
     let pool = setup_pool().await;
@@ -372,6 +416,7 @@ async fn test_timescaledb_compression_setup() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_continuous_aggregates_exist() {
     let pool = setup_pool().await;
@@ -393,6 +438,7 @@ async fn test_continuous_aggregates_exist() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_indexer_state_table() {
     let pool = setup_pool().await;
@@ -421,6 +467,7 @@ async fn test_indexer_state_table() {
     pool.close().await;
 }
 
+#[serial]
 #[tokio::test]
 async fn test_retention_policies_configured() {
     let pool = setup_pool().await;

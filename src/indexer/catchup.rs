@@ -79,8 +79,8 @@ pub async fn detect_gaps(pool: &PgPool, target_height: i64) -> Result<GapInfo, s
 
     // Gap before first indexed block (if any)
     if let Some((first,)) = first_block {
-        if first > 0 {
-            let gap = (0, first - 1);
+        if first > 1 {
+            let gap = (1, first - 1);
             total_missing += gap.1 - gap.0 + 1;
             gaps.push(gap);
         }

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, error, info};
 
 use super::metrics::IndexerMetrics;
@@ -69,6 +69,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 pub struct IndexerWriter {
     pool: PgPool,
     tx: mpsc::Sender<IndexedBlock>,
+    handle: JoinHandle<()>,
 }
 
 impl IndexerWriter {
@@ -87,10 +88,10 @@ impl IndexerWriter {
 
         // Spawn background batch processor
         let bg_pool = pool.clone();
-        tokio::spawn(batch_processor(bg_pool, rx));
+        let handle = tokio::spawn(batch_processor(bg_pool, rx));
         info!("Indexer batch processor started");
 
-        Ok(Self { pool, tx })
+        Ok(Self { pool, tx, handle })
     }
 
     /// Send a block to the indexing queue. Non-blocking.
@@ -116,6 +117,7 @@ impl IndexerWriter {
 
     pub async fn close(self) {
         drop(self.tx); // signal shutdown to batch processor
+        let _ = self.handle.await;
         self.pool.close().await;
     }
 }

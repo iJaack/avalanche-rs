@@ -4,6 +4,7 @@
 
 #![cfg(feature = "indexer")]
 
+use std::sync::OnceLock;
 use avalanche_rs::{
     api::routes,
     indexer::{IndexedBlock, IndexedLog, IndexedTransaction, IndexerQuery, IndexerWriter},
@@ -12,18 +13,51 @@ use axum::http::StatusCode;
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration as StdDuration;
+use serial_test::serial;
 use tower::ServiceExt;
 
 // ============================================================================
 // SETUP
 // ============================================================================
 
+static TEST_DB_NAME: OnceLock<String> = OnceLock::new();
+
+fn test_database_name() -> String {
+    TEST_DB_NAME
+        .get_or_init(|| format!("api_integration_{}", std::process::id()))
+        .clone()
+}
+
+async fn ensure_test_database() {
+    let db_name = test_database_name();
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect("postgresql:///postgres")
+        .await
+        .expect("connect to postgres admin db");
+
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
+        .bind(&db_name)
+        .fetch_optional(&admin_pool)
+        .await
+        .expect("check test database existence");
+
+    if exists.is_none() {
+        sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
+            .execute(&admin_pool)
+            .await
+            .expect("create test database");
+    }
+
+    admin_pool.close().await;
+}
+
 fn test_database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://test:test@localhost:5433/indexer_test".to_string())
+    format!("postgresql:///{}", test_database_name())
 }
 
 async fn setup_pool() -> PgPool {
+    ensure_test_database().await;
     let url = test_database_url();
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -41,6 +75,8 @@ async fn setup_pool() -> PgPool {
     let _ = sqlx::query("DELETE FROM transactions").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM blocks").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM address_balances").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM indexer_state WHERE key NOT IN ('indexer_version')").execute(&pool).await;
+    let _ = sqlx::query("INSERT INTO indexer_state (key, value_int, updated_at) VALUES ('last_indexed_block', 0, NOW()) ON CONFLICT (key) DO UPDATE SET value_int = 0, updated_at = NOW()").execute(&pool).await;
 
     pool
 }
@@ -131,6 +167,7 @@ fn make_block(number: i64, tx_count: usize) -> IndexedBlock {
 // TEST: Health endpoint
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_health_endpoint() {
     let pool = setup_pool().await;
@@ -157,18 +194,23 @@ async fn test_health_endpoint() {
 // TEST: Get block by number
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_get_block_by_number() {
     let pool = setup_pool().await;
+    let db_url = test_database_url();
+    eprintln!("TEST_DB_URL: {}", db_url);
 
-    let writer = IndexerWriter::new(&test_database_url())
+    let writer = IndexerWriter::new(&db_url)
         .await
         .unwrap();
 
     let block = make_block(42, 2);
     writer.index_block(block).await;
+    eprintln!("Block indexed, sleeping 6s...");
 
     tokio::time::sleep(StdDuration::from_secs(6)).await;
+    eprintln!("Sleep done, querying...");
 
     let query = IndexerQuery::new(pool.clone());
     let app = routes::router(query);
@@ -204,6 +246,7 @@ async fn test_get_block_by_number() {
 // TEST: Get block by hash
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_get_block_by_hash() {
     let pool = setup_pool().await;
@@ -251,6 +294,7 @@ async fn test_get_block_by_hash() {
 // TEST: Get block by invalid hash (400)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_get_block_invalid_hash_format() {
     let pool = setup_pool().await;
@@ -277,6 +321,7 @@ async fn test_get_block_invalid_hash_format() {
 // TEST: Get transaction by hash
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_get_transaction_by_hash() {
     let pool = setup_pool().await;
@@ -326,6 +371,7 @@ async fn test_get_transaction_by_hash() {
 // TEST: Get address transactions
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_get_address_transactions() {
     let pool = setup_pool().await;
@@ -374,6 +420,7 @@ async fn test_get_address_transactions() {
 // TEST: Get logs with filters
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_get_logs_with_address_filter() {
     let pool = setup_pool().await;
@@ -421,6 +468,7 @@ async fn test_get_logs_with_address_filter() {
 // TEST: Pagination parameters
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_pagination_limit_and_offset() {
     let pool = setup_pool().await;
@@ -482,6 +530,7 @@ async fn test_pagination_limit_and_offset() {
 // TEST: Metrics endpoint
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_metrics_endpoint() {
     let pool = setup_pool().await;
@@ -517,6 +566,7 @@ async fn test_metrics_endpoint() {
 // TEST: 404 Not Found
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_nonexistent_block_returns_404() {
     let pool = setup_pool().await;
@@ -543,6 +593,7 @@ async fn test_nonexistent_block_returns_404() {
 // TEST: Hex encoding round-trip
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 async fn test_hex_encoding_preserves_data() {
     let pool = setup_pool().await;

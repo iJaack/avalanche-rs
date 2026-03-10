@@ -111,6 +111,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 tracing-test = "0.2"
 tempfile = "3.10"
 wiremock = "0.6"
+serial_test = "3"
 
 [[bench]]
 name = "codec_bench"

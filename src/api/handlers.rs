@@ -91,7 +91,7 @@ impl From<crate::indexer::query::TransactionRow> for TransactionJson {
             block_number: t.block_number,
             from_address: hex(&t.from_address),
             to_address: t.to_address.as_ref().map(|a| hex(a)),
-            value: t.value.to_string(),
+            value: t.value.to_plain_string(),
             gas_price: t.gas_price,
             gas_limit: t.gas_limit,
             gas_used: t.gas_used,
@@ -133,12 +133,20 @@ pub async fn get_block_by_number(
     State(query): State<AppState>,
     Path(number): Path<u64>,
 ) -> impl IntoResponse {
+    eprintln!("Handler: get_block_by_number({})", number);
     match query.get_block_by_number(number).await {
         Ok(Some(block)) => {
+            eprintln!("Handler: found block #{}", block.number);
             Json(serde_json::to_value(BlockJson::from(block)).unwrap()).into_response()
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(None) => {
+            eprintln!("Handler: block not found");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(e) => {
+            eprintln!("Handler: error {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -372,7 +380,7 @@ pub async fn get_address_balance(
         Ok(Some(row)) => {
             let json = BalanceJson {
                 address: hex(&bytes),
-                balance: row.balance.to_string(),
+                balance: row.balance.to_plain_string(),
                 nonce: row.nonce,
                 last_updated_block: row.last_updated_block,
             };
