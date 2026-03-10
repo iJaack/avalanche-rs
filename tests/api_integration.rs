@@ -4,14 +4,13 @@
 
 #![cfg(feature = "indexer")]
 
-use avalanche_rs::indexer::{
-    api::{handlers, routes},
-    IndexedBlock, IndexedLog, IndexedTransaction, IndexerQuery, IndexerWriter,
+use avalanche_rs::{
+    api::routes,
+    indexer::{IndexedBlock, IndexedLog, IndexedTransaction, IndexerQuery, IndexerWriter},
 };
 use axum::http::StatusCode;
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tower::ServiceExt;
 
@@ -85,10 +84,10 @@ fn make_block(number: i64, tx_count: usize) -> IndexedBlock {
             };
 
             IndexedTransaction {
-                hash: tx_hash,
+                hash: tx_hash.clone(),
                 block_hash: hash.clone(),
                 block_number: number,
-                from_address: from,
+                from_address: from.clone(),
                 to_address: Some(to),
                 value: (1_000_000_000_000_000_000u128 * (i as u128 + 1)).to_string(),
                 gas_price: Some(25_000_000_000i64),

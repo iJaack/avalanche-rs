@@ -12,7 +12,6 @@
 use avalanche_rs::indexer::{IndexedBlock, IndexedLog, IndexedTransaction, IndexerQuery, IndexerWriter};
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::time::Instant;
 use std::time::Duration as StdDuration;
 
 // ============================================================================
