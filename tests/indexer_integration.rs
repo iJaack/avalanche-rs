@@ -38,7 +38,10 @@ async fn setup_pool() -> PgPool {
         .expect("Failed to run migrations");
 
     // Clean all tables for a fresh test
-    sqlx::query("DELETE FROM logs").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM logs")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM transactions")
         .execute(&pool)
         .await
@@ -60,8 +63,8 @@ async fn setup_pool() -> PgPool {
 }
 
 fn make_block(number: i64, tx_count: usize) -> avalanche_rs::indexer::IndexedBlock {
-    let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()
-        + chrono::Duration::seconds(number * 2);
+    let ts =
+        Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(number * 2);
     let hash = {
         let mut h = vec![0u8; 32];
         h[..8].copy_from_slice(&number.to_be_bytes());
@@ -323,7 +326,12 @@ async fn test_query_logs_with_filters() {
     // Query by topic0
     let topic = vec![0xEE; 32];
     let logs = query
-        .get_logs(None, vec![Some(topic.as_slice()), None, None, None], None, None)
+        .get_logs(
+            None,
+            vec![Some(topic.as_slice()), None, None, None],
+            None,
+            None,
+        )
         .await
         .expect("query");
     assert_eq!(logs.len(), 10);

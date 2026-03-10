@@ -87,21 +87,23 @@ pub async fn recompute_all_balances(pool: &PgPool) -> Result<u64, sqlx::Error> {
         .execute(&mut *tx)
         .await?;
 
-    // Compute net balance per address in a single pass:
-    // debits (sent value + gas fees) and credits (received value)
+    // Compute net balance per address in SQL only:
+    // - sender debits aggregate value + gas fees
+    // - receiver credits aggregate value
+    // This avoids Rust-side iteration for billion-row rebuilds.
     let result = sqlx::query(
         "INSERT INTO address_balances (address, balance, nonce, last_updated_block, last_updated_at)
          SELECT
              addr,
-             SUM(delta),
-             COALESCE(MAX(max_nonce), 0),
-             MAX(max_block),
-             MAX(max_ts)
+             SUM(delta) AS balance,
+             COALESCE(MAX(max_nonce), 0) AS nonce,
+             MAX(max_block) AS last_updated_block,
+             MAX(max_ts) AS last_updated_at
          FROM (
-             -- Debits: sender pays value + gas
+             -- Debits: sender pays value + gas across all sent txs
              SELECT
                  from_address AS addr,
-                 -(value + COALESCE(gas_used, 0) * COALESCE(gas_price, 0)) AS delta,
+                 -SUM(value + (COALESCE(gas_used, 0)::numeric * COALESCE(gas_price, 0)::numeric)) AS delta,
                  MAX(nonce) AS max_nonce,
                  MAX(block_number) AS max_block,
                  MAX(timestamp) AS max_ts
@@ -110,11 +112,11 @@ pub async fn recompute_all_balances(pool: &PgPool) -> Result<u64, sqlx::Error> {
 
              UNION ALL
 
-             -- Credits: receiver gets value
+             -- Credits: receiver gets transferred value
              SELECT
                  to_address AS addr,
                  SUM(value) AS delta,
-                 NULL AS max_nonce,
+                 NULL::bigint AS max_nonce,
                  MAX(block_number) AS max_block,
                  MAX(timestamp) AS max_ts
              FROM transactions

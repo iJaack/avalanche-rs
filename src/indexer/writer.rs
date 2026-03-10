@@ -124,7 +124,7 @@ async fn batch_processor(pool: PgPool, mut rx: mpsc::Receiver<IndexedBlock>) {
     let mut batch: Vec<IndexedBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut flush_interval = tokio::time::interval(FLUSH_INTERVAL);
     flush_interval.tick().await; // skip immediate tick
-    
+
     info!("Indexer batch processor: waiting for blocks...");
 
     loop {
@@ -166,7 +166,10 @@ async fn flush_batch(pool: &PgPool, batch: &mut Vec<IndexedBlock>) {
     let last_num = batch.last().map(|b| b.number).unwrap_or(0);
     let metrics = IndexerMetrics::global();
 
-    debug!("Flushing batch of {} blocks (#{} to #{})", count, first_num, last_num);
+    debug!(
+        "Flushing batch of {} blocks (#{} to #{})",
+        count, first_num, last_num
+    );
 
     let start = std::time::Instant::now();
     match write_batch(pool, batch).await {
@@ -185,7 +188,10 @@ async fn flush_batch(pool: &PgPool, batch: &mut Vec<IndexedBlock>) {
             }
             info!(
                 "Indexed batch of {} blocks (#{} to #{}) in {:.1}ms",
-                count, first_num, last_num, elapsed.as_secs_f64() * 1000.0
+                count,
+                first_num,
+                last_num,
+                elapsed.as_secs_f64() * 1000.0
             );
         }
         Err(e) => {
@@ -225,7 +231,7 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
         .bind(block.size)
         .execute(&mut *tx)
         .await?;
-        
+
         if result.rows_affected() > 0 {
             blocks_inserted += 1;
         }
@@ -253,7 +259,7 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
             .bind(txn.timestamp)
             .execute(&mut *tx)
             .await?;
-            
+
             if result.rows_affected() > 0 {
                 txs_inserted += 1;
             }
@@ -277,12 +283,11 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
                 .bind(log.timestamp)
                 .execute(&mut *tx)
                 .await?;
-                
+
                 if result.rows_affected() > 0 {
                     logs_inserted += 1;
                 }
             }
-
         }
 
         // 4. Compute and apply AVAX balance deltas for this block
@@ -300,4 +305,3 @@ async fn write_batch(pool: &PgPool, blocks: &[IndexedBlock]) -> Result<BatchStat
         logs: logs_inserted,
     })
 }
-

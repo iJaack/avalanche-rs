@@ -225,19 +225,17 @@ impl IndexerQuery {
     // -----------------------------------------------------------------------
 
     pub async fn get_last_indexed_block(&self) -> Result<i64, sqlx::Error> {
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT value_int FROM indexer_state WHERE key = 'last_indexed_block'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT value_int FROM indexer_state WHERE key = 'last_indexed_block'")
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.and_then(|r| r.0).unwrap_or(0))
     }
 
     pub async fn get_max_block_number(&self) -> Result<i64, sqlx::Error> {
-        let row: (Option<i64>,) =
-            sqlx::query_as("SELECT MAX(number) FROM blocks")
-                .fetch_one(&self.pool)
-                .await?;
+        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(number) FROM blocks")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.0.unwrap_or(0))
     }
 }

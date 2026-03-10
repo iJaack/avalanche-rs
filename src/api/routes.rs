@@ -29,14 +29,8 @@ pub fn router(query: IndexerQuery) -> Router {
             get(handlers::get_address_transactions),
         )
         .route("/api/logs", get(handlers::get_logs))
-        .route(
-            "/api/stats/hourly",
-            get(handlers::get_hourly_stats),
-        )
-        .route(
-            "/api/stats/daily",
-            get(handlers::get_daily_stats),
-        )
+        .route("/api/stats/hourly", get(handlers::get_hourly_stats))
+        .route("/api/stats/daily", get(handlers::get_daily_stats))
         .route(
             "/api/address/{addr}/balance",
             get(handlers::get_address_balance),

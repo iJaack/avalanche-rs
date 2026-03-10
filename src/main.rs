@@ -855,6 +855,16 @@ async fn main() {
         info!("Light client mode enabled — headers only, state via on-demand proofs");
     }
 
+    #[cfg(feature = "indexer")]
+    if let Some(ref writer) = indexer_writer {
+        let chain_height = node.c_chain_metrics.read().await.tip_height as i64;
+        if let Err(e) =
+            avalanche_rs::indexer::catchup::startup_catchup(&writer.pool(), chain_height).await
+        {
+            error!("Indexer startup catchup scan failed: {}", e);
+        }
+    }
+
     // 6. Start P2P listener
     let staking_addr: SocketAddr = format!("0.0.0.0:{}", node.config.staking_port)
         .parse()
@@ -3016,10 +3026,7 @@ async fn broadcast_block_to_peers(node: &NodeState, block: &BuiltBlock) {
 
 /// Build an IndexedBlock from raw C-Chain block data for the PostgreSQL indexer.
 #[cfg(feature = "indexer")]
-fn build_indexed_cchain_block(
-    container: &[u8],
-    hash: &[u8; 32],
-) -> Option<IndexedBlock> {
+fn build_indexed_cchain_block(container: &[u8], hash: &[u8; 32]) -> Option<IndexedBlock> {
     let fields = extract_cchain_block_fields(container)?;
     let header = BlockHeader::parse(container, Chain::CChain).ok()?;
     Some(IndexedBlock {
@@ -3028,7 +3035,7 @@ fn build_indexed_cchain_block(
         parent_hash: header.parent_id.to_vec(),
         timestamp: chrono::DateTime::from_timestamp(fields.timestamp as i64, 0)
             .unwrap_or_else(chrono::Utc::now),
-        gas_used: 0,     // filled after EVM execution
+        gas_used: 0, // filled after EVM execution
         gas_limit: fields.gas_limit as i64,
         transaction_count: 0, // filled after EVM execution
         size: container.len() as i64,
@@ -3038,10 +3045,7 @@ fn build_indexed_cchain_block(
 
 /// Build an IndexedBlock from raw P-Chain block data for the PostgreSQL indexer.
 #[cfg(feature = "indexer")]
-fn build_indexed_pchain_block(
-    container: &[u8],
-    block_id: &[u8; 32],
-) -> Option<IndexedBlock> {
+fn build_indexed_pchain_block(container: &[u8], block_id: &[u8; 32]) -> Option<IndexedBlock> {
     let header = BlockHeader::parse(container, Chain::PChain).ok()?;
     Some(IndexedBlock {
         number: header.height as i64,
@@ -4465,6 +4469,8 @@ mod integration_tests {
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "indexer")]
+            indexer: None,
         })
     }
 
@@ -4650,6 +4656,8 @@ mod integration_tests {
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "indexer")]
+            indexer: None,
         });
 
         let mut handshake_complete = false;
@@ -4794,6 +4802,8 @@ mod integration_tests {
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "indexer")]
+            indexer: None,
         });
 
         let mut fetched_cchain_block = false;

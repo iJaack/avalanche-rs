@@ -70,10 +70,9 @@ pub async fn detect_gaps(pool: &PgPool, target_height: i64) -> Result<GapInfo, s
     .await?;
 
     // Also check if we're missing blocks from 0 to first indexed block
-    let first_block: Option<(i64,)> =
-        sqlx::query_as("SELECT MIN(number) FROM blocks")
-            .fetch_optional(pool)
-            .await?;
+    let first_block: Option<(i64,)> = sqlx::query_as("SELECT MIN(number) FROM blocks")
+        .fetch_optional(pool)
+        .await?;
 
     let mut gaps = Vec::new();
     let mut total_missing = 0i64;
@@ -116,10 +115,7 @@ pub async fn get_db_height(pool: &PgPool) -> Result<i64, sqlx::Error> {
 }
 
 /// Update the indexer_state tracking table.
-pub async fn update_indexer_state(
-    pool: &PgPool,
-    block_number: i64,
-) -> Result<(), sqlx::Error> {
+pub async fn update_indexer_state(pool: &PgPool, block_number: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO indexer_state (key, value_int, updated_at)
          VALUES ('last_indexed_block', $1, NOW())
@@ -238,12 +234,18 @@ pub async fn compress_old_chunks(pool: &PgPool, older_than_days: i32) -> Result<
 /// Returns the gap info for the caller to process (actual block fetching
 /// depends on the node's chain access).
 pub async fn startup_catchup(pool: &PgPool, chain_height: i64) -> Result<GapInfo, sqlx::Error> {
-    info!("Indexer catchup: scanning for gaps (chain height: {})", chain_height);
+    info!(
+        "Indexer catchup: scanning for gaps (chain height: {})",
+        chain_height
+    );
 
     let gap_info = detect_gaps(pool, chain_height).await?;
 
     if gap_info.gaps.is_empty() {
-        info!("Indexer catchup: no gaps detected, fully synced at block {}", gap_info.db_height);
+        info!(
+            "Indexer catchup: no gaps detected, fully synced at block {}",
+            gap_info.db_height
+        );
     } else {
         info!(
             "Indexer catchup: found {} gaps totaling {} missing blocks (DB height: {}, chain height: {})",
@@ -253,7 +255,13 @@ pub async fn startup_catchup(pool: &PgPool, chain_height: i64) -> Result<GapInfo
             chain_height
         );
         for (i, (start, end)) in gap_info.gaps.iter().enumerate().take(10) {
-            info!("  Gap {}: blocks {} to {} ({} blocks)", i + 1, start, end, end - start + 1);
+            info!(
+                "  Gap {}: blocks {} to {} ({} blocks)",
+                i + 1,
+                start,
+                end,
+                end - start + 1
+            );
         }
         if gap_info.gaps.len() > 10 {
             info!("  ... and {} more gaps", gap_info.gaps.len() - 10);
@@ -261,7 +269,9 @@ pub async fn startup_catchup(pool: &PgPool, chain_height: i64) -> Result<GapInfo
 
         let metrics = IndexerMetrics::global();
         metrics.catchup_blocks_remaining.set(gap_info.total_missing);
-        metrics.indexer_lag_blocks.set(chain_height - gap_info.db_height);
+        metrics
+            .indexer_lag_blocks
+            .set(chain_height - gap_info.db_height);
     }
 
     // Compress any old uncompressed chunks on startup
