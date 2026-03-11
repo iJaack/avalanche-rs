@@ -1,6 +1,8 @@
 # Stage 1: Build
 FROM rust:latest AS builder
 
+ARG AVALANCHE_FEATURES=full
+
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
     pkg-config libssl-dev libclang-dev clang llvm-dev protobuf-compiler && \
@@ -14,13 +16,13 @@ COPY build.rs ./
 COPY src/ src/
 COPY benches/ benches/
 
-RUN cargo build --release --features full && \
+RUN cargo build --release --features ${AVALANCHE_FEATURES} && \
     strip target/release/avalanche-rs
 
 # Stage 2: Runtime
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates libstdc++ && \
+RUN apk add --no-cache ca-certificates libstdc++ wget && \
     adduser -D -H avalanche
 
 COPY --from=builder /app/target/release/avalanche-rs /usr/local/bin/avalanche-rs
@@ -30,7 +32,7 @@ RUN mkdir -p /data/avalanche-rs && chown -R avalanche:avalanche /data/avalanche-
 USER avalanche
 WORKDIR /data/avalanche-rs
 
-EXPOSE 9650 9651
+EXPOSE 9650 9651 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD wget -qO- http://localhost:9650/health >/dev/null 2>&1 || exit 1

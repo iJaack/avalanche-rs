@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, HashMap};
 pub struct PoolTransaction {
     /// Transaction hash
     pub hash: [u8; 32],
+    /// Original raw signed transaction bytes, when available.
+    pub raw: Option<Vec<u8>>,
     /// Sender address
     pub from: [u8; 20],
     /// Recipient
@@ -169,6 +171,14 @@ impl TransactionPool {
         }
     }
 
+    /// Get a transaction by sender and nonce.
+    pub fn get_by_sender_nonce(&self, from: &[u8; 20], nonce: u64) -> Option<&PoolTransaction> {
+        self.pending
+            .get(from)
+            .and_then(|m| m.get(&nonce))
+            .or_else(|| self.queued.get(from).and_then(|m| m.get(&nonce)))
+    }
+
     /// Get all pending transactions sorted by effective gas price (highest first).
     pub fn pending_sorted(&self) -> Vec<&PoolTransaction> {
         let mut txs: Vec<&PoolTransaction> =
@@ -179,6 +189,57 @@ impl TransactionPool {
                 .cmp(&a.effective_gas_price(base))
         });
         txs
+    }
+
+    /// Get all pending transactions cloned and sorted by effective gas price.
+    pub fn pending_sorted_cloned(&self) -> Vec<PoolTransaction> {
+        self.pending_sorted().into_iter().cloned().collect()
+    }
+
+    /// Get all pending transactions without reordering.
+    pub fn pending_transactions(&self) -> Vec<PoolTransaction> {
+        self.pending
+            .values()
+            .flat_map(|m| m.values().cloned())
+            .collect()
+    }
+
+    /// Get all queued transactions without reordering.
+    pub fn queued_transactions(&self) -> Vec<PoolTransaction> {
+        self.queued
+            .values()
+            .flat_map(|m| m.values().cloned())
+            .collect()
+    }
+
+    /// Drop mined/stale transactions below the current account nonce and
+    /// promote any contiguous queued transactions that are now executable.
+    pub fn sync_account_nonce(&mut self, from: [u8; 20], account_nonce: u64) {
+        let mut remove_hashes = Vec::new();
+
+        if let Some(pending) = self.pending.get(&from) {
+            remove_hashes.extend(
+                pending
+                    .iter()
+                    .filter(|(nonce, _)| **nonce < account_nonce)
+                    .map(|(_, tx)| tx.hash),
+            );
+        }
+
+        if let Some(queued) = self.queued.get(&from) {
+            remove_hashes.extend(
+                queued
+                    .iter()
+                    .filter(|(nonce, _)| **nonce < account_nonce)
+                    .map(|(_, tx)| tx.hash),
+            );
+        }
+
+        for hash in remove_hashes {
+            let _ = self.remove(&hash);
+        }
+
+        self.promote_queued(&from, account_nonce);
     }
 
     /// Promote queued transactions to pending when nonce gap is filled.
@@ -417,6 +478,7 @@ mod tests {
         hash[1..9].copy_from_slice(&nonce.to_be_bytes());
         PoolTransaction {
             hash,
+            raw: None,
             from: [from; 20],
             to: Some([0xBB; 20]),
             nonce,

@@ -218,6 +218,25 @@ impl NodeIdentity {
         sig.compress().to_vec()
     }
 
+    /// Return the compressed BLS public key used for proof-of-possession APIs.
+    pub fn bls_public_key_bytes(&self) -> Vec<u8> {
+        let sk = BlsSecretKey::from_bytes(&self.bls_secret_key).expect("valid BLS secret key");
+        sk.sk_to_pk().to_bytes().to_vec()
+    }
+
+    /// Return a proof-of-possession over the compressed BLS public key.
+    pub fn bls_proof_of_possession(&self) -> Vec<u8> {
+        let sk = BlsSecretKey::from_bytes(&self.bls_secret_key).expect("valid BLS secret key");
+        let public_key = sk.sk_to_pk();
+        let public_key_bytes = public_key.to_bytes();
+        let sig = sk.sign(
+            &public_key_bytes,
+            b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+            &[],
+        );
+        sig.compress().to_vec()
+    }
+
     /// Sign arbitrary bytes with BLS key for block attestation.
     ///
     /// Used by validators to sign newly built blocks before broadcasting.

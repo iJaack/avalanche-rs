@@ -572,10 +572,14 @@ fn rlp_skip(data: &[u8], pos: usize) -> Result<usize, String> {
 pub struct CChainRawTx {
     /// Transaction type: 0 = legacy, 1 = EIP-2930, 2 = EIP-1559.
     pub tx_type: u8,
+    /// Raw signed transaction bytes exactly as they appear on chain.
+    pub raw: Vec<u8>,
     /// Sender nonce.
     pub nonce: u64,
     /// Gas price in wei (legacy/EIP-2930) or `maxFeePerGas` (EIP-1559).
     pub gas_price: u128,
+    /// Max priority fee per gas in wei (legacy/EIP-2930 reuse `gas_price`).
+    pub max_priority_fee_per_gas: u128,
     /// Gas limit.
     pub gas_limit: u64,
     /// Recipient address, or `None` for contract creation.
@@ -664,6 +668,8 @@ pub struct CChainBlockFields {
     pub timestamp: u64,
     /// Gas limit for the block.
     pub gas_limit: u64,
+    /// Gas used by all transactions in the block.
+    pub gas_used: u64,
     /// Base fee per gas (EIP-1559). Defaults to 25 gwei for pre-EIP-1559 blocks.
     pub base_fee: u128,
     /// Block producer / coinbase address.
@@ -739,6 +745,28 @@ pub fn extract_cchain_transactions(raw: &[u8]) -> Vec<CChainRawTx> {
     txs
 }
 
+/// Parse a single raw Ethereum/C-Chain transaction.
+///
+/// Supports legacy RLP transactions and EIP-2718 typed transactions
+/// (`0x01`/`0x02`) exactly as they are submitted to `eth_sendRawTransaction`.
+pub fn parse_raw_cchain_transaction(raw: &[u8]) -> Option<CChainRawTx> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw[0] >= 0xc0 {
+        let tx = parse_legacy_tx(raw, 0)?;
+        let end = rlp_skip(raw, 0).ok()?;
+        (end == raw.len()).then_some(tx)
+    } else {
+        let payload = raw.get(1..)?;
+        let end = rlp_skip(payload, 0).ok()?;
+        (end == payload.len())
+            .then(|| parse_typed_tx(raw))
+            .flatten()
+    }
+}
+
 /// Extract block-level header fields from a raw C-Chain block.
 ///
 /// Handles blocks with varying numbers of header fields (pre- and post-EIP-1559).
@@ -807,12 +835,23 @@ pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
     if !skip(rlp, &mut pos) {
         return None;
     }
-    // field 10: gasUsed – skip
+    // field 10: gasUsed
+    let gas_used = rlp_read_u64(rlp, pos).unwrap_or(0);
     if !skip(rlp, &mut pos) {
         return None;
     }
     // field 11: timestamp
     let timestamp = rlp_read_u64(rlp, pos).unwrap_or(0);
+    if !skip(rlp, &mut pos) {
+        return Some(CChainBlockFields {
+            number,
+            timestamp,
+            gas_limit,
+            gas_used,
+            base_fee: 25_000_000_000,
+            miner,
+        });
+    }
     // Fields 12+ are optional in synthetic/test blocks
     // field 12: extraData
     if !skip(rlp, &mut pos) {
@@ -820,6 +859,7 @@ pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
             number,
             timestamp,
             gas_limit,
+            gas_used,
             base_fee: 25_000_000_000,
             miner,
         });
@@ -830,6 +870,7 @@ pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
             number,
             timestamp,
             gas_limit,
+            gas_used,
             base_fee: 25_000_000_000,
             miner,
         });
@@ -840,6 +881,7 @@ pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
             number,
             timestamp,
             gas_limit,
+            gas_used,
             base_fee: 25_000_000_000,
             miner,
         });
@@ -855,6 +897,7 @@ pub fn extract_cchain_block_fields(raw: &[u8]) -> Option<CChainBlockFields> {
         number,
         timestamp,
         gas_limit,
+        gas_used,
         base_fee,
         miner,
     })
@@ -876,6 +919,8 @@ fn strip_avalanche_wrapper(raw: &[u8]) -> &[u8] {
 /// Parse a legacy (type-0) Ethereum transaction from an RLP list.
 /// Format: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
 fn parse_legacy_tx(data: &[u8], pos: usize) -> Option<CChainRawTx> {
+    let end = rlp_skip(data, pos).ok()?;
+    let raw = data.get(pos..end)?.to_vec();
     let (_, mut fp) = rlp_list_start(data, pos).ok()?;
     let nonce = rlp_read_u64(data, fp).unwrap_or(0);
     fp = rlp_skip(data, fp).ok()?;
@@ -903,8 +948,10 @@ fn parse_legacy_tx(data: &[u8], pos: usize) -> Option<CChainRawTx> {
 
     Some(CChainRawTx {
         tx_type: 0,
+        raw,
         nonce,
         gas_price,
+        max_priority_fee_per_gas: gas_price,
         gas_limit,
         to,
         value,
@@ -1070,8 +1117,10 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
             let s = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
             Some(CChainRawTx {
                 tx_type: 1,
+                raw: raw.to_vec(),
                 nonce,
                 gas_price,
+                max_priority_fee_per_gas: gas_price,
                 gas_limit,
                 to,
                 value,
@@ -1088,7 +1137,8 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
             fp = rlp_skip(payload, fp).ok()?; // chainId
             let nonce = rlp_read_u64(payload, fp).unwrap_or(0);
             fp = rlp_skip(payload, fp).ok()?;
-            fp = rlp_skip(payload, fp).ok()?; // maxPriorityFeePerGas
+            let max_priority_fee_per_gas = rlp_read_u128(payload, fp).unwrap_or(0);
+            fp = rlp_skip(payload, fp).ok()?;
             let gas_price = rlp_read_u128(payload, fp).unwrap_or(0); // maxFeePerGas
             fp = rlp_skip(payload, fp).ok()?;
             let gas_limit = rlp_read_u64(payload, fp).unwrap_or(21_000);
@@ -1123,8 +1173,10 @@ fn parse_typed_tx(raw: &[u8]) -> Option<CChainRawTx> {
             let s = rlp_read_bytes_vec(payload, fp).unwrap_or_default();
             Some(CChainRawTx {
                 tx_type: 2,
+                raw: raw.to_vec(),
                 nonce,
                 gas_price,
+                max_priority_fee_per_gas,
                 gas_limit,
                 to,
                 value,
@@ -1691,6 +1743,49 @@ mod tests {
         rlp_list(outer)
     }
 
+    fn make_cchain_block_with_base_fee(
+        parent: [u8; 32],
+        number: u64,
+        timestamp: u64,
+        base_fee: u64,
+    ) -> Vec<u8> {
+        let mut header_payload: Vec<u8> = Vec::new();
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&parent);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0x1du8; 32]);
+        header_payload.push(0x94);
+        header_payload.extend_from_slice(&[0u8; 20]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xb9);
+        header_payload.push(0x01);
+        header_payload.push(0x00);
+        header_payload.extend_from_slice(&[0u8; 256]);
+        header_payload.push(0x80);
+        encode_rlp_u64(&mut header_payload, number);
+        encode_rlp_u64(&mut header_payload, 8_000_000);
+        header_payload.push(0x80);
+        encode_rlp_u64(&mut header_payload, timestamp);
+        header_payload.push(0x80);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]);
+        encode_rlp_u64(&mut header_payload, base_fee);
+
+        let header_list = rlp_list(header_payload);
+        let empty = 0xc0u8;
+        let mut outer = Vec::new();
+        outer.extend_from_slice(&header_list);
+        outer.push(empty);
+        outer.push(empty);
+        rlp_list(outer)
+    }
+
     #[test]
     fn test_extract_state_root() {
         let state_root = [0x42u8; 32];
@@ -1958,6 +2053,7 @@ mod tests {
         assert_eq!(f.number, 42);
         assert_eq!(f.timestamp, 1_700_000_000);
         assert_eq!(f.gas_limit, 8_000_000); // from make_cchain_block
+        assert_eq!(f.gas_used, 0);
     }
 
     #[test]
@@ -1968,6 +2064,17 @@ mod tests {
         let f = fields.unwrap();
         assert_eq!(f.number, 99);
         assert_eq!(f.timestamp, 1_750_000_000);
+        assert_eq!(f.gas_used, 0);
+    }
+
+    #[test]
+    fn test_extract_cchain_block_fields_reads_base_fee() {
+        let raw = make_cchain_block_with_base_fee([0u8; 32], 7, 1_760_000_000, 25_000_000_000);
+        let fields = extract_cchain_block_fields(&raw).expect("should extract block fields");
+        assert_eq!(fields.number, 7);
+        assert_eq!(fields.timestamp, 1_760_000_000);
+        assert_eq!(fields.base_fee, 25_000_000_000);
+        assert_eq!(fields.gas_used, 0);
     }
 
     #[test]

@@ -189,6 +189,14 @@ impl SubscriptionManager {
         }
     }
 
+    /// Remove a subscription only if it belongs to the given connection.
+    pub fn unsubscribe_for_connection(&mut self, connection_id: u64, sub_id: &str) -> bool {
+        match self.subscriptions.get(sub_id) {
+            Some(sub) if sub.connection_id == connection_id => self.unsubscribe(sub_id),
+            _ => false,
+        }
+    }
+
     /// Get all subscriptions of a given type (for broadcasting events).
     pub fn get_subscriptions_by_type(&self, sub_type_name: &str) -> Vec<&Subscription> {
         self.subscriptions
@@ -280,8 +288,11 @@ pub fn logs_notification(sub_id: &str, log: &LogEntry) -> String {
                 "topics": topics,
                 "data": format!("0x{}", hex::encode(&log.data)),
                 "blockNumber": format!("0x{:x}", log.block_number),
+                "blockHash": format!("0x{}", hex::encode(log.block_hash)),
                 "transactionHash": format!("0x{}", hex::encode(log.tx_hash)),
+                "transactionIndex": format!("0x{:x}", log.transaction_index),
                 "logIndex": format!("0x{:x}", log.log_index),
+                "removed": log.removed,
             }
         }
     })
@@ -307,8 +318,11 @@ pub struct LogEntry {
     pub topics: Vec<[u8; 32]>,
     pub data: Vec<u8>,
     pub block_number: u64,
+    pub block_hash: [u8; 32],
     pub tx_hash: [u8; 32],
+    pub transaction_index: u32,
     pub log_index: u32,
+    pub removed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -506,8 +520,11 @@ mod tests {
             topics: vec![[0xAA; 32]],
             data: vec![0xBB; 32],
             block_number: 50,
+            block_hash: [0xDD; 32],
             tx_hash: [0xCC; 32],
+            transaction_index: 0,
             log_index: 0,
+            removed: false,
         };
 
         let msg = logs_notification("0x3", &log);

@@ -30,19 +30,23 @@ use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::Sha256;
 
 use avalanche_rs::archive::ArchiveStore;
 use avalanche_rs::block::{
-    extract_cchain_block_fields, extract_cchain_transactions, BlockHeader, Chain, ChainGraph,
+    extract_cchain_block_fields, extract_cchain_transactions, parse_raw_cchain_transaction,
+    BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
 };
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
-use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction};
+use avalanche_rs::debug::{EvmTracer, TraceConfig, TracerType};
+use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction, TxReceipt};
 use avalanche_rs::hardening::get_rss_bytes;
 use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
@@ -51,8 +55,21 @@ use avalanche_rs::network::{
     PeerState, PersistentPeerRecord,
 };
 use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
+use avalanche_rs::staking::{MIN_DELEGATOR_STAKE, MIN_VALIDATOR_STAKE};
 use avalanche_rs::subnet::{SubnetId, SubnetTracker};
 use avalanche_rs::sync::{BlockFetchMode, SyncConfig, SyncEngine, SyncPhase};
+use avalanche_rs::txpool::{PoolTransaction, TransactionPool};
+use avalanche_rs::websocket::{
+    logs_notification, new_heads_notification, new_pending_tx_notification,
+    BlockHeader as WsBlockHeader, LogEntry as WsLogEntry, SubscriptionManager,
+    SubscriptionType as WsSubscriptionType,
+};
+
+const DEFAULT_CCHAIN_GAS_LIMIT: u64 = 30_000_000;
+const DEFAULT_BASE_FEE_PER_GAS: u128 = 25_000_000_000;
+const PRIORITY_FEE_FLOOR: u128 = 1_000_000_000;
+const PRIORITY_FEE_SAMPLE_BLOCKS: u64 = 20;
+const PRIORITY_FEE_PERCENTILE: f64 = 60.0;
 
 #[cfg(feature = "indexer")]
 use avalanche_rs::api;
@@ -298,7 +315,7 @@ enum CChainBootstrapState {
 // Chain metrics
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ChainMetrics {
     pub blocks_synced: u64,
     pub genesis_height: u64,
@@ -521,6 +538,13 @@ fn find_genesis_block(db: &Database) -> Option<([u8; 32], Vec<u8>)> {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
+enum WsOutboundMessage {
+    Text(String),
+    Pong(Vec<u8>),
+    Close,
+}
+
+#[allow(dead_code)]
 struct NodeState {
     identity: NodeIdentity,
     db: Database,
@@ -539,8 +563,8 @@ struct NodeState {
     c_chain_metrics: Arc<RwLock<ChainMetrics>>,
     /// MEV engine for C-Chain opportunity detection
     mev_engine: Arc<MevEngine>,
-    /// Pending transactions for block building (validator mode only)
-    pending_txs: Arc<RwLock<Vec<EvmTransaction>>>,
+    /// Shared transaction pool for RPC submission and block building.
+    txpool: Arc<RwLock<TransactionPool>>,
     /// Light client for headers-only mode
     light_client: Arc<RwLock<avalanche_rs::light::LightClient>>,
     /// Archive store for historical state queries
@@ -549,6 +573,10 @@ struct NodeState {
     subnet_tracker: Arc<RwLock<SubnetTracker>>,
     /// Last sync state loaded from disk and refreshed on shutdown.
     persisted_sync_state: Arc<RwLock<Option<PersistedSyncState>>>,
+    /// Shared WebSocket subscription manager for `/ws` and `/ext/bc/C/ws`.
+    ws_subscriptions: Arc<RwLock<SubscriptionManager>>,
+    /// Active WebSocket connections keyed by connection ID.
+    ws_connections: Arc<RwLock<StdHashMap<u64, mpsc::UnboundedSender<WsOutboundMessage>>>>,
     /// PostgreSQL indexer for block/tx/log analytics (optional).
     #[cfg(feature = "indexer")]
     indexer: Option<Arc<IndexerWriter>>,
@@ -813,6 +841,10 @@ async fn main() {
         None
     };
 
+    let txpool = Arc::new(RwLock::new(TransactionPool::new(cli.txpool_size)));
+    let ws_subscriptions = Arc::new(RwLock::new(SubscriptionManager::new(10_000)));
+    let ws_connections = Arc::new(RwLock::new(StdHashMap::new()));
+
     let node = Arc::new(NodeState {
         identity,
         db,
@@ -827,11 +859,13 @@ async fn main() {
         p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
-        pending_txs: Arc::new(RwLock::new(Vec::new())),
+        txpool,
         light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
         archive_store,
         subnet_tracker,
         persisted_sync_state: Arc::new(RwLock::new(persisted_sync_state.clone())),
+        ws_subscriptions,
+        ws_connections,
         #[cfg(feature = "indexer")]
         indexer: indexer_writer.clone(),
     });
@@ -849,6 +883,8 @@ async fn main() {
             info!("Resuming from persisted state; skipping full bootstrap replay");
         }
     }
+
+    refresh_txpool_base_fee(&node).await;
 
     // Log light client mode
     if node.config.light_client {
@@ -1816,9 +1852,9 @@ async fn connect_and_handshake(
                                                     for peer in &peers {
                                                         // Derive NodeID from cert if available, else use node_id field
                                                         let nid_str = if !peer.cert_bytes.is_empty() {
-                                                            format!("{}", identity::derive_node_id(&peer.cert_bytes))
+                                                            full_node_id_string(&identity::derive_node_id(&peer.cert_bytes))
                                                         } else {
-                                                            format!("{}", peer.node_id)
+                                                            full_node_id_string(&peer.node_id)
                                                         };
                                                         vs.insert(nid_str);
                                                     }
@@ -2046,10 +2082,7 @@ async fn connect_and_handshake(
                                                                     // Execute block through EVM and store receipts
                                                                     execute_cchain_block_and_store(
                                                                         container,
-                                                                        node.config.chain_id,
-                                                                        &node.evm,
-                                                                        &node.db,
-                                                                        &node.c_chain_metrics,
+                                                                        &node,
                                                                     ).await;
                                                                     // Index block for PostgreSQL analytics
                                                                     #[cfg(feature = "indexer")]
@@ -2338,8 +2371,8 @@ async fn connect_and_handshake(
                                                     let _ = node.db.put_cf(CF_BLOCKS, &key, &container);
                                                     // Execute through EVM
                                                     execute_cchain_block_and_store(
-                                                        &container, node.config.chain_id,
-                                                        &node.evm, &node.db, &node.c_chain_metrics,
+                                                        &container,
+                                                        &node,
                                                     ).await;
                                                     if let Some(fields) = extract_cchain_block_fields(&container) {
                                                         info!("Following: new C-Chain block #{} via PushQuery from {}", fields.number, addr);
@@ -2641,6 +2674,8 @@ pub struct BuiltBlock {
     pub tx_count: usize,
     /// Total gas used.
     pub gas_used: u64,
+    /// Receipts produced while executing the block.
+    pub receipts: Vec<TxReceipt>,
     /// BLS signature over the block ID (48-byte public key proof).
     pub bls_signature: Vec<u8>,
 }
@@ -2669,15 +2704,14 @@ async fn run_block_builder(node: Arc<NodeState>) {
     loop {
         interval.tick().await;
 
-        let txs = {
-            let mut pool = node.pending_txs.write().await;
-            std::mem::take(&mut *pool)
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
         };
-
         let tip_height = node.c_chain_metrics.read().await.tip_height;
         let block_number = tip_height + 1;
 
-        match build_cchain_block(&node, block_number, txs).await {
+        match build_cchain_block(&node, block_number, pool_txs.clone()).await {
             Ok(block) => {
                 info!(
                     "Block builder: produced block #{} ({} txs, {} gas, id={:02x}{:02x}{:02x}{:02x}…)",
@@ -2696,6 +2730,18 @@ async fn run_block_builder(node: Arc<NodeState>) {
                     );
                     continue;
                 }
+                if let Err(e) = node.db.put_block(block.number, &block.raw) {
+                    warn!(
+                        "Block builder: failed to store block #{} by height: {}",
+                        block.number, e
+                    );
+                }
+                if let Err(e) = persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs) {
+                    warn!(
+                        "Block builder: failed to persist tx artifacts for block #{}: {}",
+                        block.number, e
+                    );
+                }
 
                 // Update last accepted height
                 let _ = node.db.set_last_accepted_height(block.number);
@@ -2705,6 +2751,18 @@ async fn run_block_builder(node: Arc<NodeState>) {
                     m.tip_hash = block.id;
                     m.blocks_synced += 1;
                 }
+                refresh_txpool_base_fee(&node).await;
+
+                let tx_hashes = pool_txs.iter().map(|tx| tx.hash).collect::<Vec<_>>();
+                websocket_broadcast_cchain_block_events(
+                    &node,
+                    &block.raw,
+                    &tx_hashes,
+                    &block.receipts,
+                )
+                .await;
+
+                reconcile_mined_pool_transactions(&node, &pool_txs).await;
 
                 // Index block for PostgreSQL analytics
                 #[cfg(feature = "indexer")]
@@ -2737,7 +2795,7 @@ async fn run_block_builder(node: Arc<NodeState>) {
 async fn build_cchain_block(
     node: &NodeState,
     block_number: u64,
-    txs: Vec<EvmTransaction>,
+    txs: Vec<PoolTransaction>,
 ) -> Result<BuiltBlock, Box<dyn std::error::Error + Send + Sync>> {
     use sha2::{Digest, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2757,8 +2815,18 @@ async fn build_cchain_block(
     let mut coinbase = [0u8; 20];
     coinbase.copy_from_slice(&node.identity.node_id.0);
 
-    let base_fee: u64 = 25_000_000_000; // 25 gwei
-    let gas_limit: u64 = 30_000_000;
+    let (gas_limit, base_fee) = latest_cchain_block_fields(&node.db)
+        .map(|fields| {
+            (
+                if fields.gas_limit == 0 {
+                    DEFAULT_CCHAIN_GAS_LIMIT
+                } else {
+                    fields.gas_limit
+                },
+                predicted_next_base_fee_from_fields(node.config.network_id, &fields),
+            )
+        })
+        .unwrap_or((DEFAULT_CCHAIN_GAS_LIMIT, DEFAULT_BASE_FEE_PER_GAS));
 
     // Execute transactions through EVM to get state root and receipts
     let ctx = BlockContext {
@@ -2766,15 +2834,17 @@ async fn build_cchain_block(
         timestamp,
         coinbase,
         gas_limit,
-        base_fee: base_fee as u128,
+        base_fee,
         difficulty: 0,
         chain_id: node.config.chain_id,
     };
 
+    let evm_txs: Vec<EvmTransaction> = txs.iter().map(pool_tx_to_evm_tx).collect();
+
     let (block_result, state_root) = {
         let mut evm = node.evm.write().await;
         let result = evm
-            .execute_block(&txs, &ctx)
+            .execute_block(&evm_txs, &ctx)
             .map_err(|e| format!("EVM execution: {}", e))?;
         let state_root = result.state_root;
         (result, state_root)
@@ -2807,6 +2877,7 @@ async fn build_cchain_block(
         number: block_number,
         tx_count: block_result.tx_count,
         gas_used: block_result.gas_used,
+        receipts: block_result.receipts,
         bls_signature,
     })
 }
@@ -2820,8 +2891,8 @@ fn encode_cchain_block_rlp(
     gas_limit: u64,
     gas_used: u64,
     timestamp: u64,
-    base_fee: u64,
-    txs: &[EvmTransaction],
+    base_fee: u128,
+    txs: &[PoolTransaction],
 ) -> Vec<u8> {
     fn rlp_bytes32(v: &[u8; 32]) -> Vec<u8> {
         let mut out = vec![0xa0u8];
@@ -2893,12 +2964,12 @@ fn encode_cchain_block_rlp(
         out.extend(payload);
         out
     }
-    /// Encode a single transaction as a legacy RLP list:
+    /// Encode a single locally-generated transaction as a legacy RLP list:
     /// [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
-    fn rlp_encode_tx(tx: &EvmTransaction) -> Vec<u8> {
+    fn rlp_encode_unsigned_legacy_tx(tx: &PoolTransaction) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend(rlp_u64(tx.nonce));
-        payload.extend(rlp_u128(tx.gas_price));
+        payload.extend(rlp_u128(tx.max_fee_per_gas));
         payload.extend(rlp_u64(tx.gas_limit));
         // to: 20-byte address or 0x80 for contract creation
         match tx.to {
@@ -2912,6 +2983,19 @@ fn encode_cchain_block_rlp(
         payload.push(0x80); // r = 0
         payload.push(0x80); // s = 0
         rlp_list(payload)
+    }
+
+    fn encode_block_tx(tx: &PoolTransaction) -> Vec<u8> {
+        match tx.raw.as_deref() {
+            Some(raw) if !raw.is_empty() => {
+                if raw[0] >= 0xc0 {
+                    raw.to_vec()
+                } else {
+                    rlp_bytes(raw)
+                }
+            }
+            _ => rlp_encode_unsigned_legacy_tx(tx),
+        }
     }
 
     let empty32 = [0u8; 32];
@@ -2937,7 +3021,7 @@ fn encode_cchain_block_rlp(
     header_payload.extend(rlp_bytes32(&empty32)); // mixHash
                                                   // nonce: 8 zero bytes = 0x8800000000000000
     header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]); // nonce
-    header_payload.extend(rlp_u64(base_fee)); // baseFeePerGas
+    header_payload.extend(rlp_u128(base_fee)); // baseFeePerGas
 
     let header = rlp_list(header_payload);
     let uncles = 0xc0u8; // empty uncles list
@@ -2948,7 +3032,7 @@ fn encode_cchain_block_rlp(
     } else {
         let mut txs_payload = Vec::new();
         for tx in txs {
-            txs_payload.extend(rlp_encode_tx(tx));
+            txs_payload.extend(encode_block_tx(tx));
         }
         rlp_list(txs_payload)
     };
@@ -3074,15 +3158,7 @@ fn build_indexed_pchain_block(container: &[u8], block_id: &[u8; 32]) -> Option<I
 /// Extracts transactions from the raw RLP block, runs them through the in-memory
 /// EVM executor, and stores receipts in CF_RECEIPTS keyed by `(block_height, tx_idx)`.
 /// The EVM state is cumulative across blocks within a single peer session.
-async fn execute_cchain_block_and_store(
-    raw_block: &[u8],
-    chain_id: u64,
-    evm: &Arc<RwLock<EvmExecutor>>,
-    db: &Database,
-    metrics: &Arc<RwLock<ChainMetrics>>,
-) {
-    use sha2::{Digest, Sha256};
-
+async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
     let fields = match extract_cchain_block_fields(raw_block) {
         Some(f) => f,
         None => return, // not a valid C-Chain block
@@ -3090,15 +3166,13 @@ async fn execute_cchain_block_and_store(
     let expected_state_root = BlockHeader::extract_state_root(raw_block);
 
     // Compute block hash for tip tracking
-    let mut hasher = Sha256::new();
-    hasher.update(raw_block);
-    let block_hash: [u8; 32] = hasher.finalize().into();
+    let block_hash = cchain_block_hash(raw_block);
 
     let raw_txs = extract_cchain_transactions(raw_block);
     if raw_txs.is_empty() {
         if let Some(expected) = expected_state_root {
             let computed = {
-                let evm = evm.read().await;
+                let evm = node.evm.read().await;
                 evm.compute_state_root_mpt()
             };
             if computed != expected {
@@ -3112,12 +3186,32 @@ async fn execute_cchain_block_and_store(
             }
         }
 
+        if let Err(e) = node.db.put_block(fields.number, raw_block) {
+            debug!(
+                "failed to store imported C-Chain block #{} by height: {}",
+                fields.number, e
+            );
+        }
+
+        let current_height = current_cchain_height(node);
+        if fields.number > current_height {
+            if let Err(e) = node.db.set_last_accepted_height(fields.number) {
+                debug!(
+                    "failed to advance imported C-Chain head to #{}: {}",
+                    fields.number, e
+                );
+            }
+        }
+
         // Even with no transactions update tip height and hash
-        let mut m = metrics.write().await;
+        let mut m = node.c_chain_metrics.write().await;
         if fields.number > m.tip_height {
             m.tip_height = fields.number;
             m.tip_hash = block_hash;
         }
+        drop(m);
+        refresh_txpool_base_fee(node).await;
+        websocket_broadcast_cchain_block_events(node, raw_block, &[], &[]).await;
         return;
     }
 
@@ -3128,12 +3222,12 @@ async fn execute_cchain_block_and_store(
         gas_limit: fields.gas_limit,
         base_fee: fields.base_fee,
         difficulty: 0,
-        chain_id,
+        chain_id: node.config.chain_id,
     };
 
     // Recover sender addresses from ECDSA signatures, falling back to zero address
     let result = {
-        let mut evm = evm.write().await;
+        let mut evm = node.evm.write().await;
         let evm_txs: Vec<EvmTransaction> = raw_txs
             .iter()
             .map(|t| {
@@ -3176,31 +3270,435 @@ async fn execute_cchain_block_and_store(
                 hex::encode(block_result.state_root)
             );
 
-            // Persist receipts: key = block_height (8 BE) + tx_index (4 BE)
-            for (idx, receipt) in block_result.receipts.iter().enumerate() {
-                // Compact binary receipt: [success(1), gas_used(8LE), logs_count(4LE)]
-                let mut rec_bytes = Vec::with_capacity(13);
-                rec_bytes.push(receipt.success as u8);
-                rec_bytes.extend_from_slice(&receipt.gas_used.to_le_bytes());
-                rec_bytes.extend_from_slice(&(receipt.logs.len() as u32).to_le_bytes());
-                if let Err(e) = db.put_receipt(fields.number, idx as u32, &rec_bytes) {
+            if let Err(e) = node.db.put_block(fields.number, raw_block) {
+                debug!(
+                    "failed to store imported C-Chain block #{} by height: {}",
+                    fields.number, e
+                );
+            }
+
+            if let Err(e) = persist_imported_cchain_tx_artifacts(
+                &node.db,
+                fields.number,
+                &block_hash,
+                &raw_txs,
+                &block_result.receipts,
+            ) {
+                debug!(
+                    "failed to persist imported tx artifacts for block #{}: {}",
+                    fields.number, e
+                );
+            }
+
+            let current_height = current_cchain_height(node);
+            if fields.number > current_height {
+                if let Err(e) = node.db.set_last_accepted_height(fields.number) {
                     debug!(
-                        "receipt store failed for block #{} tx {}: {}",
-                        fields.number, idx, e
+                        "failed to advance imported C-Chain head to #{}: {}",
+                        fields.number, e
                     );
                 }
             }
 
-            let mut m = metrics.write().await;
+            let mut m = node.c_chain_metrics.write().await;
             if fields.number > m.tip_height {
                 m.tip_height = fields.number;
                 m.tip_hash = block_hash;
             }
+            drop(m);
+            refresh_txpool_base_fee(node).await;
+
+            let tx_hashes = raw_txs
+                .iter()
+                .map(|tx| raw_tx_hash(&tx.raw))
+                .collect::<Vec<_>>();
+            websocket_broadcast_cchain_block_events(
+                node,
+                raw_block,
+                &tx_hashes,
+                &block_result.receipts,
+            )
+            .await;
         }
         Err(e) => {
             debug!("C-Chain #{} EVM execution error: {}", fields.number, e);
         }
     }
+}
+
+fn parse_http_headers(req: &str) -> StdHashMap<String, String> {
+    req.lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect()
+}
+
+fn is_websocket_upgrade(path: &str, headers: &StdHashMap<String, String>) -> bool {
+    matches!(path, "/ws" | "/ext/bc/C/ws")
+        && headers
+            .get("upgrade")
+            .map(|value| value.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false)
+        && headers
+            .get("connection")
+            .map(|value| value.to_ascii_lowercase().contains("upgrade"))
+            .unwrap_or(false)
+        && headers.contains_key("sec-websocket-key")
+}
+
+fn websocket_accept_key(sec_key: &str) -> String {
+    let mut sha1 = Sha1::new();
+    sha1.update(sec_key.as_bytes());
+    sha1.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(sha1.finalize())
+}
+
+async fn read_ws_frame<R>(reader: &mut R) -> std::io::Result<Option<(u8, Vec<u8>)>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut header = [0u8; 2];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    let opcode = header[0] & 0x0f;
+    let masked = (header[1] & 0x80) != 0;
+    let mut payload_len = u64::from(header[1] & 0x7f);
+
+    if payload_len == 126 {
+        let mut buf = [0u8; 2];
+        reader.read_exact(&mut buf).await?;
+        payload_len = u16::from_be_bytes(buf) as u64;
+    } else if payload_len == 127 {
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf).await?;
+        payload_len = u64::from_be_bytes(buf);
+    }
+
+    if payload_len > 8 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket frame too large",
+        ));
+    }
+
+    let mut mask = [0u8; 4];
+    if masked {
+        reader.read_exact(&mut mask).await?;
+    }
+
+    let mut payload = vec![0u8; payload_len as usize];
+    if !payload.is_empty() {
+        reader.read_exact(&mut payload).await?;
+    }
+    if masked {
+        for (idx, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[idx % 4];
+        }
+    }
+
+    Ok(Some((opcode, payload)))
+}
+
+async fn write_ws_frame<W>(writer: &mut W, opcode: u8, payload: &[u8]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut frame = Vec::with_capacity(2 + payload.len() + 8);
+    frame.push(0x80 | (opcode & 0x0f));
+    match payload.len() {
+        len @ 0..=125 => frame.push(len as u8),
+        len @ 126..=65535 => {
+            frame.push(126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        len => {
+            frame.push(127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(payload);
+    writer.write_all(&frame).await
+}
+
+async fn handle_ws_rpc_request(json_str: &str, node: &NodeState, connection_id: u64) -> String {
+    let req: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => {
+            return r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"parse error"},"id":null}"#
+                .to_string();
+        }
+    };
+
+    let method = req["method"].as_str().unwrap_or("");
+    let params = req["params"].as_array().cloned().unwrap_or_default();
+    let id = &req["id"];
+
+    match method {
+        "eth_subscribe" => match WsSubscriptionType::from_params(&params) {
+            Some(sub_type) => {
+                let sub_id = node
+                    .ws_subscriptions
+                    .write()
+                    .await
+                    .subscribe(connection_id, sub_type);
+                rpc_ok(&format!("\"{}\"", sub_id), id)
+            }
+            None => rpc_error(-32602, "invalid subscription", id),
+        },
+        "eth_unsubscribe" => {
+            let sub_id = params
+                .first()
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let removed = if sub_id.is_empty() {
+                false
+            } else {
+                node.ws_subscriptions
+                    .write()
+                    .await
+                    .unsubscribe_for_connection(connection_id, sub_id)
+            };
+            rpc_ok(if removed { "true" } else { "false" }, id)
+        }
+        _ => handle_rpc_request(json_str, node).await,
+    }
+}
+
+async fn ws_send_text(node: &NodeState, connection_id: u64, message: String) -> bool {
+    let sender = node
+        .ws_connections
+        .read()
+        .await
+        .get(&connection_id)
+        .cloned();
+    match sender {
+        Some(sender) => sender.send(WsOutboundMessage::Text(message)).is_ok(),
+        None => false,
+    }
+}
+
+async fn ws_disconnect(node: &NodeState, connection_id: u64) {
+    if let Some(sender) = node.ws_connections.write().await.remove(&connection_id) {
+        let _ = sender.send(WsOutboundMessage::Close);
+    }
+    node.ws_subscriptions
+        .write()
+        .await
+        .disconnect(connection_id);
+}
+
+fn websocket_block_header_from_cchain(block_data: &[u8]) -> Option<WsBlockHeader> {
+    let header = BlockHeader::parse(block_data, Chain::CChain).ok()?;
+    let fields = extract_cchain_block_fields(block_data)?;
+    Some(WsBlockHeader {
+        number: fields.number,
+        hash: header.id,
+        parent_hash: header.parent_id,
+        timestamp: fields.timestamp,
+        state_root: BlockHeader::extract_state_root(block_data).unwrap_or([0u8; 32]),
+        gas_limit: fields.gas_limit,
+        gas_used: fields.gas_used,
+    })
+}
+
+fn websocket_log_entries(
+    block_number: u64,
+    block_hash: [u8; 32],
+    tx_hashes: &[[u8; 32]],
+    receipts: &[TxReceipt],
+) -> Vec<WsLogEntry> {
+    let mut entries = Vec::new();
+    let mut log_index = 0u32;
+
+    for (tx_index, (tx_hash, receipt)) in tx_hashes.iter().zip(receipts.iter()).enumerate() {
+        for log in &receipt.logs {
+            entries.push(WsLogEntry {
+                address: log.address,
+                topics: log.topics.clone(),
+                data: log.data.clone(),
+                block_number,
+                block_hash,
+                tx_hash: *tx_hash,
+                transaction_index: tx_index as u32,
+                log_index,
+                removed: false,
+            });
+            log_index = log_index.saturating_add(1);
+        }
+    }
+
+    entries
+}
+
+async fn websocket_broadcast_pending_tx(node: &NodeState, tx_hash: &[u8; 32]) {
+    let subscriptions = {
+        let manager = node.ws_subscriptions.read().await;
+        manager
+            .get_subscriptions_by_type("newPendingTransactions")
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    for subscription in subscriptions {
+        let message = new_pending_tx_notification(&subscription.id, tx_hash);
+        if !ws_send_text(node, subscription.connection_id, message).await {
+            ws_disconnect(node, subscription.connection_id).await;
+        }
+    }
+}
+
+async fn websocket_broadcast_cchain_block_events(
+    node: &NodeState,
+    block_data: &[u8],
+    tx_hashes: &[[u8; 32]],
+    receipts: &[TxReceipt],
+) {
+    if let Some(header) = websocket_block_header_from_cchain(block_data) {
+        let head_subscriptions = {
+            let manager = node.ws_subscriptions.read().await;
+            manager
+                .get_subscriptions_by_type("newHeads")
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for subscription in head_subscriptions {
+            let message = new_heads_notification(&subscription.id, &header);
+            if !ws_send_text(node, subscription.connection_id, message).await {
+                ws_disconnect(node, subscription.connection_id).await;
+            }
+        }
+
+        let log_entries = websocket_log_entries(header.number, header.hash, tx_hashes, receipts);
+        if log_entries.is_empty() {
+            return;
+        }
+
+        let log_subscriptions = {
+            let manager = node.ws_subscriptions.read().await;
+            manager
+                .get_subscriptions_by_type("logs")
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for subscription in log_subscriptions {
+            if let WsSubscriptionType::Logs(filter) = &subscription.sub_type {
+                for log in &log_entries {
+                    if !filter.matches(&log.address, &log.topics) {
+                        continue;
+                    }
+                    let message = logs_notification(&subscription.id, log);
+                    if !ws_send_text(node, subscription.connection_id, message.clone()).await {
+                        ws_disconnect(node, subscription.connection_id).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_websocket_connection(
+    stream: tokio::net::TcpStream,
+    headers: &StdHashMap<String, String>,
+    node: Arc<NodeState>,
+) {
+    let sec_key = match headers.get("sec-websocket-key") {
+        Some(key) => key.clone(),
+        None => return,
+    };
+
+    let connection_id = match node.ws_subscriptions.write().await.connect() {
+        Ok(id) => id,
+        Err(e) => {
+            let mut stream = stream;
+            let body = serde_json::json!({"error": e.to_string()}).to_string();
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            return;
+        }
+    };
+
+    let accept_key = websocket_accept_key(&sec_key);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+        accept_key
+    );
+
+    let (mut reader, mut writer) = stream.into_split();
+    if writer.write_all(response.as_bytes()).await.is_err() {
+        node.ws_subscriptions
+            .write()
+            .await
+            .disconnect(connection_id);
+        return;
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<WsOutboundMessage>();
+    node.ws_connections
+        .write()
+        .await
+        .insert(connection_id, tx.clone());
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            let result = match message {
+                WsOutboundMessage::Text(text) => {
+                    write_ws_frame(&mut writer, 0x1, text.as_bytes()).await
+                }
+                WsOutboundMessage::Pong(payload) => {
+                    write_ws_frame(&mut writer, 0xA, &payload).await
+                }
+                WsOutboundMessage::Close => {
+                    let _ = write_ws_frame(&mut writer, 0x8, &[]).await;
+                    break;
+                }
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        match read_ws_frame(&mut reader).await {
+            Ok(Some((0x1, payload))) => {
+                let request = match String::from_utf8(payload) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+                let response = handle_ws_rpc_request(&request, &node, connection_id).await;
+                if tx.send(WsOutboundMessage::Text(response)).is_err() {
+                    break;
+                }
+            }
+            Ok(Some((0x8, _))) => break,
+            Ok(Some((0x9, payload))) => {
+                if tx.send(WsOutboundMessage::Pong(payload)).is_err() {
+                    break;
+                }
+            }
+            Ok(Some((_opcode, _payload))) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    let _ = tx.send(WsOutboundMessage::Close);
+    ws_disconnect(&node, connection_id).await;
+    let _ = writer_task.await;
 }
 
 // ---------------------------------------------------------------------------
@@ -3219,6 +3717,10 @@ async fn run_rpc_server(addr: SocketAddr, node: Arc<NodeState>) {
         }
     };
 
+    run_rpc_server_with_listener(listener, node).await;
+}
+
+async fn run_rpc_server_with_listener(listener: TcpListener, node: Arc<NodeState>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
@@ -3250,15 +3752,64 @@ async fn handle_rpc_connection(
     let req = String::from_utf8_lossy(&buf[..n]);
     let mut lines = req.lines();
     let request_line = lines.next().unwrap_or_default();
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    let mut request_parts = request_line.split_whitespace();
+    let http_method = request_parts.next().unwrap_or("POST");
+    let raw_path = request_parts.next().unwrap_or("/");
+    let (path, query) = split_path_and_query(raw_path);
+    let headers = parse_http_headers(&req);
 
-    let (content_type, response_body) = match path {
+    if is_websocket_upgrade(path, &headers) {
+        handle_websocket_connection(stream, &headers, node).await;
+        return;
+    }
+
+    let (status_line, content_type, response_body) = match path {
+        "/ext/health" | "/ext/health/health" if http_method == "GET" => {
+            let tags = query_tags(query);
+            let report = health_report(&node, HealthReportKind::Health, &tags).await;
+            let healthy = report
+                .get("healthy")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            (
+                if healthy {
+                    "HTTP/1.1 200 OK"
+                } else {
+                    "HTTP/1.1 503 Service Unavailable"
+                },
+                "application/json",
+                report.to_string(),
+            )
+        }
+        "/ext/health/readiness" if http_method == "GET" => {
+            let tags = query_tags(query);
+            let report = health_report(&node, HealthReportKind::Readiness, &tags).await;
+            let healthy = report
+                .get("healthy")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            (
+                if healthy {
+                    "HTTP/1.1 200 OK"
+                } else {
+                    "HTTP/1.1 503 Service Unavailable"
+                },
+                "application/json",
+                report.to_string(),
+            )
+        }
+        "/ext/health/liveness" if http_method == "GET" => {
+            let tags = query_tags(query);
+            let report = health_report(&node, HealthReportKind::Liveness, &tags).await;
+            ("HTTP/1.1 200 OK", "application/json", report.to_string())
+        }
         "/health" => {
             let peers = node.peer_manager.read().await.connected_count();
             let phase = node.sync_engine.phase().await.to_string();
             let uptime_seconds = node.start_time.elapsed().as_secs();
             let memory_rss_bytes = get_rss_bytes();
             (
+                "HTTP/1.1 200 OK",
                 "application/json",
                 serde_json::json!({
                     "healthy": peers > 0,
@@ -3271,6 +3822,7 @@ async fn handle_rpc_connection(
             )
         }
         "/metrics" => (
+            "HTTP/1.1 200 OK",
             "text/plain; version=0.0.4",
             render_prometheus_metrics(&node).await,
         ),
@@ -3279,12 +3831,17 @@ async fn handle_rpc_connection(
                 .split_once("\r\n\r\n")
                 .map(|(_, b)| b)
                 .unwrap_or_default();
-            ("application/json", handle_rpc_request(body, &node).await)
+            (
+                "HTTP/1.1 200 OK",
+                "application/json",
+                handle_rpc_request(body, &node).await,
+            )
         }
     };
 
     let http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        status_line,
         content_type,
         response_body.len(),
         response_body
@@ -3363,6 +3920,167 @@ fn parse_hex_hash(s: &str) -> Option<[u8; 32]> {
     Some(arr)
 }
 
+fn parse_hex_u64_str(s: &str) -> Option<u64> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.is_empty() {
+        Some(0)
+    } else {
+        u64::from_str_radix(s, 16)
+            .ok()
+            .or_else(|| s.parse::<u64>().ok())
+    }
+}
+
+fn parse_hex_u128_str(s: &str) -> Option<u128> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.is_empty() {
+        Some(0)
+    } else {
+        u128::from_str_radix(s, 16)
+            .ok()
+            .or_else(|| s.parse::<u128>().ok())
+    }
+}
+
+fn parse_quantity_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => parse_hex_u64_str(s),
+        _ => None,
+    }
+}
+
+fn parse_quantity_u128(value: &serde_json::Value) -> Option<u128> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64().map(u128::from),
+        serde_json::Value::String(s) => parse_hex_u128_str(s),
+        _ => None,
+    }
+}
+
+fn rpc_simulation_block_context(node: &NodeState) -> BlockContext {
+    let height = current_cchain_height(node);
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Some(fields) = latest_cchain_block_fields(&node.db) {
+        return BlockContext {
+            number: height.saturating_add(1),
+            timestamp,
+            coinbase: fields.miner,
+            gas_limit: if fields.gas_limit == 0 {
+                DEFAULT_CCHAIN_GAS_LIMIT
+            } else {
+                fields.gas_limit
+            },
+            base_fee: predicted_next_base_fee_from_fields(node.config.network_id, &fields),
+            difficulty: 0,
+            chain_id: node.config.chain_id,
+        };
+    }
+
+    BlockContext {
+        number: height.saturating_add(1),
+        timestamp,
+        coinbase: [0u8; 20],
+        gas_limit: DEFAULT_CCHAIN_GAS_LIMIT,
+        base_fee: DEFAULT_BASE_FEE_PER_GAS,
+        difficulty: 0,
+        chain_id: node.config.chain_id,
+    }
+}
+
+fn parse_rpc_access_list(tx_obj: &serde_json::Value) -> Vec<avalanche_rs::tx::AccessListEntry> {
+    tx_obj
+        .get("accessList")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let address = item
+                        .get("address")
+                        .and_then(|value| value.as_str())
+                        .and_then(parse_hex_address)?;
+                    let storage_keys = item
+                        .get("storageKeys")
+                        .and_then(|value| value.as_array())
+                        .map(|keys| {
+                            keys.iter()
+                                .filter_map(|value| value.as_str().and_then(parse_hex_hash))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    Some(avalanche_rs::tx::AccessListEntry {
+                        address,
+                        storage_keys,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone)]
+struct ParsedRpcSimulationTx {
+    tx: EvmTransaction,
+    access_list: Vec<avalanche_rs::tx::AccessListEntry>,
+}
+
+fn parse_rpc_simulation_tx(
+    tx_obj: &serde_json::Value,
+    evm: &EvmExecutor,
+    block_ctx: &BlockContext,
+) -> ParsedRpcSimulationTx {
+    let from = tx_obj
+        .get("from")
+        .and_then(|value| value.as_str())
+        .and_then(parse_hex_address)
+        .unwrap_or([0u8; 20]);
+    let to = tx_obj
+        .get("to")
+        .and_then(|value| value.as_str())
+        .and_then(parse_hex_address);
+    let data = tx_obj
+        .get("data")
+        .and_then(|value| value.as_str())
+        .or_else(|| tx_obj.get("input").and_then(|value| value.as_str()))
+        .and_then(parse_hex_bytes)
+        .unwrap_or_default();
+    let value = tx_obj
+        .get("value")
+        .and_then(parse_quantity_u128)
+        .unwrap_or(0);
+    let gas_limit = tx_obj
+        .get("gas")
+        .and_then(parse_quantity_u64)
+        .unwrap_or(block_ctx.gas_limit);
+    let gas_price = tx_obj
+        .get("maxFeePerGas")
+        .and_then(parse_quantity_u128)
+        .or_else(|| tx_obj.get("gasPrice").and_then(parse_quantity_u128))
+        .unwrap_or(block_ctx.base_fee);
+    let nonce = tx_obj
+        .get("nonce")
+        .and_then(parse_quantity_u64)
+        .unwrap_or_else(|| evm.get_nonce(from));
+
+    ParsedRpcSimulationTx {
+        tx: EvmTransaction {
+            from,
+            to,
+            value,
+            data,
+            gas_limit,
+            gas_price,
+            nonce,
+        },
+        access_list: parse_rpc_access_list(tx_obj),
+    }
+}
+
 /// Parse a hex block number or "latest"/"earliest"/"pending" tag.
 fn parse_block_number(val: &serde_json::Value, node: &NodeState) -> u64 {
     match val.as_str() {
@@ -3375,6 +4093,1296 @@ fn parse_block_number(val: &serde_json::Value, node: &NodeState) -> u64 {
             u64::from_str_radix(s, 16).unwrap_or(0)
         }
     }
+}
+
+fn current_cchain_height(node: &NodeState) -> u64 {
+    node.db.last_accepted_height().unwrap_or(None).unwrap_or(0)
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cb58_encode(bytes: &[u8]) -> String {
+    let checksum = Sha256::digest(Sha256::digest(bytes));
+    let mut encoded = Vec::with_capacity(bytes.len() + 4);
+    encoded.extend_from_slice(bytes);
+    encoded.extend_from_slice(&checksum[..4]);
+    bs58::encode(encoded).into_string()
+}
+
+fn cb58_encode_id(id: [u8; 32]) -> String {
+    cb58_encode(&id)
+}
+
+fn full_node_id_string(node_id: &NodeId) -> String {
+    format!("NodeID-{}", cb58_encode(&node_id.0))
+}
+
+fn parse_node_id_20(value: &str) -> Option<[u8; 20]> {
+    let raw = value.strip_prefix("NodeID-").unwrap_or(value);
+    let decoded = bs58::decode(raw).into_vec().ok()?;
+    if decoded.len() < 24 {
+        return None;
+    }
+    let mut node_id = [0u8; 20];
+    node_id.copy_from_slice(&decoded[..20]);
+    Some(node_id)
+}
+
+fn info_network_name(network_id: u32) -> &'static str {
+    match network_id {
+        1 => "mainnet",
+        5 => "fuji",
+        _ => "custom",
+    }
+}
+
+fn info_xchain_blockchain_id(network_id: u32) -> Option<[u8; 32]> {
+    let cb58 = match network_id {
+        1 => "2oYMBNV4eNHyqk2fjjV5nVQLDbtmNJzq5s3qs3Lo6ftnC6FByM",
+        5 => "2JVSBoinj9C2J33VntvzYtVJNZdN2NKiwwKjcumHUWEb5DbBrm",
+        _ => return None,
+    };
+    parse_platform_id_32(cb58)
+}
+
+fn info_blockchain_alias_id(alias: &str, network_id: u32) -> Option<[u8; 32]> {
+    match alias.to_ascii_lowercase().as_str() {
+        "p" | "platform" => Some(platform_pchain_blockchain_id()),
+        "c" | "evm" => Some(platform_cchain_blockchain_id(network_id)),
+        "x" | "avm" => info_xchain_blockchain_id(network_id),
+        _ => parse_platform_id_32(alias),
+    }
+}
+
+fn info_node_ids_param(params: &serde_json::Value) -> Vec<[u8; 20]> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("nodeIDs"))
+        .or_else(|| params.get(0))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().and_then(parse_node_id_20))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn info_alias_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("alias"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(0).and_then(|value| value.as_str()))
+}
+
+fn info_chain_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("chain"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(0).and_then(|value| value.as_str()))
+}
+
+fn info_vm_id(tag: &[u8]) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    let len = tag.len().min(id.len());
+    id[..len].copy_from_slice(&tag[..len]);
+    id
+}
+
+fn info_get_node_version_result() -> serde_json::Value {
+    let version = format!("avalanche-rs/{}", env!("CARGO_PKG_VERSION"));
+    serde_json::json!({
+        "version": version,
+        "databaseVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+        "rpcProtocolVersion": "0",
+        "gitCommit": option_env!("GIT_COMMIT").unwrap_or("rust"),
+        "vmVersions": {
+            "platform": format!("avalanche-rs/{}", env!("CARGO_PKG_VERSION")),
+            "evm": format!("avalanche-rs/{}", env!("CARGO_PKG_VERSION")),
+        }
+    })
+}
+
+fn info_get_tx_fee_result(network_id: u32) -> serde_json::Value {
+    let (create_subnet_tx_fee, transform_subnet_tx_fee, create_blockchain_tx_fee) = match network_id
+    {
+        1 => (1_000_000_000u64, 10_000_000_000u64, 1_000_000_000u64),
+        5 => (100_000_000u64, 1_000_000_000u64, 100_000_000u64),
+        _ => (100_000_000u64, 100_000_000u64, 100_000_000u64),
+    };
+
+    serde_json::json!({
+        "txFee": "1000000",
+        "createAssetTxFee": "10000000",
+        "createSubnetTxFee": create_subnet_tx_fee.to_string(),
+        "transformSubnetTxFee": transform_subnet_tx_fee.to_string(),
+        "createBlockchainTxFee": create_blockchain_tx_fee.to_string(),
+        "addPrimaryNetworkValidatorFee": "0",
+        "addPrimaryNetworkDelegatorFee": "0",
+        "addSubnetValidatorFee": "1000000",
+        "addSubnetDelegatorFee": "1000000",
+    })
+}
+
+fn info_upgrades_result(network_id: u32) -> serde_json::Value {
+    match network_id {
+        1 => serde_json::json!({
+            "apricotPhase1Time": "2021-03-31T14:00:00Z",
+            "apricotPhase2Time": "2021-05-10T11:00:00Z",
+            "apricotPhase3Time": "2021-08-24T14:00:00Z",
+            "apricotPhase4Time": "2021-09-22T21:00:00Z",
+            "apricotPhase4MinPChainHeight": 793005,
+            "apricotPhase5Time": "2021-12-02T18:00:00Z",
+            "apricotPhasePre6Time": "2022-09-05T01:30:00Z",
+            "apricotPhase6Time": "2022-09-06T20:00:00Z",
+            "apricotPhasePost6Time": "2022-09-07T03:00:00Z",
+            "banffTime": "2022-10-18T16:00:00Z",
+            "cortinaTime": "2023-04-25T15:00:00Z",
+            "cortinaXChainStopVertexID": "jrGWDh5Po9FMj54depyunNixpia5PN4aAYxfmNzU8n752Rjga",
+            "durangoTime": "2024-03-06T16:00:00Z",
+            "etnaTime": "2024-12-16T17:00:00Z",
+            "fortunaTime": "2025-04-08T15:00:00Z",
+            "graniteTime": "2025-11-19T16:00:00Z",
+            "graniteEpochDuration": 300_000_000_000u64,
+            "heliconTime": "9999-12-01T00:00:00Z",
+        }),
+        5 => serde_json::json!({
+            "apricotPhase1Time": "2021-03-26T14:00:00Z",
+            "apricotPhase2Time": "2021-05-05T14:00:00Z",
+            "apricotPhase3Time": "2021-08-16T19:00:00Z",
+            "apricotPhase4Time": "2021-09-16T21:00:00Z",
+            "apricotPhase4MinPChainHeight": 47437,
+            "apricotPhase5Time": "2021-11-24T15:00:00Z",
+            "apricotPhasePre6Time": "2022-09-06T20:00:00Z",
+            "apricotPhase6Time": "2022-09-06T20:00:00Z",
+            "apricotPhasePost6Time": "2022-09-07T06:00:00Z",
+            "banffTime": "2022-10-03T14:00:00Z",
+            "cortinaTime": "2023-04-06T15:00:00Z",
+            "cortinaXChainStopVertexID": "2D1cmbiG36BqQMRyHt4kFhWarmatA1ighSpND3FeFgz3vFVtCZ",
+            "durangoTime": "2024-02-13T16:00:00Z",
+            "etnaTime": "2024-11-25T16:00:00Z",
+            "fortunaTime": "2025-03-13T15:00:00Z",
+            "graniteTime": "2025-10-29T15:00:00Z",
+            "graniteEpochDuration": 300_000_000_000u64,
+            "heliconTime": "9999-12-01T00:00:00Z",
+        }),
+        _ => serde_json::json!({
+            "apricotPhase1Time": "2020-12-05T05:00:00Z",
+            "apricotPhase2Time": "2020-12-05T05:00:00Z",
+            "apricotPhase3Time": "2020-12-05T05:00:00Z",
+            "apricotPhase4Time": "2020-12-05T05:00:00Z",
+            "apricotPhase4MinPChainHeight": 0,
+            "apricotPhase5Time": "2020-12-05T05:00:00Z",
+            "apricotPhasePre6Time": "2020-12-05T05:00:00Z",
+            "apricotPhase6Time": "2020-12-05T05:00:00Z",
+            "apricotPhasePost6Time": "2020-12-05T05:00:00Z",
+            "banffTime": "2020-12-05T05:00:00Z",
+            "cortinaTime": "2020-12-05T05:00:00Z",
+            "cortinaXChainStopVertexID": "11111111111111111111111111111111LpoYY",
+            "durangoTime": "2020-12-05T05:00:00Z",
+            "etnaTime": "2020-12-05T05:00:00Z",
+            "fortunaTime": "2020-12-05T05:00:00Z",
+            "graniteTime": "2020-12-05T05:00:00Z",
+            "graniteEpochDuration": 30_000_000_000u64,
+            "heliconTime": "9999-12-01T00:00:00Z",
+        }),
+    }
+}
+
+fn info_get_vms_result() -> serde_json::Value {
+    serde_json::json!({
+        "vms": {
+            cb58_encode_id(info_vm_id(b"platformvm")): ["platform"],
+            cb58_encode_id(info_vm_id(b"evm")): ["evm"],
+        },
+        "fxs": {
+            cb58_encode_id(info_vm_id(b"secp256k1fx")): "secp256k1fx",
+            cb58_encode_id(info_vm_id(b"nftfx")): "nftfx",
+            cb58_encode_id(info_vm_id(b"propertyfx")): "propertyfx",
+        }
+    })
+}
+
+fn format_instant_rfc3339(instant: Instant) -> String {
+    let now = chrono::Utc::now();
+    match chrono::Duration::from_std(instant.elapsed()) {
+        Ok(delta) => (now - delta).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        Err(_) => now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    }
+}
+
+fn info_primary_network_subnet_id() -> String {
+    cb58_encode_id([0u8; 32])
+}
+
+fn info_peer_json(peer: &Peer) -> serde_json::Value {
+    let tracked_subnets = if peer.tracked_subnets.is_empty() {
+        vec![serde_json::Value::String(info_primary_network_subnet_id())]
+    } else {
+        peer.tracked_subnets
+            .iter()
+            .map(|subnet| serde_json::Value::String(cb58_encode_id(subnet.0)))
+            .collect::<Vec<_>>()
+    };
+
+    serde_json::json!({
+        "ip": peer.address.to_string(),
+        "publicIP": peer.address.to_string(),
+        "nodeID": full_node_id_string(&peer.node_id),
+        "version": peer.version.clone().unwrap_or_else(|| "unknown".to_string()),
+        "upgradeTime": 0u64,
+        "lastSent": format_instant_rfc3339(peer.last_ping_sent.unwrap_or(peer.connected_at)),
+        "lastReceived": format_instant_rfc3339(peer.last_seen),
+        "observedUptime": peer.reported_uptime.to_string(),
+        "trackedSubnets": tracked_subnets,
+        "supportedACPs": Vec::<u32>::new(),
+        "objectedACPs": Vec::<u32>::new(),
+        "benched": Vec::<String>::new(),
+    })
+}
+
+fn info_node_ip_string(node: &NodeState) -> String {
+    format!("0.0.0.0:{}", node.config.staking_port)
+}
+
+async fn info_is_bootstrapped(node: &NodeState, chain: &str) -> Result<bool, String> {
+    if chain.is_empty() {
+        return Err("argument 'chain' not given".to_string());
+    }
+
+    let phase = node.sync_engine.phase().await;
+    let bootstrapped = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
+    if matches!(
+        chain.to_ascii_lowercase().as_str(),
+        "p" | "platform" | "c" | "evm" | "x" | "avm"
+    ) {
+        return Ok(bootstrapped);
+    }
+
+    if let Some(chain_id) = info_blockchain_alias_id(chain, node.config.network_id) {
+        if chain_id == platform_pchain_blockchain_id() {
+            return Ok(bootstrapped);
+        }
+        if chain_id == platform_cchain_blockchain_id(node.config.network_id) {
+            return Ok(bootstrapped);
+        }
+        if info_xchain_blockchain_id(node.config.network_id) == Some(chain_id) {
+            return Ok(bootstrapped);
+        }
+
+        let tracker = node.subnet_tracker.read().await;
+        if let Some(state) = tracker.chain_state(&ChainId(chain_id)) {
+            return Ok(matches!(
+                state.phase,
+                SyncPhase::Synced | SyncPhase::Following
+            ));
+        }
+    }
+
+    Err(format!("there is no chain with alias/ID '{}'", chain))
+}
+
+#[derive(Clone, Copy)]
+enum HealthReportKind {
+    Health,
+    Readiness,
+    Liveness,
+}
+
+fn health_tags_param(params: &serde_json::Value) -> Vec<String> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("tags"))
+        .or_else(|| {
+            params
+                .get(0)
+                .and_then(|value| value.as_object())
+                .and_then(|obj| obj.get("tags"))
+        })
+        .and_then(|value| value.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| tag.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn current_timestamp_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+fn health_elapsed_string(elapsed: Duration) -> String {
+    if elapsed.as_millis() > 0 {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{}s", elapsed.as_secs())
+    }
+}
+
+fn health_check_value(
+    details: Option<serde_json::Value>,
+    error: Option<String>,
+    duration: Duration,
+) -> serde_json::Value {
+    let timestamp = current_timestamp_rfc3339();
+    let mut value = serde_json::Map::new();
+    if let Some(details) = details {
+        value.insert("message".to_string(), details);
+    }
+    if let Some(error) = error {
+        value.insert("error".to_string(), serde_json::Value::String(error));
+        value.insert("contiguousFailures".to_string(), serde_json::json!(1));
+        value.insert(
+            "timeOfFirstFailure".to_string(),
+            serde_json::Value::String(timestamp.clone()),
+        );
+    }
+    value.insert(
+        "timestamp".to_string(),
+        serde_json::Value::String(timestamp),
+    );
+    value.insert(
+        "duration".to_string(),
+        serde_json::json!(duration.as_nanos() as u64),
+    );
+    serde_json::Value::Object(value)
+}
+
+fn health_primary_network_tag() -> String {
+    cb58_encode_id(platform_pchain_blockchain_id())
+}
+
+fn health_tags_include_primary_chain(
+    tags: &[String],
+    aliases: &[&str],
+    chain_id: [u8; 32],
+) -> bool {
+    if tags.is_empty() {
+        return true;
+    }
+
+    let chain_id = cb58_encode_id(chain_id);
+    let primary_network = health_primary_network_tag();
+    tags.iter().any(|tag| {
+        aliases.iter().any(|alias| tag.eq_ignore_ascii_case(alias))
+            || tag == &chain_id
+            || tag == &primary_network
+    })
+}
+
+fn health_tags_include_tracked_chain(
+    tags: &[String],
+    state: &avalanche_rs::subnet::ChainSyncState,
+) -> bool {
+    if tags.is_empty() {
+        return true;
+    }
+
+    let chain_id = cb58_encode_id(state.config.chain_id.0);
+    let subnet_id = cb58_encode_id(state.config.subnet_id.0);
+    tags.iter().any(|tag| {
+        tag == &chain_id || tag == &subnet_id || tag.eq_ignore_ascii_case(&state.config.name)
+    })
+}
+
+fn chain_health_value(
+    chain_name: &str,
+    last_accepted_height: u64,
+    last_accepted_id: [u8; 32],
+    percent_connected: f64,
+) -> serde_json::Value {
+    let _ = chain_name;
+    health_check_value(
+        Some(serde_json::json!({
+            "engine": {
+                "consensus": {
+                    "lastAcceptedHeight": last_accepted_height,
+                    "lastAcceptedID": cb58_encode_id(last_accepted_id),
+                    "longestProcessingBlock": "0s",
+                    "processingBlocks": 0,
+                },
+                "vm": serde_json::Value::Null,
+            },
+            "networking": {
+                "percentConnected": percent_connected,
+            }
+        })),
+        None,
+        Duration::ZERO,
+    )
+}
+
+async fn health_report(
+    node: &NodeState,
+    kind: HealthReportKind,
+    tags: &[String],
+) -> serde_json::Value {
+    if matches!(kind, HealthReportKind::Liveness) {
+        return serde_json::json!({
+            "checks": {},
+            "healthy": true,
+        });
+    }
+
+    let phase = node.sync_engine.phase().await;
+    let is_bootstrapped = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
+    let db_accessible = node.db.last_accepted_height().is_ok();
+
+    let p_metrics = node.p_chain_metrics.read().await.clone();
+    let c_metrics = node.c_chain_metrics.read().await.clone();
+
+    let tracker = node.subnet_tracker.read().await;
+    let tracked_chain_states = tracker
+        .all_chains()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    drop(tracker);
+
+    let pm = node.peer_manager.read().await;
+    let connected_ids = pm.connected_peers();
+    let connected_peers = connected_ids
+        .iter()
+        .filter_map(|node_id| pm.get_peer(node_id).cloned())
+        .collect::<Vec<_>>();
+    let peer_count = connected_peers.len();
+    drop(pm);
+
+    let now = Instant::now();
+    let last_received = connected_peers
+        .iter()
+        .map(|peer| now.saturating_duration_since(peer.last_seen))
+        .min()
+        .unwrap_or_default();
+    let last_sent = connected_peers
+        .iter()
+        .map(|peer| {
+            peer.last_ping_sent
+                .map(|sent| now.saturating_duration_since(sent))
+                .unwrap_or_else(|| now.saturating_duration_since(peer.connected_at))
+        })
+        .min()
+        .unwrap_or_default();
+    let percent_connected = if peer_count > 0 { 1.0 } else { 0.0 };
+
+    let mut checks = serde_json::Map::new();
+    let mut healthy = true;
+
+    let bootstrapped_error = if is_bootstrapped {
+        None
+    } else {
+        Some("node is bootstrapping".to_string())
+    };
+    if bootstrapped_error.is_some() {
+        healthy = false;
+    }
+    checks.insert(
+        "bootstrapped".to_string(),
+        health_check_value(
+            Some(serde_json::Value::Array(vec![])),
+            bootstrapped_error,
+            Duration::ZERO,
+        ),
+    );
+
+    if matches!(kind, HealthReportKind::Readiness) {
+        return serde_json::json!({
+            "checks": checks,
+            "healthy": healthy,
+        });
+    }
+
+    let database_error = if db_accessible {
+        None
+    } else {
+        Some("database is inaccessible".to_string())
+    };
+    if database_error.is_some() {
+        healthy = false;
+    }
+    checks.insert(
+        "database".to_string(),
+        health_check_value(None, database_error, Duration::ZERO),
+    );
+
+    let network_error = if peer_count > 0 {
+        None
+    } else {
+        Some("no connected peers".to_string())
+    };
+    if network_error.is_some() {
+        healthy = false;
+    }
+    checks.insert(
+        "network".to_string(),
+        health_check_value(
+            Some(serde_json::json!({
+                "connectedPeers": peer_count,
+                "sendFailRate": 0,
+                "timeSinceLastMsgReceived": health_elapsed_string(last_received),
+                "timeSinceLastMsgSent": health_elapsed_string(last_sent),
+            })),
+            network_error,
+            Duration::ZERO,
+        ),
+    );
+
+    if health_tags_include_primary_chain(tags, &["P", "platform"], platform_pchain_blockchain_id())
+    {
+        checks.insert(
+            "P".to_string(),
+            chain_health_value(
+                "P",
+                p_metrics.tip_height,
+                p_metrics.tip_hash,
+                percent_connected,
+            ),
+        );
+    }
+
+    if health_tags_include_primary_chain(
+        tags,
+        &["C", "evm"],
+        platform_cchain_blockchain_id(node.config.network_id),
+    ) {
+        checks.insert(
+            "C".to_string(),
+            chain_health_value(
+                "C",
+                current_cchain_height(node).max(c_metrics.tip_height),
+                c_metrics.tip_hash,
+                percent_connected,
+            ),
+        );
+    }
+
+    for chain_state in tracked_chain_states {
+        if !health_tags_include_tracked_chain(tags, &chain_state) {
+            continue;
+        }
+        checks.insert(
+            chain_state.config.name.clone(),
+            health_check_value(
+                Some(serde_json::json!({
+                    "engine": {
+                        "consensus": {
+                            "lastAcceptedHeight": chain_state.height,
+                            "lastAcceptedID": cb58_encode_id(chain_state.config.chain_id.0),
+                            "longestProcessingBlock": "0s",
+                            "processingBlocks": 0,
+                        },
+                        "vm": serde_json::Value::Null,
+                    },
+                    "networking": {
+                        "percentConnected": if chain_state.peers.is_empty() { 0.0 } else { 1.0 },
+                    }
+                })),
+                None,
+                Duration::ZERO,
+            ),
+        );
+    }
+
+    serde_json::json!({
+        "checks": checks,
+        "healthy": healthy,
+    })
+}
+
+fn split_path_and_query(path: &str) -> (&str, &str) {
+    match path.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (path, ""),
+    }
+}
+
+fn query_tags(query: &str) -> Vec<String> {
+    query
+        .split('&')
+        .filter_map(|segment| segment.split_once('='))
+        .filter(|(key, _)| *key == "tag")
+        .map(|(_, value)| value.replace('+', " "))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct PlatformValidatorRecord {
+    node_id: String,
+    weight: u64,
+    start_time: u64,
+    end_time: u64,
+}
+
+impl PlatformValidatorRecord {
+    fn status(&self, now: u64) -> &'static str {
+        if now < self.start_time {
+            "pending"
+        } else if now < self.end_time {
+            "current"
+        } else {
+            "completed"
+        }
+    }
+}
+
+fn platform_params_object(
+    params: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match params {
+        serde_json::Value::Object(map) => Some(map),
+        serde_json::Value::Array(arr) => arr.first().and_then(|value| value.as_object()),
+        _ => None,
+    }
+}
+
+fn platform_subnet_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("subnetID"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(0).and_then(|value| value.as_str()))
+}
+
+fn platform_node_ids_param(params: &serde_json::Value) -> Vec<String> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("nodeIDs"))
+        .or_else(|| params.get(1))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn platform_node_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("nodeID"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(0).and_then(|value| value.as_str()))
+}
+
+async fn platform_validator_records(
+    node: &NodeState,
+    params: &serde_json::Value,
+) -> Vec<PlatformValidatorRecord> {
+    let mut records = if let Some(subnet_id_str) = platform_subnet_id_param(params) {
+        match SubnetId::from_str_any(subnet_id_str) {
+            Some(subnet_id) if subnet_id != SubnetId::primary_network() => {
+                let tracker = node.subnet_tracker.read().await;
+                tracker
+                    .subnet_validators_snapshot(&subnet_id)
+                    .map(|snapshot| {
+                        snapshot
+                            .validators
+                            .all_validators()
+                            .into_iter()
+                            .map(|validator| PlatformValidatorRecord {
+                                node_id: validator.node_id.to_string(),
+                                weight: validator.weight,
+                                start_time: validator.start_time,
+                                end_time: validator.end_time,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+            Some(_) | None => node
+                .validators
+                .values()
+                .map(|validator| PlatformValidatorRecord {
+                    node_id: validator.node_id.clone(),
+                    weight: validator.weight,
+                    start_time: validator.start_time,
+                    end_time: validator.end_time,
+                })
+                .collect::<Vec<_>>(),
+        }
+    } else {
+        node.validators
+            .values()
+            .map(|validator| PlatformValidatorRecord {
+                node_id: validator.node_id.clone(),
+                weight: validator.weight,
+                start_time: validator.start_time,
+                end_time: validator.end_time,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let requested_node_ids = platform_node_ids_param(params);
+    if !requested_node_ids.is_empty() {
+        let requested = requested_node_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        records.retain(|record| requested.contains(&record.node_id));
+    }
+
+    records.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    records
+}
+
+async fn platform_validator_response_values(
+    node: &NodeState,
+    records: Vec<PlatformValidatorRecord>,
+) -> Vec<serde_json::Value> {
+    let now = unix_timestamp_secs();
+    let connected = node.validators_seen.read().await.clone();
+    records
+        .into_iter()
+        .map(|validator| {
+            let status = validator.status(now);
+            let is_connected = connected.contains(&validator.node_id);
+            serde_json::json!({
+                "nodeID": validator.node_id,
+                "startTime": validator.start_time.to_string(),
+                "endTime": validator.end_time.to_string(),
+                "weight": validator.weight.to_string(),
+                "stakeAmount": validator.weight.to_string(),
+                "delegationFee": "0.0000",
+                "connected": is_connected,
+                "uptime": "0.0000",
+                "status": status,
+                "delegators": serde_json::Value::Null,
+            })
+        })
+        .collect()
+}
+
+fn parse_platform_id_32(value: &str) -> Option<[u8; 32]> {
+    if let Some(hash) = parse_hex_hash(value) {
+        return Some(hash);
+    }
+
+    let decoded = bs58::decode(value).into_vec().ok()?;
+    if decoded.len() < 36 {
+        return None;
+    }
+
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&decoded[..32]);
+    Some(id)
+}
+
+fn platform_cchain_blockchain_id(network_id: u32) -> [u8; 32] {
+    let cb58 = match network_id {
+        1 => "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5",
+        _ => "yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp",
+    };
+    parse_platform_id_32(cb58).unwrap_or([0u8; 32])
+}
+
+fn platform_pchain_blockchain_id() -> [u8; 32] {
+    [0u8; 32]
+}
+
+fn platform_block_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("blockID"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(0).and_then(|value| value.as_str()))
+}
+
+fn platform_blockchain_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("blockchainID"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(0).and_then(|value| value.as_str()))
+}
+
+fn platform_encoding_param<'a>(params: &'a serde_json::Value, default: &'a str) -> &'a str {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("encoding"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(1).and_then(|value| value.as_str()))
+        .unwrap_or(default)
+}
+
+fn platform_chain_status_from_phase(phase: &SyncPhase) -> &'static str {
+    match phase {
+        SyncPhase::Following | SyncPhase::Synced => "Validating",
+        SyncPhase::Idle => "Created",
+        _ => "Syncing",
+    }
+}
+
+async fn platform_blockchain_status(node: &NodeState, blockchain_id: [u8; 32]) -> String {
+    if blockchain_id == platform_pchain_blockchain_id() {
+        return platform_chain_status_from_phase(&node.sync_engine.phase().await).to_string();
+    }
+
+    if blockchain_id == platform_cchain_blockchain_id(node.config.network_id) {
+        if node.c_chain_metrics.read().await.tip_height > 0 {
+            return platform_chain_status_from_phase(&node.sync_engine.phase().await).to_string();
+        }
+        return "Created".to_string();
+    }
+
+    let tracker = node.subnet_tracker.read().await;
+    tracker
+        .chain_state(&ChainId(blockchain_id))
+        .map(|state| platform_chain_status_from_phase(&state.phase).to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn platform_block_json_value(raw_block: &[u8]) -> serde_json::Value {
+    match BlockMetadata::from_raw(raw_block, Chain::PChain) {
+        Ok(meta) => serde_json::json!({
+            "id": format!("0x{}", hex::encode(meta.id)),
+            "parentID": format!("0x{}", hex::encode(meta.parent_id)),
+            "height": meta.height.to_string(),
+            "timestamp": meta.timestamp.to_string(),
+            "type": format!("{:?}", meta.block_type),
+            "txCount": meta.tx_count,
+            "size": meta.size_bytes,
+        }),
+        Err(_) => serde_json::json!({
+            "bytes": format!("0x{}", hex::encode(raw_block)),
+        }),
+    }
+}
+
+fn parse_filter_from_block(filter_obj: &serde_json::Value, node: &NodeState) -> u64 {
+    filter_obj
+        .get("fromBlock")
+        .map(|v| parse_block_number(v, node))
+        .unwrap_or_else(|| current_cchain_height(node))
+}
+
+fn parse_filter_to_block(filter_obj: &serde_json::Value, node: &NodeState) -> Option<u64> {
+    match filter_obj.get("toBlock").and_then(|v| v.as_str()) {
+        Some("latest") | Some("pending") | None => None,
+        Some("earliest") => Some(0),
+        Some(_) => filter_obj
+            .get("toBlock")
+            .map(|v| parse_block_number(v, node)),
+    }
+}
+
+fn parse_filter_topics(filter_obj: &serde_json::Value) -> Vec<Option<Vec<[u8; 32]>>> {
+    match &filter_obj["topics"] {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|v| match v {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => parse_hex_hash(s).map(|topic| vec![topic]),
+                serde_json::Value::Array(options) => Some(
+                    options
+                        .iter()
+                        .filter_map(|value| value.as_str().and_then(parse_hex_hash))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn parse_log_filter(filter_obj: &serde_json::Value, node: &NodeState) -> LogFilter {
+    let current_height = current_cchain_height(node);
+    let from_block = parse_filter_from_block(filter_obj, node);
+    let to_block = parse_filter_to_block(filter_obj, node);
+    let addresses: Vec<[u8; 20]> = match &filter_obj["address"] {
+        serde_json::Value::String(s) => parse_hex_address(s).into_iter().collect(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().and_then(parse_hex_address))
+            .collect(),
+        _ => vec![],
+    };
+
+    LogFilter {
+        from_block,
+        to_block,
+        addresses,
+        topics: parse_filter_topics(filter_obj),
+        last_polled_block: if filter_obj.get("fromBlock").is_some() {
+            from_block.saturating_sub(1)
+        } else {
+            current_height
+        },
+    }
+}
+
+fn parse_filter_id(value: &serde_json::Value) -> u64 {
+    value
+        .as_str()
+        .and_then(|s| u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok())
+        .unwrap_or(0)
+}
+
+fn load_block_receipts_json(db: &Database, block_height: u64) -> Vec<serde_json::Value> {
+    db.get_block_receipts(block_height)
+        .ok()
+        .flatten()
+        .and_then(|data| serde_json::from_slice::<Vec<serde_json::Value>>(&data).ok())
+        .unwrap_or_default()
+}
+
+fn load_cchain_block_fields(
+    db: &Database,
+    block_height: u64,
+) -> Option<avalanche_rs::block::CChainBlockFields> {
+    db.get_block(block_height)
+        .ok()
+        .flatten()
+        .and_then(|data| extract_cchain_block_fields(&data))
+}
+
+fn latest_cchain_block_fields(db: &Database) -> Option<avalanche_rs::block::CChainBlockFields> {
+    let height = db.last_accepted_height().ok().flatten()?;
+    load_cchain_block_fields(db, height)
+}
+
+fn predicted_next_base_fee_from_fields(
+    network_id: u32,
+    fields: &avalanche_rs::block::CChainBlockFields,
+) -> u128 {
+    if avalanche_rs::fortuna::is_fortuna_active(network_id, fields.timestamp) {
+        fields.base_fee
+    } else {
+        avalanche_rs::fortuna::legacy_base_fee(
+            fields.base_fee as u64,
+            fields.gas_used,
+            avalanche_rs::fortuna::PRE_FORTUNA_GAS_TARGET,
+        ) as u128
+    }
+}
+
+fn predicted_next_base_fee_from_db(db: &Database, network_id: u32) -> u128 {
+    latest_cchain_block_fields(db)
+        .map(|fields| predicted_next_base_fee_from_fields(network_id, &fields))
+        .unwrap_or(DEFAULT_BASE_FEE_PER_GAS)
+}
+
+fn recent_priority_fee_suggestion(db: &Database, current_height: u64) -> u128 {
+    if current_height == 0 {
+        return PRIORITY_FEE_FLOOR;
+    }
+
+    let oldest_block = current_height.saturating_sub(PRIORITY_FEE_SAMPLE_BLOCKS.saturating_sub(1));
+    let mut rewards = Vec::new();
+
+    for block_height in oldest_block..=current_height {
+        let Some(fields) = load_cchain_block_fields(db, block_height) else {
+            continue;
+        };
+        let Some(block_data) = db.get_block(block_height).ok().flatten() else {
+            continue;
+        };
+        let txs = extract_cchain_transactions(&block_data);
+        let receipts = load_block_receipts_json(db, block_height);
+        rewards.extend(txs.iter().zip(receipts.iter()).filter_map(|(tx, receipt)| {
+            let gas_used = receipt
+                .get("gasUsed")
+                .and_then(|value| value.as_str())
+                .and_then(parse_hex_u64_str)
+                .unwrap_or(0);
+            if gas_used == 0 {
+                None
+            } else {
+                Some((
+                    fee_history_effective_priority_fee(tx, fields.base_fee),
+                    gas_used,
+                ))
+            }
+        }));
+    }
+
+    if rewards.is_empty() {
+        return PRIORITY_FEE_FLOOR;
+    }
+
+    rewards.sort_by_key(|(reward, _)| *reward);
+    let total_gas_used = rewards.iter().map(|(_, gas_used)| *gas_used).sum::<u64>();
+    if total_gas_used == 0 {
+        return PRIORITY_FEE_FLOOR;
+    }
+
+    let threshold = ((PRIORITY_FEE_PERCENTILE / 100.0) * total_gas_used as f64).ceil() as u64;
+    let target = threshold.max(1);
+    let mut cumulative = 0u64;
+    let mut selected = rewards.last().map(|(reward, _)| *reward).unwrap_or(0);
+    for (reward, gas_used) in &rewards {
+        cumulative = cumulative.saturating_add(*gas_used);
+        selected = *reward;
+        if cumulative >= target {
+            break;
+        }
+    }
+
+    selected.max(PRIORITY_FEE_FLOOR)
+}
+
+async fn refresh_txpool_base_fee(node: &NodeState) {
+    let base_fee = predicted_next_base_fee_from_db(&node.db, node.config.network_id);
+    node.txpool.write().await.set_base_fee(base_fee);
+}
+
+fn fee_history_effective_priority_fee(tx: &CChainRawTx, base_fee: u128) -> u128 {
+    let capped_tip = tx.gas_price.saturating_sub(base_fee);
+    if tx.tx_type == 2 {
+        capped_tip.min(tx.max_priority_fee_per_gas)
+    } else {
+        capped_tip
+    }
+}
+
+fn fee_history_rewards_for_block(
+    db: &Database,
+    block_height: u64,
+    fields: &avalanche_rs::block::CChainBlockFields,
+    reward_percentiles: &[f64],
+) -> Vec<String> {
+    if reward_percentiles.is_empty() {
+        return vec![];
+    }
+
+    let Some(block_data) = db.get_block(block_height).ok().flatten() else {
+        return vec!["0x0".to_string(); reward_percentiles.len()];
+    };
+
+    let txs = extract_cchain_transactions(&block_data);
+    let receipts = load_block_receipts_json(db, block_height);
+    let mut rewards = txs
+        .iter()
+        .zip(receipts.iter())
+        .filter_map(|(tx, receipt)| {
+            let gas_used = receipt
+                .get("gasUsed")
+                .and_then(|value| value.as_str())
+                .and_then(parse_hex_u64_str)
+                .unwrap_or(0);
+            if gas_used == 0 {
+                None
+            } else {
+                Some((
+                    fee_history_effective_priority_fee(tx, fields.base_fee),
+                    gas_used,
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if rewards.is_empty() {
+        return vec!["0x0".to_string(); reward_percentiles.len()];
+    }
+
+    rewards.sort_by_key(|(reward, _)| *reward);
+    let total_gas_used = rewards.iter().map(|(_, gas_used)| *gas_used).sum::<u64>();
+    if total_gas_used == 0 {
+        return vec!["0x0".to_string(); reward_percentiles.len()];
+    }
+
+    reward_percentiles
+        .iter()
+        .map(|percentile| {
+            let clamped = percentile.clamp(0.0, 100.0);
+            let threshold = ((clamped / 100.0) * total_gas_used as f64).ceil() as u64;
+            let target = threshold.max(1);
+            let mut cumulative = 0u64;
+            let mut selected = rewards.last().map(|(reward, _)| *reward).unwrap_or(0);
+            for (reward, gas_used) in &rewards {
+                cumulative = cumulative.saturating_add(*gas_used);
+                selected = *reward;
+                if cumulative >= target {
+                    break;
+                }
+            }
+            format!("0x{:x}", selected)
+        })
+        .collect()
+}
+
+fn fee_history_next_base_fee(
+    db: &Database,
+    network_id: u32,
+    newest_block: u64,
+    fields: &avalanche_rs::block::CChainBlockFields,
+) -> u128 {
+    if let Some(next_fields) = load_cchain_block_fields(db, newest_block.saturating_add(1)) {
+        return next_fields.base_fee;
+    }
+
+    predicted_next_base_fee_from_fields(network_id, fields)
+}
+
+fn build_fee_history_result(
+    node: &NodeState,
+    requested_block_count: u64,
+    requested_newest_block: u64,
+    reward_percentiles: &[f64],
+) -> serde_json::Value {
+    let current_height = current_cchain_height(node);
+    let newest_block = requested_newest_block.min(current_height);
+    let available_blocks = newest_block.saturating_add(1);
+    let block_count = requested_block_count.min(1024).min(available_blocks.max(1));
+    let oldest_block = newest_block.saturating_sub(block_count.saturating_sub(1));
+
+    let mut base_fees = Vec::with_capacity(block_count as usize + 1);
+    let mut gas_used_ratios = Vec::with_capacity(block_count as usize);
+    let mut rewards_by_block = Vec::with_capacity(block_count as usize);
+    let mut last_fields = None;
+
+    for block_height in oldest_block..=newest_block {
+        let fields = load_cchain_block_fields(&node.db, block_height).unwrap_or(
+            avalanche_rs::block::CChainBlockFields {
+                number: block_height,
+                timestamp: 0,
+                gas_limit: DEFAULT_CCHAIN_GAS_LIMIT,
+                gas_used: 0,
+                base_fee: DEFAULT_BASE_FEE_PER_GAS,
+                miner: [0u8; 20],
+            },
+        );
+        base_fees.push(format!("0x{:x}", fields.base_fee));
+        gas_used_ratios.push(if fields.gas_limit == 0 {
+            0.0
+        } else {
+            fields.gas_used as f64 / fields.gas_limit as f64
+        });
+        if !reward_percentiles.is_empty() {
+            rewards_by_block.push(fee_history_rewards_for_block(
+                &node.db,
+                block_height,
+                &fields,
+                reward_percentiles,
+            ));
+        }
+        last_fields = Some(fields);
+    }
+
+    let next_base_fee = last_fields
+        .as_ref()
+        .map(|fields| {
+            fee_history_next_base_fee(&node.db, node.config.network_id, newest_block, fields)
+        })
+        .unwrap_or(DEFAULT_BASE_FEE_PER_GAS);
+    base_fees.push(format!("0x{:x}", next_base_fee));
+
+    let mut result = serde_json::json!({
+        "oldestBlock": format!("0x{:x}", oldest_block),
+        "baseFeePerGas": base_fees,
+        "gasUsedRatio": gas_used_ratios,
+    });
+
+    if !reward_percentiles.is_empty() {
+        result["reward"] = serde_json::Value::Array(
+            rewards_by_block
+                .into_iter()
+                .map(|block_rewards| {
+                    serde_json::Value::Array(
+                        block_rewards
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    result
+}
+
+fn normalize_block_log_indexes(receipts: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut next_log_index = 0u64;
+    let mut logs = Vec::new();
+
+    for receipt in receipts {
+        if let Some(receipt_logs) = receipt.get("logs").and_then(|value| value.as_array()) {
+            for log in receipt_logs {
+                let mut normalized = log.clone();
+                if let Some(obj) = normalized.as_object_mut() {
+                    obj.insert(
+                        "logIndex".to_string(),
+                        serde_json::Value::String(format!("0x{:x}", next_log_index)),
+                    );
+                    obj.entry("removed".to_string())
+                        .or_insert(serde_json::Value::Bool(false));
+                }
+                logs.push(normalized);
+                next_log_index = next_log_index.saturating_add(1);
+            }
+        }
+    }
+
+    logs
+}
+
+fn log_matches_filter(log: &serde_json::Value, filter: &LogFilter) -> bool {
+    if !filter.addresses.is_empty() {
+        let Some(address) = log
+            .get("address")
+            .and_then(|value| value.as_str())
+            .and_then(parse_hex_address)
+        else {
+            return false;
+        };
+        if !filter
+            .addresses
+            .iter()
+            .any(|candidate| candidate == &address)
+        {
+            return false;
+        }
+    }
+
+    let log_topics = log
+        .get("topics")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for (idx, wanted) in filter.topics.iter().enumerate() {
+        let Some(wanted_topics) = wanted else {
+            continue;
+        };
+        let Some(actual_topic) = log_topics
+            .get(idx)
+            .and_then(|value| value.as_str())
+            .and_then(parse_hex_hash)
+        else {
+            return false;
+        };
+        if !wanted_topics.iter().any(|topic| topic == &actual_topic) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn collect_logs_for_range(
+    db: &Database,
+    filter: &LogFilter,
+    start_block: u64,
+    end_block: u64,
+) -> Vec<serde_json::Value> {
+    if start_block > end_block {
+        return vec![];
+    }
+
+    let mut logs = Vec::new();
+    for block_height in start_block..=end_block {
+        let receipts = load_block_receipts_json(db, block_height);
+        if receipts.is_empty() {
+            continue;
+        }
+        logs.extend(
+            normalize_block_log_indexes(&receipts)
+                .into_iter()
+                .filter(|log| log_matches_filter(log, filter)),
+        );
+    }
+    logs
 }
 
 /// JSON-RPC error response helper.
@@ -3393,13 +5401,604 @@ fn rpc_ok(result: &str, id: &serde_json::Value) -> String {
     )
 }
 
+fn pool_tx_to_evm_tx(tx: &PoolTransaction) -> EvmTransaction {
+    EvmTransaction {
+        from: tx.from,
+        to: tx.to,
+        value: tx.value,
+        data: tx.data.clone(),
+        gas_limit: tx.gas_limit,
+        gas_price: tx.max_fee_per_gas,
+        nonce: tx.nonce,
+    }
+}
+
+fn cchain_block_context(
+    fields: &avalanche_rs::block::CChainBlockFields,
+    chain_id: u64,
+) -> BlockContext {
+    BlockContext {
+        number: fields.number,
+        timestamp: fields.timestamp,
+        coinbase: fields.miner,
+        gas_limit: fields.gas_limit,
+        base_fee: fields.base_fee,
+        difficulty: 0,
+        chain_id,
+    }
+}
+
+fn cchain_raw_to_evm_tx(tx: &CChainRawTx, base_fee: u128) -> EvmTransaction {
+    EvmTransaction {
+        from: tx.recover_sender().unwrap_or([0u8; 20]),
+        to: tx.to,
+        value: tx.value,
+        data: tx.data.clone(),
+        gas_limit: tx.gas_limit,
+        gas_price: tx.gas_price.max(base_fee),
+        nonce: tx.nonce,
+    }
+}
+
+fn replay_cchain_blocks_until(
+    db: &Database,
+    chain_id: u64,
+    target_height: u64,
+) -> Result<EvmExecutor, String> {
+    let mut executor = EvmExecutor::new(chain_id);
+
+    for height in 0..target_height {
+        let Some(block_data) = db.get_block(height).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        let Some(fields) = extract_cchain_block_fields(&block_data) else {
+            continue;
+        };
+        let ctx = cchain_block_context(&fields, chain_id);
+        let raw_txs = extract_cchain_transactions(&block_data);
+        if raw_txs.is_empty() {
+            continue;
+        }
+        let evm_txs = raw_txs
+            .iter()
+            .map(|tx| {
+                let from = tx.recover_sender().unwrap_or([0u8; 20]);
+                executor.set_balance(from, u128::MAX / 2);
+                cchain_raw_to_evm_tx(tx, fields.base_fee)
+            })
+            .collect::<Vec<_>>();
+        executor
+            .execute_block(&evm_txs, &ctx)
+            .map_err(|e| format!("replay block #{}: {}", height, e))?;
+    }
+
+    Ok(executor)
+}
+
+fn trace_result_value(
+    trace: avalanche_rs::debug::TransactionTrace,
+    tx: &EvmTransaction,
+    config: &TraceConfig,
+) -> serde_json::Value {
+    match config.tracer {
+        TracerType::StructLogger => serde_json::to_value(trace).unwrap_or(serde_json::Value::Null),
+        TracerType::CallTracer => serde_json::to_value(trace.call_trace.unwrap_or_else(|| {
+            avalanche_rs::debug::EvmTracer::call_trace(
+                tx,
+                trace.gas,
+                !trace.failed,
+                &hex::decode(trace.return_value).unwrap_or_default(),
+            )
+        }))
+        .unwrap_or(serde_json::Value::Null),
+    }
+}
+
+fn trace_mined_transaction(
+    db: &Database,
+    chain_id: u64,
+    block_height: u64,
+    tx_index: u32,
+    config: &TraceConfig,
+) -> Result<serde_json::Value, String> {
+    let block_data = db
+        .get_block(block_height)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("block #{} not found", block_height))?;
+    let fields = extract_cchain_block_fields(&block_data)
+        .ok_or_else(|| format!("block #{} is not a valid C-Chain block", block_height))?;
+    let ctx = cchain_block_context(&fields, chain_id);
+    let raw_txs = extract_cchain_transactions(&block_data);
+    let tx = raw_txs.get(tx_index as usize).ok_or_else(|| {
+        format!(
+            "transaction {} not found in block {}",
+            tx_index, block_height
+        )
+    })?;
+
+    let mut executor = replay_cchain_blocks_until(db, chain_id, block_height)?;
+    for prior_tx in raw_txs.iter().take(tx_index as usize) {
+        let from = prior_tx.recover_sender().unwrap_or([0u8; 20]);
+        executor.set_balance(from, u128::MAX / 2);
+        let evm_tx = cchain_raw_to_evm_tx(prior_tx, fields.base_fee);
+        executor.execute_tx(&evm_tx, &ctx).map_err(|e| {
+            format!(
+                "replay tx {} in block {}: {}",
+                prior_tx.nonce, block_height, e
+            )
+        })?;
+    }
+
+    let from = tx.recover_sender().unwrap_or([0u8; 20]);
+    executor.set_balance(from, u128::MAX / 2);
+    let evm_tx = cchain_raw_to_evm_tx(tx, fields.base_fee);
+    let trace = EvmTracer::trace_transaction(&mut executor, &evm_tx, &ctx, config);
+    Ok(trace_result_value(trace, &evm_tx, config))
+}
+
+fn trace_pending_transaction(
+    executor: &EvmExecutor,
+    tx: &PoolTransaction,
+    block_ctx: &BlockContext,
+    config: &TraceConfig,
+) -> serde_json::Value {
+    let mut snapshot = executor.snapshot();
+    snapshot.set_balance(tx.from, u128::MAX / 2);
+    let evm_tx = pool_tx_to_evm_tx(tx);
+    let trace = EvmTracer::trace_transaction(&mut snapshot, &evm_tx, block_ctx, config);
+    trace_result_value(trace, &evm_tx, config)
+}
+
+fn trace_mined_block(
+    db: &Database,
+    chain_id: u64,
+    block_height: u64,
+    config: &TraceConfig,
+) -> Result<serde_json::Value, String> {
+    let block_data = db
+        .get_block(block_height)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("block #{} not found", block_height))?;
+    let fields = extract_cchain_block_fields(&block_data)
+        .ok_or_else(|| format!("block #{} is not a valid C-Chain block", block_height))?;
+    let ctx = cchain_block_context(&fields, chain_id);
+    let raw_txs = extract_cchain_transactions(&block_data);
+    let mut executor = replay_cchain_blocks_until(db, chain_id, block_height)?;
+    let evm_txs = raw_txs
+        .iter()
+        .map(|tx| {
+            let from = tx.recover_sender().unwrap_or([0u8; 20]);
+            executor.set_balance(from, u128::MAX / 2);
+            cchain_raw_to_evm_tx(tx, fields.base_fee)
+        })
+        .collect::<Vec<_>>();
+
+    let traces = EvmTracer::trace_block(&mut executor, &evm_txs, &ctx, config);
+    let results = traces
+        .into_iter()
+        .zip(evm_txs.iter())
+        .map(|(trace, tx)| trace_result_value(trace, tx, config))
+        .collect::<Vec<_>>();
+    Ok(serde_json::Value::Array(results))
+}
+
+async fn reconcile_mined_pool_transactions(node: &NodeState, mined_txs: &[PoolTransaction]) {
+    if mined_txs.is_empty() {
+        return;
+    }
+
+    let nonce_by_sender = {
+        let evm = node.evm.read().await;
+        mined_txs
+            .iter()
+            .map(|tx| (tx.from, evm.get_nonce(tx.from)))
+            .collect::<Vec<_>>()
+    };
+
+    let mut txpool = node.txpool.write().await;
+    for (from, nonce) in nonce_by_sender {
+        txpool.sync_account_nonce(from, nonce);
+    }
+}
+
+fn txpool_group_transactions(txs: Vec<PoolTransaction>) -> serde_json::Value {
+    let mut grouped = serde_json::Map::new();
+
+    for tx in txs {
+        let from = format!("0x{}", hex::encode(tx.from));
+        let nonce = format!("0x{:x}", tx.nonce);
+        let entry = serde_json::json!({
+            "hash": format!("0x{}", hex::encode(tx.hash)),
+            "from": from.clone(),
+            "to": tx.to.map(|addr| format!("0x{}", hex::encode(addr))),
+            "nonce": nonce,
+            "gas": format!("0x{:x}", tx.gas_limit),
+            "gasPrice": format!("0x{:x}", tx.max_fee_per_gas),
+            "maxFeePerGas": format!("0x{:x}", tx.max_fee_per_gas),
+            "maxPriorityFeePerGas": format!("0x{:x}", tx.max_priority_fee_per_gas),
+            "value": format!("0x{:x}", tx.value),
+            "input": format!("0x{}", hex::encode(tx.data)),
+        });
+
+        let account = grouped
+            .entry(from)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(account) = account.as_object_mut() {
+            account.insert(nonce, entry);
+        }
+    }
+
+    serde_json::Value::Object(grouped)
+}
+
+fn txpool_group_inspect(txs: Vec<PoolTransaction>) -> serde_json::Value {
+    let mut grouped = serde_json::Map::new();
+
+    for tx in txs {
+        let from = format!("0x{}", hex::encode(tx.from));
+        let nonce = format!("0x{:x}", tx.nonce);
+        let entry = serde_json::Value::String(format!(
+            "{} wei + {} gas x {} wei",
+            tx.value, tx.gas_limit, tx.max_fee_per_gas
+        ));
+
+        let account = grouped
+            .entry(from)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(account) = account.as_object_mut() {
+            account.insert(nonce, entry);
+        }
+    }
+
+    serde_json::Value::Object(grouped)
+}
+
+fn raw_tx_hash(raw: &[u8]) -> [u8; 32] {
+    let hash = revm::primitives::keccak256(raw);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hash.as_slice());
+    out
+}
+
+fn pool_tx_from_cchain_raw(tx: &CChainRawTx) -> PoolTransaction {
+    PoolTransaction {
+        hash: raw_tx_hash(&tx.raw),
+        raw: Some(tx.raw.clone()),
+        from: tx.recover_sender().unwrap_or([0u8; 20]),
+        to: tx.to,
+        nonce: tx.nonce,
+        gas_limit: tx.gas_limit,
+        max_fee_per_gas: tx.gas_price,
+        max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
+        value: tx.value,
+        data: tx.data.clone(),
+        size: tx.raw.len(),
+        timestamp: 0,
+    }
+}
+
+fn load_mined_cchain_transaction(
+    db: &Database,
+    block_height: u64,
+    tx_index: u32,
+) -> Option<([u8; 32], PoolTransaction)> {
+    let block_data = db.get_block(block_height).ok()??;
+    let txs = extract_cchain_transactions(&block_data);
+    let tx = txs.get(tx_index as usize)?;
+    let block_hash = cchain_block_hash(&block_data);
+    Some((block_hash, pool_tx_from_cchain_raw(tx)))
+}
+
+fn cchain_block_hash(block_data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(block_data);
+    hasher.finalize().into()
+}
+
+fn rpc_block_from_cchain_data(
+    block_data: &[u8],
+    include_full_txs: bool,
+) -> Option<serde_json::Value> {
+    let header = BlockHeader::parse(block_data, Chain::CChain).ok()?;
+    let fields = extract_cchain_block_fields(block_data)?;
+    let block_hash = cchain_block_hash(block_data);
+    let state_root = BlockHeader::extract_state_root(block_data).unwrap_or([0u8; 32]);
+    let txs = extract_cchain_transactions(block_data);
+    let transactions: Vec<serde_json::Value> = txs
+        .iter()
+        .enumerate()
+        .map(|(idx, tx)| {
+            let pool_tx = pool_tx_from_cchain_raw(tx);
+            if include_full_txs {
+                rpc_transaction_from_pool(
+                    &pool_tx.hash,
+                    &pool_tx,
+                    Some(block_hash),
+                    Some(fields.number),
+                    Some(idx as u32),
+                )
+            } else {
+                serde_json::Value::String(format!("0x{}", hex::encode(pool_tx.hash)))
+            }
+        })
+        .collect();
+
+    Some(serde_json::json!({
+        "number": format!("0x{:x}", fields.number),
+        "hash": format!("0x{}", hex::encode(block_hash)),
+        "parentHash": format!("0x{}", hex::encode(header.parent_id)),
+        "miner": format!("0x{}", hex::encode(fields.miner)),
+        "stateRoot": format!("0x{}", hex::encode(state_root)),
+        "size": format!("0x{:x}", block_data.len()),
+        "gasLimit": format!("0x{:x}", fields.gas_limit),
+        "gasUsed": format!("0x{:x}", fields.gas_used),
+        "timestamp": format!("0x{:x}", fields.timestamp),
+        "baseFeePerGas": format!("0x{:x}", fields.base_fee),
+        "transactions": transactions,
+        "uncles": Vec::<serde_json::Value>::new(),
+    }))
+}
+
+fn rpc_transaction_from_pool(
+    tx_hash: &[u8; 32],
+    tx: &PoolTransaction,
+    block_hash: Option<[u8; 32]>,
+    block_number: Option<u64>,
+    tx_index: Option<u32>,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "hash".to_string(),
+        serde_json::Value::String(format!("0x{}", hex::encode(tx_hash))),
+    );
+    obj.insert(
+        "from".to_string(),
+        serde_json::Value::String(format!("0x{}", hex::encode(tx.from))),
+    );
+    obj.insert(
+        "to".to_string(),
+        tx.to
+            .map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "nonce".to_string(),
+        serde_json::Value::String(format!("0x{:x}", tx.nonce)),
+    );
+    obj.insert(
+        "value".to_string(),
+        serde_json::Value::String(format!("0x{:x}", tx.value)),
+    );
+    obj.insert(
+        "gas".to_string(),
+        serde_json::Value::String(format!("0x{:x}", tx.gas_limit)),
+    );
+    obj.insert(
+        "gasPrice".to_string(),
+        serde_json::Value::String(format!("0x{:x}", tx.max_fee_per_gas)),
+    );
+    obj.insert(
+        "maxFeePerGas".to_string(),
+        serde_json::Value::String(format!("0x{:x}", tx.max_fee_per_gas)),
+    );
+    obj.insert(
+        "maxPriorityFeePerGas".to_string(),
+        serde_json::Value::String(format!("0x{:x}", tx.max_priority_fee_per_gas)),
+    );
+    obj.insert(
+        "input".to_string(),
+        serde_json::Value::String(format!("0x{}", hex::encode(&tx.data))),
+    );
+    obj.insert(
+        "blockHash".to_string(),
+        block_hash
+            .map(|hash| serde_json::Value::String(format!("0x{}", hex::encode(hash))))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "blockNumber".to_string(),
+        block_number
+            .map(|height| serde_json::Value::String(format!("0x{:x}", height)))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "transactionIndex".to_string(),
+        tx_index
+            .map(|idx| serde_json::Value::String(format!("0x{:x}", idx)))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(obj)
+}
+
+fn rpc_receipt_from_pool(
+    tx_hash: &[u8; 32],
+    tx: &PoolTransaction,
+    receipt: &TxReceipt,
+    block_hash: &[u8; 32],
+    block_number: u64,
+    tx_index: u32,
+    cumulative_gas_used: u64,
+    log_index_offset: u32,
+) -> serde_json::Value {
+    let logs: Vec<serde_json::Value> = receipt
+        .logs
+        .iter()
+        .enumerate()
+        .map(|(log_index, log)| {
+            serde_json::json!({
+                "address": format!("0x{}", hex::encode(log.address)),
+                "topics": log
+                    .topics
+                    .iter()
+                    .map(|topic| serde_json::Value::String(format!("0x{}", hex::encode(topic))))
+                    .collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
+                "blockNumber": format!("0x{:x}", block_number),
+                "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+                "transactionIndex": format!("0x{:x}", tx_index),
+                "blockHash": format!("0x{}", hex::encode(block_hash)),
+                "logIndex": format!("0x{:x}", log_index_offset + log_index as u32),
+                "removed": false,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+        "transactionIndex": format!("0x{:x}", tx_index),
+        "blockHash": format!("0x{}", hex::encode(block_hash)),
+        "blockNumber": format!("0x{:x}", block_number),
+        "from": format!("0x{}", hex::encode(tx.from)),
+        "to": tx
+            .to
+            .map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+            .unwrap_or(serde_json::Value::Null),
+        "cumulativeGasUsed": format!("0x{:x}", cumulative_gas_used),
+        "gasUsed": format!("0x{:x}", receipt.gas_used),
+        "contractAddress": receipt
+            .contract_address
+            .map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+            .unwrap_or(serde_json::Value::Null),
+        "status": if receipt.success { "0x1" } else { "0x0" },
+        "logs": logs,
+    })
+}
+
+fn persist_local_cchain_tx_artifacts(
+    db: &Database,
+    block: &BuiltBlock,
+    txs: &[PoolTransaction],
+) -> Result<(), avalanche_rs::db::DbError> {
+    let mut cumulative_gas = 0u64;
+    let mut log_index_offset = 0u32;
+
+    for (idx, (tx, receipt)) in txs.iter().zip(block.receipts.iter()).enumerate() {
+        db.put_tx_index(&tx.hash, block.number, idx as u32)?;
+        cumulative_gas = cumulative_gas.saturating_add(receipt.gas_used);
+        let receipt_json = rpc_receipt_from_pool(
+            &tx.hash,
+            tx,
+            receipt,
+            &block.id,
+            block.number,
+            idx as u32,
+            cumulative_gas,
+            log_index_offset,
+        );
+        db.put_receipt(
+            block.number,
+            idx as u32,
+            receipt_json.to_string().as_bytes(),
+        )?;
+        log_index_offset = log_index_offset.saturating_add(receipt.logs.len() as u32);
+    }
+
+    Ok(())
+}
+
+fn persist_imported_cchain_tx_artifacts(
+    db: &Database,
+    block_number: u64,
+    block_hash: &[u8; 32],
+    txs: &[CChainRawTx],
+    receipts: &[TxReceipt],
+) -> Result<(), avalanche_rs::db::DbError> {
+    let mut cumulative_gas = 0u64;
+    let mut log_index_offset = 0u32;
+
+    for (idx, (tx, receipt)) in txs.iter().zip(receipts.iter()).enumerate() {
+        let pool_tx = pool_tx_from_cchain_raw(tx);
+        db.put_tx_index(&pool_tx.hash, block_number, idx as u32)?;
+        cumulative_gas = cumulative_gas.saturating_add(receipt.gas_used);
+        let receipt_json = rpc_receipt_from_pool(
+            &pool_tx.hash,
+            &pool_tx,
+            receipt,
+            block_hash,
+            block_number,
+            idx as u32,
+            cumulative_gas,
+            log_index_offset,
+        );
+        db.put_receipt(
+            block_number,
+            idx as u32,
+            receipt_json.to_string().as_bytes(),
+        )?;
+        log_index_offset = log_index_offset.saturating_add(receipt.logs.len() as u32);
+    }
+
+    Ok(())
+}
+
+async fn submit_raw_cchain_transaction(
+    node: &NodeState,
+    raw_tx: &[u8],
+) -> Result<[u8; 32], String> {
+    let parsed = parse_raw_cchain_transaction(raw_tx)
+        .ok_or_else(|| "invalid raw transaction".to_string())?;
+    let from = parsed
+        .recover_sender()
+        .ok_or_else(|| "invalid transaction signature".to_string())?;
+
+    let tx_hash = raw_tx_hash(raw_tx);
+
+    let account_nonce = {
+        let evm = node.evm.read().await;
+        evm.get_nonce(from)
+    };
+
+    if parsed.nonce < account_nonce {
+        return Err("nonce too low".to_string());
+    }
+
+    let mut txpool = node.txpool.write().await;
+    if let Some(existing) = txpool.get_by_sender_nonce(&from, parsed.nonce) {
+        if existing.hash == tx_hash {
+            return Ok(tx_hash);
+        }
+        return Err("replacement transaction not supported".to_string());
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let tx = PoolTransaction {
+        hash: tx_hash,
+        raw: Some(raw_tx.to_vec()),
+        from,
+        to: parsed.to,
+        nonce: parsed.nonce,
+        gas_limit: parsed.gas_limit,
+        max_fee_per_gas: parsed.gas_price,
+        max_priority_fee_per_gas: parsed.max_priority_fee_per_gas,
+        value: parsed.value,
+        data: parsed.data,
+        size: raw_tx.len(),
+        timestamp,
+    };
+
+    txpool
+        .add(tx, account_nonce)
+        .map_err(|e| format!("transaction rejected: {}", e))?;
+    drop(txpool);
+
+    websocket_broadcast_pending_tx(node, &tx_hash).await;
+
+    Ok(tx_hash)
+}
+
 /// In-memory log filter for eth_newFilter/getFilterChanges/uninstallFilter.
 #[allow(dead_code)]
 struct LogFilter {
     from_block: u64,
     to_block: Option<u64>,
     addresses: Vec<[u8; 20]>,
-    topics: Vec<Option<[u8; 32]>>,
+    topics: Vec<Option<Vec<[u8; 32]>>>,
     last_polled_block: u64,
 }
 
@@ -3429,19 +6028,13 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // -----------------------------------------------------------------
         // Existing methods
         // -----------------------------------------------------------------
-        "eth_chainId" => {
-            rpc_ok(&format!("\"0x{:x}\"", node.config.chain_id), id)
-        }
+        "eth_chainId" => rpc_ok(&format!("\"0x{:x}\"", node.config.chain_id), id),
         "eth_blockNumber" => {
             let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
             rpc_ok(&format!("\"0x{:x}\"", height), id)
         }
-        "net_version" => {
-            rpc_ok(&format!("\"{}\"", node.config.network_id), id)
-        }
-        "web3_clientVersion" => {
-            rpc_ok("\"avalanche-rs/0.1.0\"", id)
-        }
+        "net_version" => rpc_ok(&format!("\"{}\"", node.config.network_id), id),
+        "web3_clientVersion" => rpc_ok("\"avalanche-rs/0.1.0\"", id),
         "eth_syncing" => {
             let phase = node.sync_engine.phase().await;
             if phase == SyncPhase::Synced || phase == SyncPhase::Following {
@@ -3458,12 +6051,11 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                 )
             }
         }
-        "avax_getNodeID" => {
-            rpc_ok(&format!("\"{}\"", node.identity.node_id), id)
-        }
-        "avax_getNodeVersion" => {
-            rpc_ok("\"avalanche-rs/0.1.0\"", id)
-        }
+        "avax_getNodeID" => rpc_ok(
+            &format!("\"{}\"", full_node_id_string(&node.identity.node_id)),
+            id,
+        ),
+        "avax_getNodeVersion" => rpc_ok("\"avalanche-rs/0.1.0\"", id),
 
         // -----------------------------------------------------------------
         // eth_getBalance
@@ -3542,41 +6134,10 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             if tx_obj.is_none() {
                 return rpc_error(-32602, "missing transaction object", id);
             }
-            let tx_obj = tx_obj.unwrap();
-            let from = tx_obj["from"].as_str().and_then(parse_hex_address).unwrap_or([0u8; 20]);
-            let to = tx_obj["to"].as_str().and_then(parse_hex_address);
-            let data = tx_obj["data"].as_str().or(tx_obj["input"].as_str())
-                .and_then(parse_hex_bytes).unwrap_or_default();
-            let value_str = tx_obj["value"].as_str().unwrap_or("0x0");
-            let value = u128::from_str_radix(
-                value_str.strip_prefix("0x").unwrap_or(value_str), 16
-            ).unwrap_or(0);
-            let gas_str = tx_obj["gas"].as_str().unwrap_or("0x1c9c380"); // 30M default
-            let gas = u64::from_str_radix(
-                gas_str.strip_prefix("0x").unwrap_or(gas_str), 16
-            ).unwrap_or(30_000_000);
-
             let evm = node.evm.read().await;
-            let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
-            let block_ctx = avalanche_rs::evm::BlockContext {
-                number: height,
-                timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                coinbase: [0u8; 20],
-                gas_limit: 30_000_000,
-                base_fee: 25_000_000_000,
-                difficulty: 0,
-                chain_id: node.config.chain_id,
-            };
-            let tx = avalanche_rs::evm::EvmTransaction {
-                from,
-                to,
-                value,
-                data,
-                gas_limit: gas,
-                gas_price: 25_000_000_000,
-                nonce: evm.get_nonce(from),
-            };
-            match evm.execute_call(&tx, &block_ctx) {
+            let block_ctx = rpc_simulation_block_context(node);
+            let parsed = parse_rpc_simulation_tx(tx_obj.unwrap(), &evm, &block_ctx);
+            match evm.execute_call(&parsed.tx, &block_ctx) {
                 Ok(output) => rpc_ok(&format!("\"0x{}\"", hex::encode(&output)), id),
                 Err(e) => rpc_error(-32000, &format!("{}", e), id),
             }
@@ -3590,37 +6151,10 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             if tx_obj.is_none() {
                 return rpc_error(-32602, "missing transaction object", id);
             }
-            let tx_obj = tx_obj.unwrap();
-            let from = tx_obj["from"].as_str().and_then(parse_hex_address).unwrap_or([0u8; 20]);
-            let to = tx_obj["to"].as_str().and_then(parse_hex_address);
-            let data = tx_obj["data"].as_str().or(tx_obj["input"].as_str())
-                .and_then(parse_hex_bytes).unwrap_or_default();
-            let value_str = tx_obj["value"].as_str().unwrap_or("0x0");
-            let value = u128::from_str_radix(
-                value_str.strip_prefix("0x").unwrap_or(value_str), 16
-            ).unwrap_or(0);
-
             let evm = node.evm.read().await;
-            let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
-            let block_ctx = avalanche_rs::evm::BlockContext {
-                number: height,
-                timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                coinbase: [0u8; 20],
-                gas_limit: 30_000_000,
-                base_fee: 25_000_000_000,
-                difficulty: 0,
-                chain_id: node.config.chain_id,
-            };
-            let tx = avalanche_rs::evm::EvmTransaction {
-                from,
-                to,
-                value,
-                data,
-                gas_limit: 30_000_000,
-                gas_price: 25_000_000_000,
-                nonce: evm.get_nonce(from),
-            };
-            match evm.estimate_gas(&tx, &block_ctx) {
+            let block_ctx = rpc_simulation_block_context(node);
+            let parsed = parse_rpc_simulation_tx(tx_obj.unwrap(), &evm, &block_ctx);
+            match evm.estimate_gas(&parsed.tx, &block_ctx) {
                 Ok(gas) => rpc_ok(&format!("\"0x{:x}\"", gas), id),
                 Err(e) => rpc_error(-32000, &format!("{}", e), id),
             }
@@ -3634,21 +6168,56 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         }
 
         // -----------------------------------------------------------------
+        // eth_sendRawTransaction
+        // -----------------------------------------------------------------
+        "eth_sendRawTransaction" => {
+            let tx_bytes_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+            if tx_bytes_str.is_empty() {
+                return rpc_error(-32602, "missing raw transaction", id);
+            }
+
+            match parse_hex_bytes(tx_bytes_str) {
+                Some(raw_tx) => match submit_raw_cchain_transaction(node, &raw_tx).await {
+                    Ok(tx_hash) => rpc_ok(&format!("\"0x{}\"", hex::encode(tx_hash)), id),
+                    Err(msg) => rpc_error(-32000, &msg, id),
+                },
+                None => rpc_error(-32602, "invalid tx hex", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
         // eth_getTransactionByHash
         // -----------------------------------------------------------------
         "eth_getTransactionByHash" => {
             let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(tx_hash_str) {
                 Some(tx_hash) => {
+                    if let Some(tx) = node.txpool.read().await.get(&tx_hash).cloned() {
+                        let result = rpc_transaction_from_pool(&tx_hash, &tx, None, None, None);
+                        return rpc_ok(&result.to_string(), id);
+                    }
                     match node.db.get_tx_index(&tx_hash) {
                         Ok(Some((block_height, tx_index))) => {
-                            rpc_ok(
-                                &format!(
-                                    "{{\"hash\":\"0x{}\",\"blockNumber\":\"0x{:x}\",\"transactionIndex\":\"0x{:x}\"}}",
-                                    hex::encode(tx_hash), block_height, tx_index
-                                ),
-                                id,
-                            )
+                            if let Some((block_hash, tx)) =
+                                load_mined_cchain_transaction(&node.db, block_height, tx_index)
+                            {
+                                let result = rpc_transaction_from_pool(
+                                    &tx_hash,
+                                    &tx,
+                                    Some(block_hash),
+                                    Some(block_height),
+                                    Some(tx_index),
+                                );
+                                rpc_ok(&result.to_string(), id)
+                            } else {
+                                rpc_ok(
+                                    &format!(
+                                        "{{\"hash\":\"0x{}\",\"blockNumber\":\"0x{:x}\",\"transactionIndex\":\"0x{:x}\"}}",
+                                        hex::encode(tx_hash), block_height, tx_index
+                                    ),
+                                    id,
+                                )
+                            }
                         }
                         _ => rpc_ok("null", id),
                     }
@@ -3694,21 +6263,15 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // eth_getBlockByNumber
         // -----------------------------------------------------------------
         "eth_getBlockByNumber" => {
-            let block_num = parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            let block_num =
+                parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            let include_full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
             match node.db.get_block(block_num) {
                 Ok(Some(block_data)) => {
-                    let hash_bytes = {
-                        let mut hasher = Sha256::new();
-                        hasher.update(&block_data);
-                        hasher.finalize()
-                    };
-                    rpc_ok(
-                        &format!(
-                            "{{\"number\":\"0x{:x}\",\"hash\":\"0x{}\",\"size\":\"0x{:x}\",\"transactions\":[]}}",
-                            block_num, hex::encode(hash_bytes), block_data.len()
-                        ),
-                        id,
-                    )
+                    match rpc_block_from_cchain_data(&block_data, include_full_txs) {
+                        Some(result) => rpc_ok(&result.to_string(), id),
+                        None => rpc_ok("null", id),
+                    }
                 }
                 _ => rpc_ok("null", id),
             }
@@ -3721,19 +6284,17 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(hash_str) {
                 Some(block_hash) => {
+                    let include_full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
                     // Look up block by hash in blocks CF (hash key format: "c:" prefix for C-chain)
                     let mut key = Vec::with_capacity(34);
                     key.extend_from_slice(b"c:");
                     key.extend_from_slice(&block_hash);
                     match node.db.get_cf(avalanche_rs::db::CF_BLOCKS, &key) {
                         Ok(Some(block_data)) => {
-                            rpc_ok(
-                                &format!(
-                                    "{{\"hash\":\"0x{}\",\"size\":\"0x{:x}\",\"transactions\":[]}}",
-                                    hex::encode(block_hash), block_data.len()
-                                ),
-                                id,
-                            )
+                            match rpc_block_from_cchain_data(&block_data, include_full_txs) {
+                                Some(result) => rpc_ok(&result.to_string(), id),
+                                None => rpc_ok("null", id),
+                            }
                         }
                         _ => rpc_ok("null", id),
                     }
@@ -3746,8 +6307,14 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // eth_getLogs
         // -----------------------------------------------------------------
         "eth_getLogs" => {
-            // Returns empty array — log indexing requires full state sync
-            rpc_ok("[]", id)
+            let filter = parse_log_filter(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            let current_height = current_cchain_height(node);
+            let end_block = filter
+                .to_block
+                .unwrap_or(current_height)
+                .min(current_height);
+            let logs = collect_logs_for_range(&node.db, &filter, filter.from_block, end_block);
+            rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
         }
 
         // -----------------------------------------------------------------
@@ -3755,40 +6322,8 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // -----------------------------------------------------------------
         "eth_newFilter" => {
             let filter_obj = params.get(0).unwrap_or(&serde_json::Value::Null);
-            let from_block = filter_obj["fromBlock"].as_str()
-                .map(|s| {
-                    let s = s.strip_prefix("0x").unwrap_or(s);
-                    u64::from_str_radix(s, 16).unwrap_or(0)
-                })
-                .unwrap_or(0);
-            let to_block = filter_obj["toBlock"].as_str()
-                .and_then(|s| {
-                    let s = s.strip_prefix("0x").unwrap_or(s);
-                    u64::from_str_radix(s, 16).ok()
-                });
-            let addresses: Vec<[u8; 20]> = match &filter_obj["address"] {
-                serde_json::Value::String(s) => parse_hex_address(s).into_iter().collect(),
-                serde_json::Value::Array(arr) => arr.iter()
-                    .filter_map(|v| v.as_str().and_then(parse_hex_address))
-                    .collect(),
-                _ => vec![],
-            };
-            let topics: Vec<Option<[u8; 32]>> = match &filter_obj["topics"] {
-                serde_json::Value::Array(arr) => arr.iter()
-                    .map(|v| v.as_str().and_then(parse_hex_hash))
-                    .collect(),
-                _ => vec![],
-            };
-
             let filter_id = NEXT_FILTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let current_height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
-            let filter = LogFilter {
-                from_block,
-                to_block,
-                addresses,
-                topics,
-                last_polled_block: current_height,
-            };
+            let filter = parse_log_filter(filter_obj, node);
             FILTERS.write().await.insert(filter_id, filter);
             rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
         }
@@ -3797,16 +6332,43 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // eth_getFilterChanges
         // -----------------------------------------------------------------
         "eth_getFilterChanges" => {
-            let filter_id_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
-            let filter_id = u64::from_str_radix(
-                filter_id_str.strip_prefix("0x").unwrap_or(filter_id_str), 16
-            ).unwrap_or(0);
+            let filter_id = parse_filter_id(params.get(0).unwrap_or(&serde_json::Value::Null));
             let mut filters = FILTERS.write().await;
             match filters.get_mut(&filter_id) {
                 Some(filter) => {
-                    let current_height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
+                    let current_height = current_cchain_height(node);
+                    let end_block = filter
+                        .to_block
+                        .unwrap_or(current_height)
+                        .min(current_height);
+                    let start_block = filter
+                        .last_polled_block
+                        .saturating_add(1)
+                        .max(filter.from_block);
+                    let logs = collect_logs_for_range(&node.db, filter, start_block, end_block);
                     filter.last_polled_block = current_height;
-                    rpc_ok("[]", id) // log indexing not yet available
+                    rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
+                }
+                None => rpc_error(-32000, "filter not found", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getFilterLogs
+        // -----------------------------------------------------------------
+        "eth_getFilterLogs" => {
+            let filter_id = parse_filter_id(params.get(0).unwrap_or(&serde_json::Value::Null));
+            let filters = FILTERS.read().await;
+            match filters.get(&filter_id) {
+                Some(filter) => {
+                    let current_height = current_cchain_height(node);
+                    let end_block = filter
+                        .to_block
+                        .unwrap_or(current_height)
+                        .min(current_height);
+                    let logs =
+                        collect_logs_for_range(&node.db, filter, filter.from_block, end_block);
+                    rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
                 }
                 None => rpc_error(-32000, "filter not found", id),
             }
@@ -3816,10 +6378,7 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // eth_uninstallFilter
         // -----------------------------------------------------------------
         "eth_uninstallFilter" => {
-            let filter_id_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
-            let filter_id = u64::from_str_radix(
-                filter_id_str.strip_prefix("0x").unwrap_or(filter_id_str), 16
-            ).unwrap_or(0);
+            let filter_id = parse_filter_id(params.get(0).unwrap_or(&serde_json::Value::Null));
             let removed = FILTERS.write().await.remove(&filter_id).is_some();
             rpc_ok(if removed { "true" } else { "false" }, id)
         }
@@ -3828,30 +6387,98 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // Platform RPC methods (routed via /ext/bc/P in AvalancheGo)
         // -----------------------------------------------------------------
         "platform.getCurrentValidators" => {
-            let validators: Vec<String> = node.validators.iter().map(|(node_id, info)| {
-                format!(
-                    "{{\"nodeID\":\"{}\",\"weight\":\"{}\",\"startTime\":\"{}\",\"endTime\":\"{}\"}}",
-                    node_id, info.weight, info.start_time, info.end_time
-                )
-            }).collect();
-            rpc_ok(&format!("{{\"validators\":[{}]}}", validators.join(",")), id)
+            let now = unix_timestamp_secs();
+            let records = platform_validator_records(node, params).await;
+            let records = records
+                .into_iter()
+                .filter(|validator| validator.status(now) == "current")
+                .collect::<Vec<_>>();
+            let validators = platform_validator_response_values(node, records).await;
+            rpc_ok(
+                &serde_json::json!({ "validators": validators }).to_string(),
+                id,
+            )
+        }
+
+        "platform.getValidators" => {
+            let validators = platform_validator_response_values(
+                node,
+                platform_validator_records(node, params).await,
+            )
+            .await;
+            rpc_ok(
+                &serde_json::json!({ "validators": validators }).to_string(),
+                id,
+            )
         }
 
         "platform.getPendingValidators" => {
-            rpc_ok("{\"validators\":[]}", id)
+            let now = unix_timestamp_secs();
+            let records = platform_validator_records(node, params).await;
+            let records = records
+                .into_iter()
+                .filter(|validator| validator.status(now) == "pending")
+                .collect::<Vec<_>>();
+            let validators = platform_validator_response_values(node, records).await;
+            rpc_ok(
+                &serde_json::json!({
+                    "validators": validators,
+                    "delegators": [],
+                })
+                .to_string(),
+                id,
+            )
+        }
+
+        "platform.getValidator" => {
+            let Some(node_id) = platform_node_id_param(params) else {
+                return rpc_error(-32602, "missing nodeID", id);
+            };
+            let validators = platform_validator_response_values(
+                node,
+                platform_validator_records(node, params).await,
+            )
+            .await;
+            match validators.into_iter().find(|validator| {
+                validator.get("nodeID").and_then(|value| value.as_str()) == Some(node_id)
+            }) {
+                Some(validator) => rpc_ok(&validator.to_string(), id),
+                None => rpc_error(-32000, "validator not found", id),
+            }
         }
 
         "platform.getHeight" => {
             let height = node.db.last_accepted_height().unwrap_or(None).unwrap_or(0);
-            rpc_ok(&format!("\"{}\"", height), id)
+            rpc_ok(
+                &serde_json::json!({ "height": height.to_string() }).to_string(),
+                id,
+            )
         }
 
         "platform.getBlock" => {
-            let height_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0");
-            let height = height_str.parse::<u64>().unwrap_or(0);
-            match node.db.get_block(height) {
+            let Some(block_id_str) = platform_block_id_param(params) else {
+                return rpc_error(-32602, "missing blockID", id);
+            };
+            let Some(block_id) = parse_platform_id_32(block_id_str) else {
+                return rpc_error(-32602, "invalid blockID", id);
+            };
+            let encoding = platform_encoding_param(params, "hex");
+            match node.db.get_cf(CF_BLOCKS, &block_id) {
                 Ok(Some(data)) => {
-                    rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id)
+                    let response = match encoding {
+                        "hex" => serde_json::json!({
+                            "block": format!("0x{}", hex::encode(&data)),
+                            "encoding": "hex",
+                        }),
+                        "json" => serde_json::json!({
+                            "block": platform_block_json_value(&data),
+                            "encoding": "json",
+                        }),
+                        _ => {
+                            return rpc_error(-32602, "unsupported encoding", id);
+                        }
+                    };
+                    rpc_ok(&response.to_string(), id)
                 }
                 _ => rpc_error(-32000, "block not found", id),
             }
@@ -3868,46 +6495,79 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         }
 
         "platform.getBlockchainStatus" => {
-            let peers = node.peer_manager.read().await.connected_count();
-            let stats = node.sync_engine.stats().await;
-            let p_tip = node.p_chain_metrics.read().await.tip_height;
-            let c_tip = node.c_chain_metrics.read().await.tip_height;
-            let progress = stats.progress_pct();
+            let Some(blockchain_id_str) = platform_blockchain_id_param(params) else {
+                return rpc_error(-32602, "missing blockchainID", id);
+            };
+            let Some(blockchain_id) = parse_platform_id_32(blockchain_id_str) else {
+                return rpc_error(-32602, "invalid blockchainID", id);
+            };
+            let status = platform_blockchain_status(node, blockchain_id).await;
+            rpc_ok(&serde_json::json!({ "status": status }).to_string(), id)
+        }
+
+        "health" | "health.health" => {
+            let tags = health_tags_param(params);
             rpc_ok(
-                &format!(
-                    "{{\"syncProgress\":{},\"blockHeight\":{},\"peerCount\":{},\"pChainHeight\":{},\"cChainHeight\":{}}}",
-                    progress,
-                    p_tip.max(c_tip),
-                    peers,
-                    p_tip,
-                    c_tip
-                ),
+                &health_report(node, HealthReportKind::Health, &tags)
+                    .await
+                    .to_string(),
                 id,
             )
         }
 
-        "health" => {
-            let peers = node.peer_manager.read().await.connected_count();
-            let sync_state = node.sync_engine.phase().await.to_string();
-            let memory_rss = get_rss_bytes();
+        "health.readiness" => {
+            let tags = health_tags_param(params);
             rpc_ok(
-                &format!(
-                    "{{\"connectedPeers\":{},\"syncState\":\"{}\",\"memoryRssBytes\":{}}}",
-                    peers, sync_state, memory_rss
-                ),
+                &health_report(node, HealthReportKind::Readiness, &tags)
+                    .await
+                    .to_string(),
+                id,
+            )
+        }
+
+        "health.liveness" => {
+            let tags = health_tags_param(params);
+            rpc_ok(
+                &health_report(node, HealthReportKind::Liveness, &tags)
+                    .await
+                    .to_string(),
                 id,
             )
         }
 
         "platform.getStake" => {
-            let total: u64 = node.validators.values().map(|v| v.weight).sum();
-            rpc_ok(&format!("{{\"staked\":\"{}\"}}", total), id)
+            let addresses = platform_params_object(params)
+                .and_then(|obj| obj.get("addresses"))
+                .or_else(|| params.get(0))
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let encoding = platform_encoding_param(params, "hex");
+            let response = serde_json::json!({
+                "staked": "0",
+                "stakeds": addresses
+                    .iter()
+                    .map(|_| serde_json::Value::String("0".to_string()))
+                    .collect::<Vec<_>>(),
+                "stakedOutputs": serde_json::Value::Array(vec![]),
+                "encoding": encoding,
+            });
+            rpc_ok(&response.to_string(), id)
         }
 
-        "platform.getMinStake" => {
-            // Mainnet: 2000 AVAX for validators, 25 AVAX for delegators
-            rpc_ok("{\"minValidatorStake\":\"2000000000000\",\"minDelegatorStake\":\"25000000000\"}", id)
-        }
+        "platform.getMinStake" => rpc_ok(
+            &serde_json::json!({
+                "minValidatorStake": MIN_VALIDATOR_STAKE.to_string(),
+                "minDelegatorStake": MIN_DELEGATOR_STAKE.to_string(),
+            })
+            .to_string(),
+            id,
+        ),
 
         // -----------------------------------------------------------------
         // eth_getBlobByHash (EIP-4844)
@@ -3915,12 +6575,10 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         "eth_getBlobByHash" => {
             let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(hash_str) {
-                Some(hash) => {
-                    match node.db.get_cf(avalanche_rs::db::CF_BLOBS, &hash) {
-                        Ok(Some(data)) => rpc_ok(&String::from_utf8_lossy(&data), id),
-                        _ => rpc_ok("null", id),
-                    }
-                }
+                Some(hash) => match node.db.get_cf(avalanche_rs::db::CF_BLOBS, &hash) {
+                    Ok(Some(data)) => rpc_ok(&String::from_utf8_lossy(&data), id),
+                    _ => rpc_ok("null", id),
+                },
                 None => rpc_error(-32602, "invalid hash", id),
             }
         }
@@ -3929,50 +6587,96 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // Transaction Pool RPCs
         // -----------------------------------------------------------------
         "eth_txpool_status" | "txpool_status" => {
-            rpc_ok("{\"pending\":\"0x0\",\"queued\":\"0x0\"}", id)
+            let pool = node.txpool.read().await;
+            let status = pool.status();
+            let result = serde_json::json!({
+                "pending": format!("0x{:x}", status.pending),
+                "queued": format!("0x{:x}", status.queued),
+            });
+            rpc_ok(&result.to_string(), id)
         }
 
         "eth_txpool_content" | "txpool_content" => {
-            rpc_ok("{\"pending\":{},\"queued\":{}}", id)
+            let pool = node.txpool.read().await;
+            let result = serde_json::json!({
+                "pending": txpool_group_transactions(pool.pending_transactions()),
+                "queued": txpool_group_transactions(pool.queued_transactions()),
+            });
+            rpc_ok(&result.to_string(), id)
         }
 
         "eth_txpool_inspect" | "txpool_inspect" => {
-            rpc_ok("{\"pending\":{},\"queued\":{}}", id)
+            let pool = node.txpool.read().await;
+            let result = serde_json::json!({
+                "pending": txpool_group_inspect(pool.pending_transactions()),
+                "queued": txpool_group_inspect(pool.queued_transactions()),
+            });
+            rpc_ok(&result.to_string(), id)
         }
 
         // -----------------------------------------------------------------
         // WebSocket subscription (HTTP fallback)
         // -----------------------------------------------------------------
-        "eth_subscribe" => {
-            rpc_error(-32601, "eth_subscribe requires WebSocket connection (/ws)", id)
-        }
+        "eth_subscribe" => rpc_error(
+            -32601,
+            "eth_subscribe requires WebSocket connection (/ws)",
+            id,
+        ),
 
-        "eth_unsubscribe" => {
-            rpc_error(-32601, "eth_unsubscribe requires WebSocket connection (/ws)", id)
-        }
+        "eth_unsubscribe" => rpc_error(
+            -32601,
+            "eth_unsubscribe requires WebSocket connection (/ws)",
+            id,
+        ),
 
         // -----------------------------------------------------------------
         // Debug & Trace APIs
         // -----------------------------------------------------------------
         "debug_traceTransaction" => {
             let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let config = TraceConfig::from_json(params.get(1).unwrap_or(&serde_json::Value::Null));
             match parse_hex_hash(hash_str) {
-                Some(_hash) => {
-                    rpc_ok("{\"gas\":0,\"failed\":false,\"returnValue\":\"\",\"structLogs\":[]}", id)
+                Some(hash) => {
+                    if let Some(tx) = node.txpool.read().await.get(&hash).cloned() {
+                        let evm = node.evm.read().await;
+                        let block_ctx = rpc_simulation_block_context(node);
+                        let result = trace_pending_transaction(&evm, &tx, &block_ctx, &config);
+                        rpc_ok(&result.to_string(), id)
+                    } else {
+                        match node.db.get_tx_index(&hash) {
+                            Ok(Some((block_height, tx_index))) => {
+                                match trace_mined_transaction(
+                                    &node.db,
+                                    node.config.chain_id,
+                                    block_height,
+                                    tx_index,
+                                    &config,
+                                ) {
+                                    Ok(result) => rpc_ok(&result.to_string(), id),
+                                    Err(msg) => rpc_error(-32000, &msg, id),
+                                }
+                            }
+                            _ => rpc_error(-32000, "transaction not found", id),
+                        }
+                    }
                 }
                 None => rpc_error(-32602, "invalid tx hash", id),
             }
         }
 
         "debug_traceBlockByNumber" => {
-            rpc_ok("[]", id)
+            let block_num =
+                parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            let config = TraceConfig::from_json(params.get(1).unwrap_or(&serde_json::Value::Null));
+            match trace_mined_block(&node.db, node.config.chain_id, block_num, &config) {
+                Ok(result) => rpc_ok(&result.to_string(), id),
+                Err(msg) => rpc_error(-32000, &msg, id),
+            }
         }
 
         "debug_getBlockByNumber" => {
-            let block_num = parse_block_number(
-                params.get(0).unwrap_or(&serde_json::Value::Null),
-                node,
-            );
+            let block_num =
+                parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
             match node.db.get_block(block_num) {
                 Ok(Some(data)) => rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id),
                 _ => rpc_ok("null", id),
@@ -3987,52 +6691,39 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // eth_feeHistory (EIP-1559)
         // -----------------------------------------------------------------
         "eth_feeHistory" => {
-            let block_count = params.get(0).and_then(|v| {
-                v.as_u64().or_else(|| {
-                    v.as_str().and_then(|s| {
-                        let s = s.strip_prefix("0x").unwrap_or(s);
-                        u64::from_str_radix(s, 16).ok()
-                    })
+            let block_count = params.get(0).and_then(parse_quantity_u64).unwrap_or(1);
+            let newest_block =
+                parse_block_number(params.get(1).unwrap_or(&serde_json::Value::Null), node);
+            let reward_percentiles = params
+                .get(2)
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_f64())
+                        .collect::<Vec<_>>()
                 })
-            }).unwrap_or(1);
-            let newest_block = parse_block_number(
-                params.get(1).unwrap_or(&serde_json::Value::Null), node
-            );
-            let block_count = block_count.min(1024);
-            let oldest = newest_block.saturating_sub(block_count.saturating_sub(1));
-            let base_fee = "0x5d21dba00"; // 25 gwei
-            let mut base_fees = Vec::new();
-            let mut gas_used_ratios = Vec::new();
-            for _ in 0..block_count {
-                base_fees.push(format!("\"{}\"", base_fee));
-                gas_used_ratios.push("0.5".to_string());
-            }
-            base_fees.push(format!("\"{}\"", base_fee)); // +1 for next block
-            rpc_ok(
-                &format!(
-                    "{{\"oldestBlock\":\"0x{:x}\",\"baseFeePerGas\":[{}],\"gasUsedRatio\":[{}]}}",
-                    oldest,
-                    base_fees.join(","),
-                    gas_used_ratios.join(",")
-                ),
-                id,
-            )
+                .unwrap_or_default();
+            let result =
+                build_fee_history_result(node, block_count, newest_block, &reward_percentiles);
+            rpc_ok(&result.to_string(), id)
         }
 
         // -----------------------------------------------------------------
         // eth_maxPriorityFeePerGas
         // -----------------------------------------------------------------
         "eth_maxPriorityFeePerGas" => {
-            rpc_ok("\"0x3b9aca00\"", id) // 1 gwei suggested priority fee
+            let priority_fee =
+                recent_priority_fee_suggestion(&node.db, current_cchain_height(node));
+            rpc_ok(&format!("\"0x{:x}\"", priority_fee), id)
         }
 
         // -----------------------------------------------------------------
         // eth_getBlockReceipts
         // -----------------------------------------------------------------
         "eth_getBlockReceipts" => {
-            let block_num = parse_block_number(
-                params.get(0).unwrap_or(&serde_json::Value::Null), node
-            );
+            let block_num =
+                parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
             // Return receipts from DB if available, else empty array
             match node.db.get_block_receipts(block_num) {
                 Ok(Some(data)) => {
@@ -4051,11 +6742,35 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             if tx_obj.is_none() {
                 return rpc_error(-32602, "missing transaction object", id);
             }
-            // Return empty access list with gas estimate
-            rpc_ok(
-                "{\"accessList\":[],\"gasUsed\":\"0x5208\"}",
-                id,
-            )
+            let evm = node.evm.read().await;
+            let block_ctx = rpc_simulation_block_context(node);
+            let parsed = parse_rpc_simulation_tx(tx_obj.unwrap(), &evm, &block_ctx);
+            match evm.create_access_list(&parsed.tx, &block_ctx, &parsed.access_list) {
+                Ok(result) => {
+                    let mut response = serde_json::json!({
+                        "accessList": result
+                            .access_list
+                            .into_iter()
+                            .map(|entry| {
+                                serde_json::json!({
+                                    "address": format!("0x{}", hex::encode(entry.address)),
+                                    "storageKeys": entry
+                                        .storage_keys
+                                        .into_iter()
+                                        .map(|key| serde_json::Value::String(format!("0x{}", hex::encode(key))))
+                                        .collect::<Vec<_>>(),
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                        "gasUsed": format!("0x{:x}", result.gas_used),
+                    });
+                    if let Some(error) = result.error {
+                        response["error"] = serde_json::Value::String(error);
+                    }
+                    rpc_ok(&response.to_string(), id)
+                }
+                Err(e) => rpc_error(-32000, &format!("{}", e), id),
+            }
         }
 
         // -----------------------------------------------------------------
@@ -4069,9 +6784,7 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             // Atomic txs stored in CF_BLOCKS with "atomic:" prefix
             let key = format!("atomic:{}", tx_id_str);
             match node.db.get_cf(avalanche_rs::db::CF_BLOCKS, key.as_bytes()) {
-                Ok(Some(data)) => {
-                    rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id)
-                }
+                Ok(Some(data)) => rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id),
                 _ => rpc_ok("null", id),
             }
         }
@@ -4095,7 +6808,9 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                     let tx_id = hex::encode(tx_hash);
                     // Store in DB for retrieval
                     let key = format!("atomic:{}", tx_id);
-                    let _ = node.db.put_cf(avalanche_rs::db::CF_BLOCKS, key.as_bytes(), &tx_bytes);
+                    let _ = node
+                        .db
+                        .put_cf(avalanche_rs::db::CF_BLOCKS, key.as_bytes(), &tx_bytes);
                     rpc_ok(&format!("{{\"txID\":\"0x{}\"}}", tx_id), id)
                 }
                 None => rpc_error(-32602, "invalid tx hex", id),
@@ -4105,46 +6820,128 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // -----------------------------------------------------------------
         // info namespace
         // -----------------------------------------------------------------
-        "info.getNetworkID" => {
-            rpc_ok(&format!("{{\"networkID\":\"{}\"}}", node.config.network_id), id)
-        }
+        "info.getNetworkID" => rpc_ok(
+            &format!("{{\"networkID\":\"{}\"}}", node.config.network_id),
+            id,
+        ),
 
-        "info.getNetworkName" => {
-            let name = match node.config.network_id {
-                1 => "mainnet",
-                5 => "fuji",
-                _ => "custom",
-            };
-            rpc_ok(&format!("{{\"networkName\":\"{}\"}}", name), id)
-        }
+        "info.getNetworkName" => rpc_ok(
+            &serde_json::json!({
+                "networkName": info_network_name(node.config.network_id),
+            })
+            .to_string(),
+            id,
+        ),
 
         "info.getBlockchainID" => {
-            // C-Chain blockchain ID
-            rpc_ok("{\"blockchainID\":\"2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5\"}", id)
-        }
-
-        "info.getNodeVersion" => {
+            let Some(alias) = info_alias_param(params) else {
+                return rpc_error(-32602, "missing alias", id);
+            };
+            let Some(blockchain_id) = info_blockchain_alias_id(alias, node.config.network_id)
+            else {
+                return rpc_error(
+                    -32602,
+                    &format!("there is no chain with alias/ID '{}'", alias),
+                    id,
+                );
+            };
             rpc_ok(
-                &format!(
-                    "{{\"version\":\"avalanche-rs/0.1.0\",\"databaseVersion\":\"{}\",\"gitCommit\":\"rust\"}}",
-                    "0.1.0"
-                ),
+                &serde_json::json!({
+                    "blockchainID": cb58_encode_id(blockchain_id),
+                })
+                .to_string(),
                 id,
             )
         }
 
+        "info.getNodeID" => {
+            let result = serde_json::json!({
+                "nodeID": full_node_id_string(&node.identity.node_id),
+                "nodePOP": {
+                    "publicKey": format!("0x{}", hex::encode(node.identity.bls_public_key_bytes())),
+                    "proofOfPossession": format!(
+                        "0x{}",
+                        hex::encode(node.identity.bls_proof_of_possession())
+                    ),
+                }
+            });
+            rpc_ok(&result.to_string(), id)
+        }
+
+        "info.getNodeIP" => rpc_ok(
+            &serde_json::json!({
+                "ip": info_node_ip_string(node),
+            })
+            .to_string(),
+            id,
+        ),
+
+        "info.getNodeVersion" => rpc_ok(&info_get_node_version_result().to_string(), id),
+
         "info.peers" => {
             let pm = node.peer_manager.read().await;
-            let peer_count = pm.connected_count();
-            rpc_ok(&format!("{{\"numPeers\":{},\"peers\":[]}}", peer_count), id)
+            let requested_node_ids = info_node_ids_param(params);
+            let requested = requested_node_ids
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let peers = pm
+                .connected_peers()
+                .into_iter()
+                .filter_map(|node_id| pm.get_peer(&node_id))
+                .filter(|peer| requested.is_empty() || requested.contains(&peer.node_id.0))
+                .map(info_peer_json)
+                .collect::<Vec<_>>();
+            rpc_ok(
+                &serde_json::json!({
+                    "numPeers": peers.len().to_string(),
+                    "peers": peers,
+                })
+                .to_string(),
+                id,
+            )
         }
+
+        "info.isBootstrapped" => {
+            let Some(chain) = info_chain_param(params) else {
+                return rpc_error(-32602, "argument 'chain' not given", id);
+            };
+            match info_is_bootstrapped(node, chain).await {
+                Ok(is_bootstrapped) => rpc_ok(
+                    &serde_json::json!({
+                        "isBootstrapped": is_bootstrapped,
+                    })
+                    .to_string(),
+                    id,
+                ),
+                Err(message) => rpc_error(-32602, &message, id),
+            }
+        }
+
+        "info.getTxFee" => rpc_ok(
+            &info_get_tx_fee_result(node.config.network_id).to_string(),
+            id,
+        ),
+
+        "info.getVMs" => rpc_ok(&info_get_vms_result().to_string(), id),
+
+        "info.uptime" => rpc_ok(
+            &serde_json::json!({
+                "rewardingStakePercentage": "0.0000",
+                "weightedAveragePercentage": "0.0000",
+            })
+            .to_string(),
+            id,
+        ),
+
+        "info.upgrades" => rpc_ok(
+            &info_upgrades_result(node.config.network_id).to_string(),
+            id,
+        ),
 
         // -----------------------------------------------------------------
         // Unknown method
         // -----------------------------------------------------------------
-        _ => {
-            rpc_error(-32601, &format!("method not found: {}", method), id)
-        }
+        _ => rpc_error(-32601, &format!("method not found: {}", method), id),
     }
 }
 
@@ -4395,6 +7192,11 @@ fn init_logging(level: &str, format: &str) {
 mod integration_tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    static FILTER_TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     fn make_test_node(network_id: u32) -> Arc<NodeState> {
         let identity = NodeIdentity::generate().expect("generate node identity");
@@ -4464,11 +7266,97 @@ mod integration_tests {
             p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
-            pending_txs: Arc::new(RwLock::new(Vec::new())),
+            txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
+            ws_subscriptions: Arc::new(RwLock::new(SubscriptionManager::new(1024))),
+            ws_connections: Arc::new(RwLock::new(StdHashMap::new())),
+            #[cfg(feature = "indexer")]
+            indexer: None,
+        })
+    }
+
+    fn make_test_node_with_validators(
+        network_id: u32,
+        validators: std::collections::HashMap<String, ValidatorInfo>,
+        validators_seen: std::collections::HashSet<String>,
+    ) -> Arc<NodeState> {
+        let identity = NodeIdentity::generate().expect("generate node identity");
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        let evm = Arc::new(RwLock::new(EvmExecutor::new(43114)));
+
+        let net_config = NetworkConfig {
+            network_id,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(RwLock::new(PeerManager::new(
+            net_config,
+            identity.node_id.clone(),
+        )));
+
+        let mut chain_id_bytes = [0u8; 32];
+        chain_id_bytes[31] = if network_id == 1 { 0x01 } else { 0x05 };
+        let sync_engine = Arc::new(SyncEngine::new(SyncConfig {
+            chain_id: ChainId(chain_id_bytes),
+            ..Default::default()
+        }));
+
+        Arc::new(NodeState {
+            identity,
+            db,
+            evm,
+            sync_engine,
+            peer_manager,
+            config: Cli {
+                network_id,
+                data_dir: PathBuf::from("./data/test-rpc"),
+                bootstrap_ips: vec![],
+                tracked_subnets: "".to_string(),
+                subnet_id: None,
+                staking_tls_cert_file: None,
+                staking_tls_key_file: None,
+                http_port: 0,
+                staking_port: 9651,
+                log_level: "info".to_string(),
+                log_format: "pretty".to_string(),
+                chain_id: 43114,
+                validator: false,
+                state_pruning_depth: 256,
+                light_client: false,
+                archive: false,
+                blob_retention_epochs: 4096,
+                txpool_size: 4096,
+                block_cache_size: 1024,
+                rpc_max_body_size: 5_242_880,
+                max_memory_mb: 0,
+                log_max_size: 100,
+                log_max_files: 10,
+                connection_pool_size: 8,
+                stake_amount: None,
+                stake_duration: None,
+                delegation_fee: None,
+                reward_address: None,
+                #[cfg(feature = "indexer")]
+                indexer_enabled: false,
+                #[cfg(feature = "indexer")]
+                database_url: String::new(),
+            },
+            start_time: Instant::now(),
+            validators,
+            validators_seen: Arc::new(RwLock::new(validators_seen)),
+            total_stake_weight: Arc::new(RwLock::new(0u64)),
+            p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
+            mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
+            txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
+            archive_store: Arc::new(ArchiveStore::new(false)),
+            subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
+            persisted_sync_state: Arc::new(RwLock::new(None)),
+            ws_subscriptions: Arc::new(RwLock::new(SubscriptionManager::new(1024))),
+            ws_connections: Arc::new(RwLock::new(StdHashMap::new())),
             #[cfg(feature = "indexer")]
             indexer: None,
         })
@@ -4487,6 +7375,141 @@ mod integration_tests {
         let mut h = Sha256::new();
         h.update(data);
         h.finalize().into()
+    }
+
+    fn make_test_log(
+        address: [u8; 20],
+        topics: Vec<[u8; 32]>,
+        block_number: u64,
+        tx_hash: [u8; 32],
+        tx_index: u32,
+        block_hash: [u8; 32],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "address": format!("0x{}", hex::encode(address)),
+            "topics": topics
+                .into_iter()
+                .map(|topic| serde_json::Value::String(format!("0x{}", hex::encode(topic))))
+                .collect::<Vec<_>>(),
+            "data": "0x",
+            "blockNumber": format!("0x{:x}", block_number),
+            "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+            "transactionIndex": format!("0x{:x}", tx_index),
+            "blockHash": format!("0x{}", hex::encode(block_hash)),
+            "logIndex": "0x0",
+            "removed": false,
+        })
+    }
+
+    fn store_test_receipt(
+        db: &Database,
+        block_number: u64,
+        tx_index: u32,
+        tx_hash: [u8; 32],
+        block_hash: [u8; 32],
+        logs: Vec<serde_json::Value>,
+    ) {
+        let receipt = serde_json::json!({
+            "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+            "transactionIndex": format!("0x{:x}", tx_index),
+            "blockHash": format!("0x{}", hex::encode(block_hash)),
+            "blockNumber": format!("0x{:x}", block_number),
+            "from": format!("0x{}", hex::encode([0x11; 20])),
+            "to": format!("0x{}", hex::encode([0x22; 20])),
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "status": "0x1",
+            "logs": logs,
+        });
+        db.put_receipt(block_number, tx_index, receipt.to_string().as_bytes())
+            .unwrap();
+    }
+
+    async fn websocket_handshake(stream: &mut TcpStream, path: &str) {
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            path
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.starts_with("HTTP/1.1 101"));
+        assert!(response.contains("Sec-WebSocket-Accept"));
+    }
+
+    async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            path
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    async fn write_masked_ws_text_frame(stream: &mut TcpStream, text: &str) {
+        let payload = text.as_bytes();
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        let mut frame = Vec::with_capacity(payload.len() + 16);
+        frame.push(0x81);
+        match payload.len() {
+            len @ 0..=125 => frame.push(0x80 | len as u8),
+            len @ 126..=65535 => {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            }
+            len => {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        for (idx, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[idx % 4]);
+        }
+        stream.write_all(&frame).await.unwrap();
+    }
+
+    async fn read_ws_text_frame(stream: &mut TcpStream) -> serde_json::Value {
+        let frame = tokio::time::timeout(Duration::from_secs(5), read_ws_frame(stream))
+            .await
+            .expect("websocket frame should arrive")
+            .expect("frame read should succeed")
+            .expect("frame should exist");
+        assert_eq!(frame.0, 0x1);
+        serde_json::from_slice(&frame.1).unwrap()
+    }
+
+    fn make_pool_tx(from: u8, nonce: u64) -> PoolTransaction {
+        let mut hash = [0u8; 32];
+        hash[0] = from;
+        hash[1..9].copy_from_slice(&nonce.to_be_bytes());
+
+        PoolTransaction {
+            hash,
+            raw: None,
+            from: [from; 20],
+            to: Some([0xAA; 20]),
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 25_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            value: 42,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            size: 128,
+            timestamp: 1_700_000_000,
+        }
+    }
+
+    fn keccak_tx_hash(raw: &[u8]) -> [u8; 32] {
+        let hash = revm::primitives::keccak256(raw);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hash.as_slice());
+        out
     }
 
     #[test]
@@ -4554,16 +7577,1597 @@ mod integration_tests {
         let subnets = handle_rpc_request(subnets_req, &node).await;
         assert!(subnets.contains("subnets"));
 
-        let status_req =
-            r#"{"jsonrpc":"2.0","method":"platform.getBlockchainStatus","params":[],"id":3}"#;
-        let status = handle_rpc_request(status_req, &node).await;
-        assert!(status.contains("syncProgress"));
-        assert!(status.contains("peerCount"));
+        node.sync_engine.mark_following().await;
+        let status_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBlockchainStatus","params":{{"blockchainID":"0x{}"}},"id":3}}"#,
+            hex::encode(platform_pchain_blockchain_id())
+        );
+        let status = handle_rpc_request(&status_req, &node).await;
+        assert!(status.contains("Validating"));
 
         let health_req = r#"{"jsonrpc":"2.0","method":"health","params":[],"id":4}"#;
         let health = handle_rpc_request(health_req, &node).await;
-        assert!(health.contains("connectedPeers"));
-        assert!(health.contains("memoryRssBytes"));
+        assert!(health.contains("\"checks\""));
+        assert!(health.contains("\"healthy\""));
+    }
+
+    #[tokio::test]
+    async fn test_platform_validator_endpoints_filter_and_lookup() {
+        let now = unix_timestamp_secs();
+        let current_node = "NodeID-current".to_string();
+        let pending_node = "NodeID-pending".to_string();
+        let completed_node = "NodeID-completed".to_string();
+        let mut validators = std::collections::HashMap::new();
+        validators.insert(
+            current_node.clone(),
+            ValidatorInfo {
+                node_id: current_node.clone(),
+                weight: 2_000 * avalanche_rs::staking::NANO_AVAX,
+                start_time: now.saturating_sub(60),
+                end_time: now + 3600,
+            },
+        );
+        validators.insert(
+            pending_node.clone(),
+            ValidatorInfo {
+                node_id: pending_node.clone(),
+                weight: 3_000 * avalanche_rs::staking::NANO_AVAX,
+                start_time: now + 600,
+                end_time: now + 7200,
+            },
+        );
+        validators.insert(
+            completed_node.clone(),
+            ValidatorInfo {
+                node_id: completed_node.clone(),
+                weight: 1_500 * avalanche_rs::staking::NANO_AVAX,
+                start_time: now.saturating_sub(7200),
+                end_time: now.saturating_sub(600),
+            },
+        );
+        let node = make_test_node_with_validators(
+            1,
+            validators,
+            [current_node.clone()].into_iter().collect(),
+        );
+
+        let current_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getCurrentValidators","params":{{"nodeIDs":["{}","{}"]}},"id":5}}"#,
+            current_node, pending_node
+        );
+        let current_response = handle_rpc_request(&current_req, &node).await;
+        let current_json: serde_json::Value = serde_json::from_str(&current_response).unwrap();
+        let current_validators = current_json["result"]["validators"].as_array().unwrap();
+        assert_eq!(current_validators.len(), 1);
+        assert_eq!(current_validators[0]["nodeID"], current_node);
+        assert_eq!(current_validators[0]["status"], "current");
+        assert_eq!(current_validators[0]["connected"], true);
+        assert_eq!(current_validators[0]["stakeAmount"], "2000000000000");
+
+        let pending_req =
+            r#"{"jsonrpc":"2.0","method":"platform.getPendingValidators","params":{},"id":6}"#;
+        let pending_response = handle_rpc_request(pending_req, &node).await;
+        let pending_json: serde_json::Value = serde_json::from_str(&pending_response).unwrap();
+        let pending_validators = pending_json["result"]["validators"].as_array().unwrap();
+        assert_eq!(pending_validators.len(), 1);
+        assert_eq!(pending_validators[0]["nodeID"], pending_node);
+        assert_eq!(pending_validators[0]["status"], "pending");
+        assert!(pending_json["result"]["delegators"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let validators_req =
+            r#"{"jsonrpc":"2.0","method":"platform.getValidators","params":{},"id":7}"#;
+        let validators_response = handle_rpc_request(validators_req, &node).await;
+        let validators_json: serde_json::Value =
+            serde_json::from_str(&validators_response).unwrap();
+        let validators = validators_json["result"]["validators"].as_array().unwrap();
+        assert_eq!(validators.len(), 3);
+        assert!(validators
+            .iter()
+            .any(|validator| validator["status"] == "completed"));
+
+        let validator_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getValidator","params":{{"nodeID":"{}"}},"id":8}}"#,
+            current_node
+        );
+        let validator_response = handle_rpc_request(&validator_req, &node).await;
+        let validator_json: serde_json::Value = serde_json::from_str(&validator_response).unwrap();
+        assert_eq!(validator_json["result"]["nodeID"], current_node);
+        assert_eq!(validator_json["result"]["weight"], "2000000000000");
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_height_and_min_stake_shapes() {
+        let node = make_test_node(1);
+        node.db.set_last_accepted_height(42).unwrap();
+
+        let height_req = r#"{"jsonrpc":"2.0","method":"platform.getHeight","params":{},"id":9}"#;
+        let height_response = handle_rpc_request(height_req, &node).await;
+        let height_json: serde_json::Value = serde_json::from_str(&height_response).unwrap();
+        assert_eq!(height_json["result"]["height"], "42");
+
+        let min_stake_req =
+            r#"{"jsonrpc":"2.0","method":"platform.getMinStake","params":{},"id":10}"#;
+        let min_stake_response = handle_rpc_request(min_stake_req, &node).await;
+        let min_stake_json: serde_json::Value = serde_json::from_str(&min_stake_response).unwrap();
+        assert_eq!(
+            min_stake_json["result"]["minValidatorStake"],
+            MIN_VALIDATOR_STAKE.to_string()
+        );
+        assert_eq!(
+            min_stake_json["result"]["minDelegatorStake"],
+            MIN_DELEGATOR_STAKE.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_block_supports_hex_and_json_encoding() {
+        let node = make_test_node(1);
+        let raw_block = make_banff_std([0x11; 32], 7);
+        let block_id = sha256_bytes(&raw_block);
+        node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+
+        let hex_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBlock","params":{{"blockID":"0x{}","encoding":"hex"}},"id":11}}"#,
+            hex::encode(block_id)
+        );
+        let hex_response = handle_rpc_request(&hex_req, &node).await;
+        let hex_json: serde_json::Value = serde_json::from_str(&hex_response).unwrap();
+        assert_eq!(hex_json["result"]["encoding"], "hex");
+        assert_eq!(
+            hex_json["result"]["block"],
+            format!("0x{}", hex::encode(&raw_block))
+        );
+
+        let json_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBlock","params":{{"blockID":"0x{}","encoding":"json"}},"id":12}}"#,
+            hex::encode(block_id)
+        );
+        let json_response = handle_rpc_request(&json_req, &node).await;
+        let json_value: serde_json::Value = serde_json::from_str(&json_response).unwrap();
+        assert_eq!(json_value["result"]["encoding"], "json");
+        assert_eq!(json_value["result"]["block"]["height"], "7");
+        assert_eq!(json_value["result"]["block"]["txCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_blockchain_status_and_stake_shapes() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+
+        let cchain_status_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBlockchainStatus","params":{{"blockchainID":"0x{}"}},"id":13}}"#,
+            hex::encode(platform_cchain_blockchain_id(node.config.network_id))
+        );
+        let cchain_status_response = handle_rpc_request(&cchain_status_req, &node).await;
+        let cchain_status_json: serde_json::Value =
+            serde_json::from_str(&cchain_status_response).unwrap();
+        assert_eq!(cchain_status_json["result"]["status"], "Created");
+
+        let unknown_status_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBlockchainStatus","params":{{"blockchainID":"0x{}"}},"id":14}}"#,
+            hex::encode([0x22; 32])
+        );
+        let unknown_status_response = handle_rpc_request(&unknown_status_req, &node).await;
+        let unknown_status_json: serde_json::Value =
+            serde_json::from_str(&unknown_status_response).unwrap();
+        assert_eq!(unknown_status_json["result"]["status"], "Unknown");
+
+        let stake_req = r#"{"jsonrpc":"2.0","method":"platform.getStake","params":{"addresses":["P-local1","P-local2"],"validatorsOnly":true,"encoding":"hex"},"id":15}"#;
+        let stake_response = handle_rpc_request(stake_req, &node).await;
+        let stake_json: serde_json::Value = serde_json::from_str(&stake_response).unwrap();
+        assert_eq!(stake_json["result"]["staked"], "0");
+        assert_eq!(stake_json["result"]["encoding"], "hex");
+        assert_eq!(stake_json["result"]["stakeds"][0], "0");
+        assert_eq!(stake_json["result"]["stakeds"][1], "0");
+        assert!(stake_json["result"]["stakedOutputs"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_info_endpoints_return_avalanchego_shapes() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+
+        let peer_id = NodeId([0x11; 20]);
+        let peer_id_str = full_node_id_string(&peer_id);
+        let mut peer = Peer::new(peer_id.clone(), "10.0.0.1:9651".parse().unwrap());
+        peer.state = PeerState::Connected;
+        peer.version = Some("avalanchego/1.14.1".to_string());
+        peer.reported_uptime = 9500;
+        node.peer_manager.write().await.add_peer(peer).unwrap();
+
+        let node_id_req = r#"{"jsonrpc":"2.0","method":"info.getNodeID","params":{},"id":16}"#;
+        let node_id_response = handle_rpc_request(node_id_req, &node).await;
+        let node_id_json: serde_json::Value = serde_json::from_str(&node_id_response).unwrap();
+        assert_eq!(
+            node_id_json["result"]["nodeID"],
+            full_node_id_string(&node.identity.node_id)
+        );
+        assert!(node_id_json["result"]["nodePOP"]["publicKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+        assert!(node_id_json["result"]["nodePOP"]["proofOfPossession"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+
+        let avax_node_id_req = r#"{"jsonrpc":"2.0","method":"avax_getNodeID","params":[],"id":17}"#;
+        let avax_node_id_response = handle_rpc_request(avax_node_id_req, &node).await;
+        let avax_node_id_json: serde_json::Value =
+            serde_json::from_str(&avax_node_id_response).unwrap();
+        assert_eq!(
+            avax_node_id_json["result"],
+            full_node_id_string(&node.identity.node_id)
+        );
+
+        let blockchain_id_req =
+            r#"{"jsonrpc":"2.0","method":"info.getBlockchainID","params":{"alias":"X"},"id":18}"#;
+        let blockchain_id_response = handle_rpc_request(blockchain_id_req, &node).await;
+        let blockchain_id_json: serde_json::Value =
+            serde_json::from_str(&blockchain_id_response).unwrap();
+        assert_eq!(
+            blockchain_id_json["result"]["blockchainID"],
+            cb58_encode_id(info_xchain_blockchain_id(node.config.network_id).unwrap())
+        );
+
+        let node_ip_req = r#"{"jsonrpc":"2.0","method":"info.getNodeIP","params":{},"id":19}"#;
+        let node_ip_response = handle_rpc_request(node_ip_req, &node).await;
+        let node_ip_json: serde_json::Value = serde_json::from_str(&node_ip_response).unwrap();
+        assert_eq!(node_ip_json["result"]["ip"], "0.0.0.0:9651");
+
+        let version_req = r#"{"jsonrpc":"2.0","method":"info.getNodeVersion","params":{},"id":20}"#;
+        let version_response = handle_rpc_request(version_req, &node).await;
+        let version_json: serde_json::Value = serde_json::from_str(&version_response).unwrap();
+        assert_eq!(version_json["result"]["rpcProtocolVersion"], "0");
+        assert_eq!(
+            version_json["result"]["vmVersions"]["platform"],
+            format!("avalanche-rs/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            version_json["result"]["vmVersions"]["evm"],
+            format!("avalanche-rs/{}", env!("CARGO_PKG_VERSION"))
+        );
+
+        let tx_fee_req = r#"{"jsonrpc":"2.0","method":"info.getTxFee","params":{},"id":21}"#;
+        let tx_fee_response = handle_rpc_request(tx_fee_req, &node).await;
+        let tx_fee_json: serde_json::Value = serde_json::from_str(&tx_fee_response).unwrap();
+        assert_eq!(tx_fee_json["result"]["createSubnetTxFee"], "1000000000");
+        assert_eq!(tx_fee_json["result"]["transformSubnetTxFee"], "10000000000");
+        assert_eq!(tx_fee_json["result"]["createBlockchainTxFee"], "1000000000");
+
+        let vms_req = r#"{"jsonrpc":"2.0","method":"info.getVMs","params":{},"id":22}"#;
+        let vms_response = handle_rpc_request(vms_req, &node).await;
+        let vms_json: serde_json::Value = serde_json::from_str(&vms_response).unwrap();
+        let platform_vm_id = cb58_encode_id(info_vm_id(b"platformvm"));
+        let evm_vm_id = cb58_encode_id(info_vm_id(b"evm"));
+        assert_eq!(vms_json["result"]["vms"][&platform_vm_id][0], "platform");
+        assert_eq!(vms_json["result"]["vms"][&evm_vm_id][0], "evm");
+
+        let uptime_req = r#"{"jsonrpc":"2.0","method":"info.uptime","params":{},"id":23}"#;
+        let uptime_response = handle_rpc_request(uptime_req, &node).await;
+        let uptime_json: serde_json::Value = serde_json::from_str(&uptime_response).unwrap();
+        assert_eq!(uptime_json["result"]["rewardingStakePercentage"], "0.0000");
+        assert_eq!(uptime_json["result"]["weightedAveragePercentage"], "0.0000");
+
+        let upgrades_req = r#"{"jsonrpc":"2.0","method":"info.upgrades","params":{},"id":24}"#;
+        let upgrades_response = handle_rpc_request(upgrades_req, &node).await;
+        let upgrades_json: serde_json::Value = serde_json::from_str(&upgrades_response).unwrap();
+        assert_eq!(
+            upgrades_json["result"]["fortunaTime"],
+            "2025-04-08T15:00:00Z"
+        );
+        assert_eq!(
+            upgrades_json["result"]["graniteEpochDuration"],
+            300_000_000_000u64
+        );
+
+        let bootstrapped_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"C"},"id":25}"#;
+        let bootstrapped_response = handle_rpc_request(bootstrapped_req, &node).await;
+        let bootstrapped_json: serde_json::Value =
+            serde_json::from_str(&bootstrapped_response).unwrap();
+        assert_eq!(bootstrapped_json["result"]["isBootstrapped"], true);
+
+        let peers_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"info.peers","params":{{"nodeIDs":["{}"]}},"id":26}}"#,
+            peer_id_str
+        );
+        let peers_response = handle_rpc_request(&peers_req, &node).await;
+        let peers_json: serde_json::Value = serde_json::from_str(&peers_response).unwrap();
+        let peers = peers_json["result"]["peers"].as_array().unwrap();
+        assert_eq!(peers_json["result"]["numPeers"], "1");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["nodeID"], peer_id_str);
+        assert_eq!(peers[0]["ip"], "10.0.0.1:9651");
+        assert_eq!(peers[0]["publicIP"], "10.0.0.1:9651");
+        assert_eq!(peers[0]["version"], "avalanchego/1.14.1");
+        assert_eq!(peers[0]["observedUptime"], "9500");
+        assert_eq!(
+            peers[0]["trackedSubnets"][0],
+            cb58_encode_id(platform_pchain_blockchain_id())
+        );
+        assert!(peers[0]["supportedACPs"].as_array().unwrap().is_empty());
+        assert!(peers[0]["objectedACPs"].as_array().unwrap().is_empty());
+        assert!(peers[0]["benched"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_info_network_specific_ids_and_fees_for_fuji() {
+        let node = make_test_node(5);
+
+        let cchain_req =
+            r#"{"jsonrpc":"2.0","method":"info.getBlockchainID","params":{"alias":"C"},"id":27}"#;
+        let cchain_response = handle_rpc_request(cchain_req, &node).await;
+        let cchain_json: serde_json::Value = serde_json::from_str(&cchain_response).unwrap();
+        assert_eq!(
+            cchain_json["result"]["blockchainID"],
+            cb58_encode_id(platform_cchain_blockchain_id(node.config.network_id))
+        );
+
+        let tx_fee_req = r#"{"jsonrpc":"2.0","method":"info.getTxFee","params":{},"id":28}"#;
+        let tx_fee_response = handle_rpc_request(tx_fee_req, &node).await;
+        let tx_fee_json: serde_json::Value = serde_json::from_str(&tx_fee_response).unwrap();
+        assert_eq!(tx_fee_json["result"]["createSubnetTxFee"], "100000000");
+        assert_eq!(tx_fee_json["result"]["transformSubnetTxFee"], "1000000000");
+        assert_eq!(tx_fee_json["result"]["createBlockchainTxFee"], "100000000");
+
+        let upgrades_req = r#"{"jsonrpc":"2.0","method":"info.upgrades","params":{},"id":29}"#;
+        let upgrades_response = handle_rpc_request(upgrades_req, &node).await;
+        let upgrades_json: serde_json::Value = serde_json::from_str(&upgrades_response).unwrap();
+        assert_eq!(
+            upgrades_json["result"]["fortunaTime"],
+            "2025-03-13T15:00:00Z"
+        );
+        assert_eq!(
+            upgrades_json["result"]["graniteTime"],
+            "2025-10-29T15:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_rpc_methods_and_tag_filtering() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        {
+            let mut c = node.c_chain_metrics.write().await;
+            c.tip_height = 34;
+            c.tip_hash = [0xCC; 32];
+        }
+
+        let mut peer = Peer::new(NodeId([0x42; 20]), "127.0.0.1:9651".parse().unwrap());
+        peer.state = PeerState::Connected;
+        peer.last_ping_sent = Some(Instant::now());
+        node.peer_manager.write().await.add_peer(peer).unwrap();
+
+        let health_req =
+            r#"{"jsonrpc":"2.0","method":"health.health","params":{"tags":["C"]},"id":30}"#;
+        let health_response = handle_rpc_request(health_req, &node).await;
+        let health_json: serde_json::Value = serde_json::from_str(&health_response).unwrap();
+        assert_eq!(health_json["result"]["healthy"], true);
+        let checks = health_json["result"]["checks"].as_object().unwrap();
+        assert!(checks.contains_key("bootstrapped"));
+        assert!(checks.contains_key("database"));
+        assert!(checks.contains_key("network"));
+        assert!(checks.contains_key("C"));
+        assert!(!checks.contains_key("P"));
+
+        let readiness_req = r#"{"jsonrpc":"2.0","method":"health.readiness","params":{},"id":31}"#;
+        let readiness_response = handle_rpc_request(readiness_req, &node).await;
+        let readiness_json: serde_json::Value = serde_json::from_str(&readiness_response).unwrap();
+        assert_eq!(readiness_json["result"]["healthy"], true);
+        let readiness_checks = readiness_json["result"]["checks"].as_object().unwrap();
+        assert_eq!(readiness_checks.len(), 1);
+        assert!(readiness_checks.contains_key("bootstrapped"));
+
+        let liveness_req = r#"{"jsonrpc":"2.0","method":"health.liveness","params":{},"id":32}"#;
+        let liveness_response = handle_rpc_request(liveness_req, &node).await;
+        let liveness_json: serde_json::Value = serde_json::from_str(&liveness_response).unwrap();
+        assert_eq!(liveness_json["result"]["healthy"], true);
+        assert!(liveness_json["result"]["checks"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_http_ext_health_status_codes_and_paths() {
+        let unhealthy_node = make_test_node(1);
+        let unhealthy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unhealthy_addr = unhealthy_listener.local_addr().unwrap();
+        let unhealthy_server = tokio::spawn(run_rpc_server_with_listener(
+            unhealthy_listener,
+            unhealthy_node.clone(),
+        ));
+
+        let unhealthy_response = http_get(unhealthy_addr, "/ext/health").await;
+        assert!(unhealthy_response.starts_with("HTTP/1.1 503"));
+        let unhealthy_body = unhealthy_response.split("\r\n\r\n").nth(1).unwrap();
+        let unhealthy_json: serde_json::Value = serde_json::from_str(unhealthy_body).unwrap();
+        assert_eq!(unhealthy_json["healthy"], false);
+        assert!(unhealthy_json["checks"].get("bootstrapped").is_some());
+
+        unhealthy_server.abort();
+        let _ = unhealthy_server.await;
+
+        let healthy_node = make_test_node(1);
+        healthy_node.sync_engine.mark_following().await;
+        healthy_node.p_chain_metrics.write().await.tip_height = 7;
+        healthy_node.c_chain_metrics.write().await.tip_height = 8;
+        let mut peer = Peer::new(NodeId([0x24; 20]), "127.0.0.1:9651".parse().unwrap());
+        peer.state = PeerState::Connected;
+        healthy_node
+            .peer_manager
+            .write()
+            .await
+            .add_peer(peer)
+            .unwrap();
+
+        let healthy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy_listener.local_addr().unwrap();
+        let healthy_server = tokio::spawn(run_rpc_server_with_listener(
+            healthy_listener,
+            healthy_node.clone(),
+        ));
+
+        let readiness_response = http_get(healthy_addr, "/ext/health/readiness").await;
+        assert!(readiness_response.starts_with("HTTP/1.1 200"));
+        let readiness_body = readiness_response.split("\r\n\r\n").nth(1).unwrap();
+        let readiness_json: serde_json::Value = serde_json::from_str(readiness_body).unwrap();
+        assert_eq!(readiness_json["healthy"], true);
+        assert_eq!(readiness_json["checks"].as_object().unwrap().len(), 1);
+
+        let filtered_health_response = http_get(healthy_addr, "/ext/health?tag=C").await;
+        assert!(filtered_health_response.starts_with("HTTP/1.1 200"));
+        let filtered_body = filtered_health_response.split("\r\n\r\n").nth(1).unwrap();
+        let filtered_json: serde_json::Value = serde_json::from_str(filtered_body).unwrap();
+        assert_eq!(filtered_json["healthy"], true);
+        let filtered_checks = filtered_json["checks"].as_object().unwrap();
+        assert!(filtered_checks.contains_key("C"));
+        assert!(!filtered_checks.contains_key("P"));
+
+        let liveness_response = http_get(healthy_addr, "/ext/health/liveness").await;
+        assert!(liveness_response.starts_with("HTTP/1.1 200"));
+        let liveness_body = liveness_response.split("\r\n\r\n").nth(1).unwrap();
+        let liveness_json: serde_json::Value = serde_json::from_str(liveness_body).unwrap();
+        assert_eq!(liveness_json["healthy"], true);
+        assert!(liveness_json["checks"].as_object().unwrap().is_empty());
+
+        healthy_server.abort();
+        let _ = healthy_server.await;
+    }
+
+    #[tokio::test]
+    async fn test_rpc_txpool_status_reflects_live_pool() {
+        let node = make_test_node(1);
+
+        node.txpool
+            .write()
+            .await
+            .add(make_pool_tx(0x11, 0), 0)
+            .expect("tx should be accepted");
+
+        let req = r#"{"jsonrpc":"2.0","method":"txpool_status","params":[],"id":7}"#;
+        let response = handle_rpc_request(req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed["result"]["pending"], "0x1");
+        assert_eq!(parsed["result"]["queued"], "0x0");
+    }
+
+    #[tokio::test]
+    async fn test_rpc_txpool_content_and_inspect_group_by_sender_and_nonce() {
+        let node = make_test_node(1);
+        let from = [0x22; 20];
+        let from_key = format!("0x{}", hex::encode(from));
+
+        node.txpool
+            .write()
+            .await
+            .add(make_pool_tx(0x22, 0), 0)
+            .expect("pending tx should be accepted");
+        node.txpool
+            .write()
+            .await
+            .add(make_pool_tx(0x22, 2), 0)
+            .expect("queued tx should be accepted");
+
+        let content_req = r#"{"jsonrpc":"2.0","method":"txpool_content","params":[],"id":8}"#;
+        let content = handle_rpc_request(content_req, &node).await;
+        let content_json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(
+            content_json["result"]["pending"][&from_key]["0x0"]["input"],
+            "0xdeadbeef"
+        );
+        assert_eq!(
+            content_json["result"]["queued"][&from_key]["0x2"]["gasPrice"],
+            "0x5d21dba00"
+        );
+
+        let inspect_req = r#"{"jsonrpc":"2.0","method":"txpool_inspect","params":[],"id":9}"#;
+        let inspect = handle_rpc_request(inspect_req, &node).await;
+        let inspect_json: serde_json::Value = serde_json::from_str(&inspect).unwrap();
+
+        assert!(inspect_json["result"]["pending"][&from_key]["0x0"]
+            .as_str()
+            .unwrap()
+            .contains("21000 gas"));
+        assert!(inspect_json["result"]["queued"][&from_key]["0x2"]
+            .as_str()
+            .unwrap()
+            .contains("42 wei"));
+    }
+
+    #[tokio::test]
+    async fn test_eth_send_raw_transaction_accepts_legacy_tx() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: [0x33; 20],
+            value: 7,
+            data: vec![0xAB, 0xCD],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let expected_hash = keccak_tx_hash(&signed.raw);
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":10}}"#,
+            signed.raw_hex()
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(
+            parsed["result"],
+            format!("0x{}", hex::encode(expected_hash))
+        );
+
+        let pool = node.txpool.read().await;
+        let pooled = pool
+            .get(&expected_hash)
+            .expect("tx should be stored in txpool");
+        assert_eq!(pooled.from, *wallet.address());
+        assert_eq!(pooled.nonce, 0);
+        assert_eq!(pooled.value, 7);
+    }
+
+    #[tokio::test]
+    async fn test_eth_send_raw_transaction_accepts_eip1559_tx() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::Eip1559Tx {
+            nonce: 0,
+            max_priority_fee_per_gas: 1_500_000_000,
+            max_fee_per_gas: 30_000_000_000,
+            gas_limit: 25_000,
+            to: [0x44; 20],
+            value: 9,
+            data: vec![0x01, 0x02, 0x03],
+            access_list: vec![],
+        };
+        let signed = wallet.sign_eip1559(&tx).expect("type-2 tx should sign");
+        let expected_hash = keccak_tx_hash(&signed.raw);
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":11}}"#,
+            signed.raw_hex()
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(
+            parsed["result"],
+            format!("0x{}", hex::encode(expected_hash))
+        );
+
+        let pool = node.txpool.read().await;
+        let pooled = pool
+            .get(&expected_hash)
+            .expect("tx should be stored in txpool");
+        assert_eq!(pooled.from, *wallet.address());
+        assert_eq!(pooled.max_fee_per_gas, 30_000_000_000);
+        assert_eq!(pooled.max_priority_fee_per_gas, 1_500_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_eth_send_raw_transaction_rejects_same_nonce_replacement() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        let first = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: [0x55; 20],
+            value: 1,
+            data: vec![],
+        };
+        let second = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 30_000_000_000,
+            gas_limit: 21_000,
+            to: [0x55; 20],
+            value: 2,
+            data: vec![],
+        };
+
+        let first_signed = wallet.sign_legacy(&first).expect("first tx should sign");
+        let second_signed = wallet.sign_legacy(&second).expect("second tx should sign");
+
+        let first_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":12}}"#,
+            first_signed.raw_hex()
+        );
+        let second_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":13}}"#,
+            second_signed.raw_hex()
+        );
+
+        let first_response = handle_rpc_request(&first_req, &node).await;
+        let first_json: serde_json::Value = serde_json::from_str(&first_response).unwrap();
+        assert!(first_json.get("result").is_some());
+
+        let second_response = handle_rpc_request(&second_req, &node).await;
+        let second_json: serde_json::Value = serde_json::from_str(&second_response).unwrap();
+        assert_eq!(
+            second_json["error"]["message"],
+            "replacement transaction not supported"
+        );
+
+        let pool = node.txpool.read().await;
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_eth_get_transaction_by_hash_returns_pending_txpool_tx() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: [0x77; 20],
+            value: 5,
+            data: vec![0xAA],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let expected_hash = keccak_tx_hash(&signed.raw);
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":15}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert_eq!(
+            submit_json["result"],
+            format!("0x{}", hex::encode(expected_hash))
+        );
+
+        let lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":16}}"#,
+            hex::encode(expected_hash)
+        );
+        let lookup_response = handle_rpc_request(&lookup_req, &node).await;
+        let lookup_json: serde_json::Value = serde_json::from_str(&lookup_response).unwrap();
+
+        assert_eq!(
+            lookup_json["result"]["from"],
+            format!("0x{}", hex::encode(wallet.address()))
+        );
+        assert_eq!(
+            lookup_json["result"]["blockNumber"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            lookup_json["result"]["transactionIndex"],
+            serde_json::Value::Null
+        );
+        assert_eq!(lookup_json["result"]["input"], "0xaa");
+    }
+
+    #[tokio::test]
+    async fn test_build_cchain_block_preserves_raw_signed_typed_transactions() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::Eip1559Tx {
+            nonce: 0,
+            max_priority_fee_per_gas: 1_500_000_000,
+            max_fee_per_gas: 30_000_000_000,
+            gas_limit: 21_000,
+            to: [0x66; 20],
+            value: 1,
+            data: vec![],
+            access_list: vec![],
+        };
+        let signed = wallet.sign_eip1559(&tx).expect("type-2 tx should sign");
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":14}}"#,
+            signed.raw_hex()
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(parsed.get("result").is_some());
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs)
+            .await
+            .expect("block should build");
+
+        let extracted = extract_cchain_transactions(&block.raw);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].tx_type, 2);
+        assert_eq!(extracted[0].gas_price, 30_000_000_000);
+        assert_eq!(extracted[0].max_priority_fee_per_gas, 1_500_000_000);
+        assert_eq!(extracted[0].recover_sender(), Some(*wallet.address()));
+    }
+
+    #[tokio::test]
+    async fn test_local_built_block_persists_tx_lookup_artifacts() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::Eip1559Tx {
+            nonce: 0,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 25_000_000_000,
+            gas_limit: 50_000,
+            to: [0x88; 20],
+            value: 3,
+            data: vec![0x01, 0x02],
+            access_list: vec![],
+        };
+        let signed = wallet.sign_eip1559(&tx).expect("tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":17}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs.clone())
+            .await
+            .expect("block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &block.raw).unwrap();
+        node.db.put_block(block.number, &block.raw).unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs).unwrap();
+        node.db.set_last_accepted_height(block.number).unwrap();
+        reconcile_mined_pool_transactions(&node, &pool_txs).await;
+
+        let tx_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":18}}"#,
+            hex::encode(tx_hash)
+        );
+        let tx_lookup_response = handle_rpc_request(&tx_lookup_req, &node).await;
+        let tx_lookup_json: serde_json::Value = serde_json::from_str(&tx_lookup_response).unwrap();
+        assert_eq!(tx_lookup_json["result"]["blockNumber"], "0x1");
+        assert_eq!(tx_lookup_json["result"]["transactionIndex"], "0x0");
+
+        let receipt_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":19}}"#,
+            hex::encode(tx_hash)
+        );
+        let receipt_response = handle_rpc_request(&receipt_req, &node).await;
+        let receipt_json: serde_json::Value = serde_json::from_str(&receipt_response).unwrap();
+        assert_eq!(receipt_json["result"]["blockNumber"], "0x1");
+        assert_eq!(
+            receipt_json["result"]["transactionHash"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+        assert_eq!(
+            receipt_json["result"]["from"],
+            format!("0x{}", hex::encode(wallet.address()))
+        );
+
+        let block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",true],"id":20}"#;
+        let block_response = handle_rpc_request(block_req, &node).await;
+        let block_json: serde_json::Value = serde_json::from_str(&block_response).unwrap();
+        assert_eq!(
+            block_json["result"]["hash"],
+            format!("0x{}", hex::encode(block.id))
+        );
+        assert_eq!(block_json["result"]["number"], "0x1");
+        assert_eq!(
+            block_json["result"]["gasUsed"],
+            format!("0x{:x}", block.gas_used)
+        );
+        assert_eq!(
+            block_json["result"]["transactions"][0]["hash"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+        assert_eq!(
+            block_json["result"]["transactions"][0]["blockHash"],
+            format!("0x{}", hex::encode(block.id))
+        );
+        assert_eq!(
+            block_json["result"]["transactions"][0]["transactionIndex"],
+            "0x0"
+        );
+
+        let block_hash_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBlockByHash","params":["0x{}",false],"id":20}}"#,
+            hex::encode(block.id)
+        );
+        let block_hash_response = handle_rpc_request(&block_hash_req, &node).await;
+        let block_hash_json: serde_json::Value =
+            serde_json::from_str(&block_hash_response).unwrap();
+        assert_eq!(
+            block_hash_json["result"]["transactions"][0],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_imported_cchain_block_persists_lookup_artifacts() {
+        let builder_node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::Eip1559Tx {
+            nonce: 0,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 25_000_000_000,
+            gas_limit: 50_000,
+            to: [0x99; 20],
+            value: 4,
+            data: vec![0xAA, 0xBB],
+            access_list: vec![],
+        };
+        let signed = wallet.sign_eip1559(&tx).expect("tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = builder_node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":21}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &builder_node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let pool_txs = {
+            let pool = builder_node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&builder_node, 1, pool_txs)
+            .await
+            .expect("block should build");
+
+        let importer_node = make_test_node(1);
+        execute_cchain_block_and_store(&block.raw, &importer_node).await;
+
+        let imported_block = importer_node
+            .db
+            .get_block(1)
+            .expect("db lookup should succeed");
+        assert!(imported_block.is_some(), "imported block should be stored");
+
+        let indexed_tx = importer_node
+            .db
+            .get_tx_index(&tx_hash)
+            .expect("tx index lookup should succeed");
+        assert!(
+            indexed_tx.is_some(),
+            "imported tx should be indexed under the raw transaction hash"
+        );
+
+        let tx_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":22}}"#,
+            hex::encode(tx_hash)
+        );
+        let tx_lookup_response = handle_rpc_request(&tx_lookup_req, &importer_node).await;
+        let tx_lookup_json: serde_json::Value = serde_json::from_str(&tx_lookup_response).unwrap();
+        assert_eq!(tx_lookup_json["result"]["blockNumber"], "0x1");
+        assert_eq!(tx_lookup_json["result"]["transactionIndex"], "0x0");
+        assert_eq!(
+            tx_lookup_json["result"]["blockHash"],
+            format!("0x{}", hex::encode(block.id))
+        );
+        assert_eq!(
+            tx_lookup_json["result"]["from"],
+            format!("0x{}", hex::encode(wallet.address()))
+        );
+
+        let receipt_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":23}}"#,
+            hex::encode(tx_hash)
+        );
+        let receipt_response = handle_rpc_request(&receipt_req, &importer_node).await;
+        let receipt_json: serde_json::Value = serde_json::from_str(&receipt_response).unwrap();
+        assert_eq!(receipt_json["result"]["blockNumber"], "0x1");
+        assert_eq!(
+            receipt_json["result"]["transactionHash"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+
+        let block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",true],"id":24}"#;
+        let block_response = handle_rpc_request(block_req, &importer_node).await;
+        let block_json: serde_json::Value = serde_json::from_str(&block_response).unwrap();
+        assert_eq!(
+            block_json["result"]["hash"],
+            format!("0x{}", hex::encode(block.id))
+        );
+        assert_eq!(
+            block_json["result"]["transactions"][0]["hash"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+        assert_eq!(
+            block_json["result"]["transactions"][0]["from"],
+            format!("0x{}", hex::encode(wallet.address()))
+        );
+        assert_eq!(
+            block_json["result"]["transactions"][0]["blockNumber"],
+            "0x1"
+        );
+
+        assert_eq!(importer_node.db.last_accepted_height().unwrap(), Some(1));
+        let imported_fields =
+            extract_cchain_block_fields(&block.raw).expect("imported block fields should parse");
+        let expected_next_base_fee =
+            predicted_next_base_fee_from_fields(importer_node.config.network_id, &imported_fields);
+        let pool = importer_node.txpool.read().await;
+        assert_eq!(pool.base_fee, expected_next_base_fee);
+    }
+
+    #[tokio::test]
+    async fn test_eth_get_logs_filters_persisted_receipts() {
+        let _guard = FILTER_TEST_GUARD.lock().unwrap();
+        FILTERS.write().await.clear();
+
+        let node = make_test_node(1);
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let address_match = [0xAA; 20];
+        let address_other = [0xBB; 20];
+        let topic_match = [0x11; 32];
+        let topic_other = [0x22; 32];
+        let block_hash = [0x44; 32];
+        let tx_hash0 = [0x55; 32];
+        let tx_hash1 = [0x66; 32];
+
+        store_test_receipt(
+            &node.db,
+            1,
+            0,
+            tx_hash0,
+            block_hash,
+            vec![
+                make_test_log(address_other, vec![topic_other], 1, tx_hash0, 0, block_hash),
+                make_test_log(
+                    address_match,
+                    vec![topic_match, topic_other],
+                    1,
+                    tx_hash0,
+                    0,
+                    block_hash,
+                ),
+            ],
+        );
+        store_test_receipt(
+            &node.db,
+            1,
+            1,
+            tx_hash1,
+            block_hash,
+            vec![make_test_log(
+                address_match,
+                vec![topic_match],
+                1,
+                tx_hash1,
+                1,
+                block_hash,
+            )],
+        );
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getLogs","params":[{{"fromBlock":"0x1","toBlock":"latest","address":"0x{}","topics":["0x{}"]}}],"id":25}}"#,
+            hex::encode(address_match),
+            hex::encode(topic_match)
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let logs = parsed["result"].as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(
+            logs[0]["transactionHash"],
+            format!("0x{}", hex::encode(tx_hash0))
+        );
+        assert_eq!(logs[0]["logIndex"], "0x1");
+        assert_eq!(
+            logs[1]["transactionHash"],
+            format!("0x{}", hex::encode(tx_hash1))
+        );
+        assert_eq!(logs[1]["logIndex"], "0x2");
+    }
+
+    #[tokio::test]
+    async fn test_eth_filter_changes_and_filter_logs() {
+        let _guard = FILTER_TEST_GUARD.lock().unwrap();
+        FILTERS.write().await.clear();
+
+        let node = make_test_node(1);
+        let address_match = [0xCC; 20];
+        let topic_match = [0x33; 32];
+        let block_hash1 = [0x77; 32];
+        let block_hash2 = [0x88; 32];
+        let tx_hash1 = [0x99; 32];
+        let tx_hash2 = [0xAA; 32];
+
+        store_test_receipt(
+            &node.db,
+            1,
+            0,
+            tx_hash1,
+            block_hash1,
+            vec![make_test_log(
+                address_match,
+                vec![topic_match],
+                1,
+                tx_hash1,
+                0,
+                block_hash1,
+            )],
+        );
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let new_filter_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_newFilter","params":[{{"fromBlock":"earliest","address":"0x{}","topics":["0x{}"]}}],"id":26}}"#,
+            hex::encode(address_match),
+            hex::encode(topic_match)
+        );
+        let new_filter_response = handle_rpc_request(&new_filter_req, &node).await;
+        let new_filter_json: serde_json::Value =
+            serde_json::from_str(&new_filter_response).unwrap();
+        let filter_id = new_filter_json["result"].as_str().unwrap().to_string();
+
+        let filter_logs_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterLogs","params":["{}"],"id":27}}"#,
+            filter_id
+        );
+        let filter_logs_response = handle_rpc_request(&filter_logs_req, &node).await;
+        let filter_logs_json: serde_json::Value =
+            serde_json::from_str(&filter_logs_response).unwrap();
+        assert_eq!(filter_logs_json["result"].as_array().unwrap().len(), 1);
+
+        let filter_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":28}}"#,
+            filter_id
+        );
+        let first_changes_response = handle_rpc_request(&filter_changes_req, &node).await;
+        let first_changes_json: serde_json::Value =
+            serde_json::from_str(&first_changes_response).unwrap();
+        assert_eq!(first_changes_json["result"].as_array().unwrap().len(), 1);
+
+        let second_changes_response = handle_rpc_request(&filter_changes_req, &node).await;
+        let second_changes_json: serde_json::Value =
+            serde_json::from_str(&second_changes_response).unwrap();
+        assert!(second_changes_json["result"].as_array().unwrap().is_empty());
+
+        store_test_receipt(
+            &node.db,
+            2,
+            0,
+            tx_hash2,
+            block_hash2,
+            vec![make_test_log(
+                address_match,
+                vec![topic_match],
+                2,
+                tx_hash2,
+                0,
+                block_hash2,
+            )],
+        );
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let third_changes_response = handle_rpc_request(&filter_changes_req, &node).await;
+        let third_changes_json: serde_json::Value =
+            serde_json::from_str(&third_changes_response).unwrap();
+        let third_logs = third_changes_json["result"].as_array().unwrap();
+        assert_eq!(third_logs.len(), 1);
+        assert_eq!(third_logs[0]["blockNumber"], "0x2");
+        assert_eq!(
+            third_logs[0]["transactionHash"],
+            format!("0x{}", hex::encode(tx_hash2))
+        );
+
+        let uninstall_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_uninstallFilter","params":["{}"],"id":29}}"#,
+            filter_id
+        );
+        let uninstall_response = handle_rpc_request(&uninstall_req, &node).await;
+        let uninstall_json: serde_json::Value = serde_json::from_str(&uninstall_response).unwrap();
+        assert_eq!(uninstall_json["result"], true);
+    }
+
+    #[tokio::test]
+    async fn test_websocket_subscribe_new_pending_transactions() {
+        let node = make_test_node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(run_rpc_server_with_listener(listener, node.clone()));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        websocket_handshake(&mut stream, "/ext/bc/C/ws").await;
+
+        let subscribe_req = r#"{"jsonrpc":"2.0","method":"eth_subscribe","params":["newPendingTransactions"],"id":30}"#;
+        write_masked_ws_text_frame(&mut stream, subscribe_req).await;
+        let subscribe_response = read_ws_text_frame(&mut stream).await;
+        let subscription_id = subscribe_response["result"]
+            .as_str()
+            .expect("subscription id");
+
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: [0xAB; 20],
+            value: 1,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = submit_raw_cchain_transaction(&node, &signed.raw)
+            .await
+            .expect("raw tx should be accepted");
+
+        let notification = read_ws_text_frame(&mut stream).await;
+        assert_eq!(notification["method"], "eth_subscription");
+        assert_eq!(notification["params"]["subscription"], subscription_id);
+        assert_eq!(
+            notification["params"]["result"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_websocket_subscribe_new_heads() {
+        let node = make_test_node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(run_rpc_server_with_listener(listener, node.clone()));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        websocket_handshake(&mut stream, "/ws").await;
+
+        let subscribe_req =
+            r#"{"jsonrpc":"2.0","method":"eth_subscribe","params":["newHeads"],"id":31}"#;
+        write_masked_ws_text_frame(&mut stream, subscribe_req).await;
+        let subscribe_response = read_ws_text_frame(&mut stream).await;
+        let subscription_id = subscribe_response["result"]
+            .as_str()
+            .expect("subscription id");
+
+        let block = build_cchain_block(&node, 1, vec![])
+            .await
+            .expect("empty block should build");
+        execute_cchain_block_and_store(&block.raw, &node).await;
+
+        let notification = read_ws_text_frame(&mut stream).await;
+        assert_eq!(notification["method"], "eth_subscription");
+        assert_eq!(notification["params"]["subscription"], subscription_id);
+        assert_eq!(notification["params"]["result"]["number"], "0x1");
+        assert_eq!(
+            notification["params"]["result"]["hash"],
+            format!("0x{}", hex::encode(block.id))
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_debug_trace_transaction_for_pending_tx() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let contract = [0x77; 20];
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 50_000,
+            to: contract,
+            value: 5,
+            data: vec![0xAA, 0xBB, 0xCC],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+            evm.set_account(
+                contract,
+                0,
+                1,
+                vec![0x60, 0x00, 0x35, 0x60, 0x00, 0x52, 0x00],
+            );
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":32}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let trace_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"debug_traceTransaction","params":["0x{}",{{"enableMemory":true}}],"id":33}}"#,
+            hex::encode(tx_hash)
+        );
+        let trace_response = handle_rpc_request(&trace_req, &node).await;
+        let trace_json: serde_json::Value = serde_json::from_str(&trace_response).unwrap();
+        assert_eq!(trace_json["result"]["failed"], false);
+        assert!(trace_json["result"]["gas"].as_u64().unwrap() > 0);
+        let logs = trace_json["result"]["structLogs"].as_array().unwrap();
+        assert_eq!(logs[0]["op"], "PUSH1");
+        assert_eq!(logs[1]["op"], "CALLDATALOAD");
+        assert!(logs.iter().any(|log| log["op"] == "MSTORE"));
+        assert!(logs.last().unwrap()["memory"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_debug_trace_transaction_for_pending_tx_uses_head_base_fee() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let contract = [0x79; 20];
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 50_000,
+            to: contract,
+            value: 0,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+            evm.set_account(contract, 0, 1, vec![0x00]);
+        }
+
+        let head_block = encode_cchain_block_rlp(
+            &[0u8; 32],
+            &[0u8; 20],
+            &[0u8; 32],
+            1,
+            DEFAULT_CCHAIN_GAS_LIMIT,
+            0,
+            unix_timestamp_secs(),
+            50_000_000_000,
+            &[],
+        );
+        node.db.put_block(1, &head_block).unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":34}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let trace_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"debug_traceTransaction","params":["0x{}"],"id":35}}"#,
+            hex::encode(tx_hash)
+        );
+        let trace_response = handle_rpc_request(&trace_req, &node).await;
+        let trace_json: serde_json::Value = serde_json::from_str(&trace_response).unwrap();
+        assert_eq!(trace_json["result"]["failed"], true);
+        assert_eq!(trace_json["result"]["structLogs"][0]["op"], "INVALID");
+        assert!(trace_json["result"]["structLogs"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("GasPriceLessThanBasefee"));
+    }
+
+    #[tokio::test]
+    async fn test_debug_trace_block_by_number_call_tracer() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::Eip1559Tx {
+            nonce: 0,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 25_000_000_000,
+            gas_limit: 50_000,
+            to: [0x88; 20],
+            value: 3,
+            data: vec![0x01, 0x02],
+            access_list: vec![],
+        };
+        let signed = wallet.sign_eip1559(&tx).expect("tx should sign");
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":34}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs.clone())
+            .await
+            .expect("block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &block.raw).unwrap();
+        node.db.put_block(block.number, &block.raw).unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs).unwrap();
+        node.db.set_last_accepted_height(block.number).unwrap();
+        reconcile_mined_pool_transactions(&node, &pool_txs).await;
+
+        let trace_req = r#"{"jsonrpc":"2.0","method":"debug_traceBlockByNumber","params":["0x1",{"tracer":"callTracer"}],"id":35}"#;
+        let trace_response = handle_rpc_request(trace_req, &node).await;
+        let trace_json: serde_json::Value = serde_json::from_str(&trace_response).unwrap();
+        let traces = trace_json["result"].as_array().unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["type"], "CALL");
+        assert_eq!(
+            traces[0]["from"],
+            format!("0x{}", hex::encode(wallet.address()))
+        );
+        assert!(traces[0]["gasUsed"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn test_eth_fee_history_uses_stored_block_data() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 26_000_000_000,
+            gas_limit: 30_000,
+            to: [0x52; 20],
+            value: 1,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":36}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs.clone())
+            .await
+            .expect("block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &block.raw).unwrap();
+        node.db.put_block(block.number, &block.raw).unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs).unwrap();
+        node.db.set_last_accepted_height(block.number).unwrap();
+        reconcile_mined_pool_transactions(&node, &pool_txs).await;
+
+        let req =
+            r#"{"jsonrpc":"2.0","method":"eth_feeHistory","params":["0x1","0x1",[10,90]],"id":37}"#;
+        let response = handle_rpc_request(req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["result"]["oldestBlock"], "0x1");
+        assert_eq!(parsed["result"]["baseFeePerGas"][0], "0x5d21dba00");
+        assert_eq!(
+            parsed["result"]["baseFeePerGas"].as_array().unwrap().len(),
+            2
+        );
+        assert!(parsed["result"]["gasUsedRatio"][0].as_f64().unwrap() > 0.0);
+        let rewards = parsed["result"]["reward"][0].as_array().unwrap();
+        assert_eq!(rewards.len(), 2);
+        assert_eq!(rewards[0], "0x3b9aca00");
+        assert_eq!(rewards[1], "0x3b9aca00");
+    }
+
+    #[tokio::test]
+    async fn test_eth_max_priority_fee_per_gas_uses_recent_block_tips() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 27_000_000_000,
+            gas_limit: 30_000,
+            to: [0x53; 20],
+            value: 1,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":38}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs.clone())
+            .await
+            .expect("block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &block.raw).unwrap();
+        node.db.put_block(block.number, &block.raw).unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs).unwrap();
+        node.db.set_last_accepted_height(block.number).unwrap();
+
+        let req = r#"{"jsonrpc":"2.0","method":"eth_maxPriorityFeePerGas","params":[],"id":39}"#;
+        let response = handle_rpc_request(req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["result"], "0x77359400");
+    }
+
+    #[tokio::test]
+    async fn test_build_cchain_block_uses_predicted_base_fee_from_head() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 26_000_000_000,
+            gas_limit: 30_000,
+            to: [0x54; 20],
+            value: 1,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":40}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let first_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let first_block = build_cchain_block(&node, 1, first_pool_txs.clone())
+            .await
+            .expect("first block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&first_block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &first_block.raw).unwrap();
+        node.db
+            .put_block(first_block.number, &first_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &first_block, &first_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(first_block.number)
+            .unwrap();
+        refresh_txpool_base_fee(&node).await;
+
+        let first_fields =
+            extract_cchain_block_fields(&first_block.raw).expect("first block fields should parse");
+        let expected_next_base_fee =
+            predicted_next_base_fee_from_fields(node.config.network_id, &first_fields);
+
+        let second_block = build_cchain_block(&node, 2, vec![])
+            .await
+            .expect("second block should build");
+        let second_fields = extract_cchain_block_fields(&second_block.raw)
+            .expect("second block fields should parse");
+
+        assert_eq!(second_fields.base_fee, expected_next_base_fee);
+    }
+
+    #[tokio::test]
+    async fn test_eth_create_access_list_tracks_storage_slots() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let contract = [0x91; 20];
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+            evm.set_account(contract, 0, 1, vec![0x60, 0x00, 0x54, 0x50, 0x00]);
+        }
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_createAccessList","params":[{{"from":"{}","to":"0x{}"}}],"id":38}}"#,
+            wallet.address_hex(),
+            hex::encode(contract)
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let access_list = parsed["result"]["accessList"].as_array().unwrap();
+        assert_eq!(access_list.len(), 1);
+        assert_eq!(
+            access_list[0]["address"],
+            format!("0x{}", hex::encode(contract))
+        );
+        let storage_keys = access_list[0]["storageKeys"].as_array().unwrap();
+        assert_eq!(storage_keys.len(), 1);
+        assert_eq!(storage_keys[0], format!("0x{}", hex::encode([0u8; 32])));
+        assert!(
+            parse_hex_u64_str(parsed["result"]["gasUsed"].as_str().expect("gasUsed hex"),).unwrap()
+                > 0
+        );
     }
 
     #[tokio::test]
@@ -4651,11 +9255,13 @@ mod integration_tests {
             p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
-            pending_txs: Arc::new(RwLock::new(Vec::new())),
+            txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
+            ws_subscriptions: Arc::new(RwLock::new(SubscriptionManager::new(1024))),
+            ws_connections: Arc::new(RwLock::new(StdHashMap::new())),
             #[cfg(feature = "indexer")]
             indexer: None,
         });
@@ -4797,11 +9403,13 @@ mod integration_tests {
             p_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
-            pending_txs: Arc::new(RwLock::new(Vec::new())),
+            txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
+            ws_subscriptions: Arc::new(RwLock::new(SubscriptionManager::new(1024))),
+            ws_connections: Arc::new(RwLock::new(StdHashMap::new())),
             #[cfg(feature = "indexer")]
             indexer: None,
         });

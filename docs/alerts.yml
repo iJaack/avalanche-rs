@@ -26,21 +26,6 @@ groups:
             Peer count is {{ $value }}, below the minimum threshold of 3.
             The node may be partitioned from the network.
 
-      - alert: HighDiskUsage
-        expr: |
-          (
-            (node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"})
-            / node_filesystem_size_bytes{mountpoint="/"}
-          ) * 100 > 90
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High disk usage"
-          description: >-
-            Disk usage is above 90% ({{ $value | printf "%.1f" }}%).
-            Consider pruning chain data or expanding storage.
-
       - alert: HighMemoryUsage
         expr: |
           (process_resident_memory_bytes / process_virtual_memory_max_bytes) * 100 > 80
@@ -65,15 +50,15 @@ groups:
           description: >-
             Indexer write errors increased in the last 5 minutes.
 
-      - alert: IndexerStalled
-        expr: increase(indexer_blocks_indexed_total[15m]) == 0 and indexer_lag_blocks > 0
-        for: 15m
+      - alert: IndexerLagGrowing
+        expr: indexer_lag_blocks > 5000 and increase(indexer_lag_blocks[10m]) > 0
+        for: 10m
         labels:
-          severity: critical
+          severity: warning
         annotations:
-          summary: "Indexer stalled while behind"
+          summary: "Indexer lag is high and increasing"
           description: >-
-            No new blocks were indexed for 15 minutes while indexer lag remains non-zero.
+            Indexer lag exceeded 5000 blocks and continued to grow for 10 minutes.
 
       - alert: IndexerQueueBackpressure
         expr: indexer_queue_depth > 500
@@ -84,3 +69,13 @@ groups:
           summary: "Indexer queue depth elevated"
           description: >-
             Indexer queue depth has remained above 500 for 10 minutes.
+
+      - alert: IndexerStalled
+        expr: increase(indexer_blocks_indexed_total[15m]) == 0 and indexer_lag_blocks > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer stalled while behind"
+          description: >-
+            No new blocks were indexed for 15 minutes while indexer lag remains non-zero.

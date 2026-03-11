@@ -3,11 +3,11 @@ global:
   evaluation_interval: 15s
 
 rule_files:
-  - "alerts.yml"
+  - "/etc/prometheus/alerts.yml"
 
 scrape_configs:
-  - job_name: 'avalanche-rs'
+  - job_name: 'avalanche-indexer'
     static_configs:
-      - targets: ['localhost:9650']
+      - targets: ['avalanche-indexer:8080']
     metrics_path: '/metrics'
     scrape_interval: 15s

@@ -49,16 +49,103 @@ services:
     profiles: ["indexer"]
     container_name: avalanche-indexer-db
     environment:
-      POSTGRES_DB: avalanche_indexer
-      POSTGRES_USER: indexer
-      POSTGRES_PASSWORD: indexer_pass
+      POSTGRES_DB: ${POSTGRES_DB:-avalanche_indexer}
+      POSTGRES_USER: ${POSTGRES_USER:-indexer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-indexer_pass}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     command: postgres -c shared_preload_libraries=timescaledb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-indexer} -d ${POSTGRES_DB:-avalanche_indexer}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  avalanche-indexer:
+    build:
+      context: .
+      args:
+        AVALANCHE_FEATURES: "full,indexer"
+    profiles: ["indexer"]
+    container_name: avalanche-indexer
+    depends_on:
+      indexer-db:
+        condition: service_healthy
+    environment:
+      INDEXER_ENABLED: ${INDEXER_ENABLED:-true}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-indexer}:${POSTGRES_PASSWORD:-indexer_pass}@indexer-db:5432/${POSTGRES_DB:-avalanche_indexer}}
+      AVAX_NETWORK_ID: ${AVAX_NETWORK_ID:-5}
+      AVAX_LOG_LEVEL: ${AVAX_LOG_LEVEL:-info}
+      AVAX_LOG_FORMAT: ${AVAX_LOG_FORMAT:-json}
+      AVAX_HTTP_PORT: ${AVAX_HTTP_PORT:-9650}
+      AVAX_STAKING_PORT: ${AVAX_STAKING_PORT:-9651}
+    ports:
+      - "${AVAX_HTTP_PORT:-9650}:${AVAX_HTTP_PORT:-9650}"
+      - "${AVAX_STAKING_PORT:-9651}:${AVAX_STAKING_PORT:-9651}"
+      - "${INDEXER_API_PORT:-8080}:8080"
+    volumes:
+      - indexer-data:/data/avalanche-rs
+    command:
+      - "--network-id=${AVAX_NETWORK_ID:-5}"
+      - "--data-dir=/data/avalanche-rs"
+      - "--http-port=${AVAX_HTTP_PORT:-9650}"
+      - "--staking-port=${AVAX_STAKING_PORT:-9651}"
+      - "--log-level=${AVAX_LOG_LEVEL:-info}"
+      - "--log-format=${AVAX_LOG_FORMAT:-json}"
+      - "--database-url=${DATABASE_URL:-postgres://${POSTGRES_USER:-indexer}:${POSTGRES_PASSWORD:-indexer_pass}@indexer-db:5432/${POSTGRES_DB:-avalanche_indexer}}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+
+  prometheus:
+    image: prom/prometheus:v2.53.4
+    profiles: ["indexer"]
+    container_name: avalanche-indexer-prometheus
+    depends_on:
+      avalanche-indexer:
+        condition: service_started
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docs/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    profiles: ["indexer"]
+    container_name: avalanche-indexer-grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docs/grafana/dashboard.json:/var/lib/grafana/dashboards/indexer-dashboard.json:ro
+    restart: unless-stopped
 
 volumes:
   fuji-data:
   mainnet-data:
+  indexer-data:
   postgres_data:
+  prometheus-data:
+  grafana-data:

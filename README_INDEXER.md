@@ -2,6 +2,9 @@
 
 The indexer is an optional module that indexes all blocks, transactions, and logs into PostgreSQL with TimescaleDB for efficient time-series queries. It runs alongside the node and exposes a REST API for analytics workloads.
 
+> Operator deployment path: use [`docs/indexer-deploy.md`](docs/indexer-deploy.md).
+> This document focuses on feature behavior, API usage, and local/manual workflows.
+
 ## Why Use the Indexer?
 
 - **Separate analytics workload**: REST API queries don't compete with JSON-RPC traffic
@@ -71,13 +74,7 @@ The node will:
 
 ### Production Deployment
 
-```bash
-./target/release/avalanche-rs \
-  --network-id 1 \
-  --indexer-enabled \
-  --database-url "postgres://indexer:production_password@db.internal:5432/avalanche_indexer" \
-  --log-level info
-```
+Use the compose-based operator runbook in [`docs/indexer-deploy.md`](docs/indexer-deploy.md).
 
 ## REST API Endpoints
 
@@ -226,7 +223,7 @@ The indexer runs in the background and doesn't block the main node. If PostgreSQ
 
 ## Next Steps
 
-- **Deployment**: Docker Compose template with PostgreSQL + pgAdmin
+- **Deployment**: Operator path in [`docs/indexer-deploy.md`](docs/indexer-deploy.md)
 - **Monitoring**: Prometheus metrics and operator runbook in [`docs/indexer-observability-runbook.md`](docs/indexer-observability-runbook.md)
 - **Caching**: Redis layer for hot queries
 - **GraphQL**: High-level query interface built on REST API

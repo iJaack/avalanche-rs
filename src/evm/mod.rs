@@ -8,11 +8,14 @@
 
 use revm::{
     db::CacheDB,
+    inspector_handle_register,
     primitives::{
-        AccountInfo, Address, Bytecode, Bytes, ExecutionResult, Output, TxKind, KECCAK_EMPTY, U256,
+        AccessListItem, AccountInfo, Address, Bytecode, Bytes, ExecutionResult, Output, TxKind,
+        B256, KECCAK_EMPTY, U256,
     },
-    Evm,
+    Database, Evm, EvmContext, Inspector, JournalEntry,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -88,6 +91,112 @@ pub struct BlockResult {
     pub state_root: [u8; 32],
 }
 
+/// Result of `eth_createAccessList` style access list generation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccessListResult {
+    #[serde(rename = "accessList")]
+    pub access_list: Vec<crate::tx::AccessListEntry>,
+    #[serde(rename = "gasUsed")]
+    pub gas_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AccessListInspector {
+    accesses: BTreeMap<[u8; 20], BTreeSet<[u8; 32]>>,
+}
+
+impl AccessListInspector {
+    fn record_account(&mut self, address: Address) {
+        let mut raw = [0u8; 20];
+        raw.copy_from_slice(address.as_slice());
+        self.accesses.entry(raw).or_default();
+    }
+
+    fn record_storage(&mut self, address: Address, key: U256) {
+        let mut raw = [0u8; 20];
+        raw.copy_from_slice(address.as_slice());
+        self.accesses
+            .entry(raw)
+            .or_default()
+            .insert(key.to_be_bytes::<32>());
+    }
+
+    fn collect<DB: Database>(&mut self, context: &EvmContext<DB>) {
+        for journal in &context.journaled_state.journal {
+            for entry in journal {
+                match entry {
+                    JournalEntry::AccountWarmed { address } => self.record_account(*address),
+                    JournalEntry::StorageWarmed { address, key } => {
+                        self.record_storage(*address, *key)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn into_access_list(self) -> Vec<crate::tx::AccessListEntry> {
+        self.accesses
+            .into_iter()
+            .map(|(address, storage_keys)| crate::tx::AccessListEntry {
+                address,
+                storage_keys: storage_keys.into_iter().collect(),
+            })
+            .collect()
+    }
+}
+
+impl<DB: Database> Inspector<DB> for AccessListInspector {
+    fn step_end(
+        &mut self,
+        _interp: &mut revm::interpreter::Interpreter,
+        context: &mut EvmContext<DB>,
+    ) {
+        self.collect(context);
+    }
+
+    fn log(
+        &mut self,
+        _interp: &mut revm::interpreter::Interpreter,
+        context: &mut EvmContext<DB>,
+        _log: &revm::primitives::Log,
+    ) {
+        self.collect(context);
+    }
+
+    fn call_end(
+        &mut self,
+        context: &mut EvmContext<DB>,
+        _inputs: &revm::interpreter::CallInputs,
+        outcome: revm::interpreter::CallOutcome,
+    ) -> revm::interpreter::CallOutcome {
+        self.collect(context);
+        outcome
+    }
+
+    fn create_end(
+        &mut self,
+        context: &mut EvmContext<DB>,
+        _inputs: &revm::interpreter::CreateInputs,
+        outcome: revm::interpreter::CreateOutcome,
+    ) -> revm::interpreter::CreateOutcome {
+        self.collect(context);
+        outcome
+    }
+
+    fn eofcreate_end(
+        &mut self,
+        context: &mut EvmContext<DB>,
+        _inputs: &revm::interpreter::EOFCreateInputs,
+        outcome: revm::interpreter::CreateOutcome,
+    ) -> revm::interpreter::CreateOutcome {
+        self.collect(context);
+        outcome
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EVM Executor
 // ---------------------------------------------------------------------------
@@ -106,6 +215,14 @@ impl EvmExecutor {
         Self {
             db: InMemoryDB::default(),
             chain_id,
+        }
+    }
+
+    /// Clone the executor state for read-only simulations such as tracing.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            chain_id: self.chain_id,
         }
     }
 
@@ -284,6 +401,194 @@ impl EvmExecutor {
             ExecutionResult::Revert { gas_used, .. } => Ok(gas_used),
             ExecutionResult::Halt { gas_used, .. } => Ok(gas_used),
         }
+    }
+
+    /// Generate an EIP-2930 access list for a transaction by tracing warmed
+    /// accounts and storage slots during execution.
+    pub fn create_access_list(
+        &self,
+        tx: &EvmTransaction,
+        block: &BlockContext,
+        initial_access_list: &[crate::tx::AccessListEntry],
+    ) -> Result<AccessListResult, EvmError> {
+        let mut db_clone = self.db.clone();
+        let tx_kind = match tx.to {
+            Some(addr) => TxKind::Call(Address::from(addr)),
+            None => TxKind::Create,
+        };
+
+        let chain_id = if block.chain_id == 0 {
+            self.chain_id
+        } else {
+            block.chain_id
+        };
+        let initial_revm_access_list = initial_access_list
+            .iter()
+            .map(|entry| AccessListItem {
+                address: Address::from(entry.address),
+                storage_keys: entry
+                    .storage_keys
+                    .iter()
+                    .map(|key| B256::from_slice(key))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut evm = Evm::builder()
+            .with_db(&mut db_clone)
+            .with_external_context(AccessListInspector::default())
+            .append_handler_register(inspector_handle_register)
+            .modify_cfg_env(|cfg| {
+                cfg.chain_id = chain_id;
+            })
+            .modify_block_env(|b| {
+                b.number = U256::from(block.number);
+                b.timestamp = U256::from(block.timestamp);
+                b.coinbase = Address::from(block.coinbase);
+                b.gas_limit = U256::from(block.gas_limit);
+                b.basefee = U256::from(block.base_fee);
+            })
+            .modify_tx_env(|t| {
+                t.caller = Address::from(tx.from);
+                t.transact_to = tx_kind;
+                t.value = U256::from(tx.value);
+                t.data = Bytes::from(tx.data.clone());
+                t.gas_limit = tx.gas_limit;
+                t.gas_price = U256::from(tx.gas_price);
+                t.nonce = Some(tx.nonce);
+                t.access_list = initial_revm_access_list;
+            })
+            .build();
+
+        let result = evm
+            .transact_commit()
+            .map_err(|e| EvmError::ExecutionFailed(format!("{:?}", e)))?;
+
+        let (gas_used, error) = match result {
+            ExecutionResult::Success { gas_used, .. } => (gas_used, None),
+            ExecutionResult::Revert { gas_used, .. } => {
+                (gas_used, Some("execution reverted".to_string()))
+            }
+            ExecutionResult::Halt { gas_used, reason } => (gas_used, Some(format!("{:?}", reason))),
+        };
+
+        let inspector = evm.into_context().external;
+        let mut merged = BTreeMap::<[u8; 20], BTreeSet<[u8; 32]>>::new();
+        for entry in initial_access_list {
+            merged
+                .entry(entry.address)
+                .or_default()
+                .extend(entry.storage_keys.iter().copied());
+        }
+        for entry in inspector.into_access_list() {
+            merged
+                .entry(entry.address)
+                .or_default()
+                .extend(entry.storage_keys);
+        }
+        let explicit_addresses = initial_access_list
+            .iter()
+            .map(|entry| entry.address)
+            .collect::<BTreeSet<_>>();
+        let mut always_warm = BTreeSet::new();
+        always_warm.insert(tx.from);
+        always_warm.insert(block.coinbase);
+        if let Some(to) = tx.to {
+            always_warm.insert(to);
+        }
+        for precompile in 1u8..=9 {
+            let mut address = [0u8; 20];
+            address[19] = precompile;
+            always_warm.insert(address);
+        }
+
+        Ok(AccessListResult {
+            access_list: merged
+                .into_iter()
+                .filter_map(|(address, storage_keys)| {
+                    if storage_keys.is_empty()
+                        && always_warm.contains(&address)
+                        && !explicit_addresses.contains(&address)
+                    {
+                        return None;
+                    }
+                    Some(crate::tx::AccessListEntry {
+                        address,
+                        storage_keys: storage_keys.into_iter().collect(),
+                    })
+                })
+                .collect(),
+            gas_used,
+            error,
+        })
+    }
+
+    /// Execute a transaction with a custom revm inspector attached.
+    pub fn inspect_tx<INSP>(
+        &mut self,
+        tx: &EvmTransaction,
+        block: &BlockContext,
+        inspector: INSP,
+    ) -> Result<(TxReceipt, INSP), EvmError>
+    where
+        INSP: for<'a> Inspector<&'a mut InMemoryDB>,
+    {
+        let tx_kind = match tx.to {
+            Some(addr) => TxKind::Call(Address::from(addr)),
+            None => TxKind::Create,
+        };
+
+        let chain_id = if block.chain_id == 0 {
+            self.chain_id
+        } else {
+            block.chain_id
+        };
+        let tx_caller = Address::from(tx.from);
+        let tx_value = U256::from(tx.value);
+        let tx_data = Bytes::from(tx.data.clone());
+        let tx_gas_limit = tx.gas_limit;
+        let tx_gas_price = U256::from(tx.gas_price);
+        let tx_nonce = tx.nonce;
+
+        let blk_number = block.number;
+        let blk_timestamp = U256::from(block.timestamp);
+        let blk_coinbase = Address::from(block.coinbase);
+        let blk_gas_limit = U256::from(block.gas_limit);
+        let blk_basefee = U256::from(block.base_fee);
+        let blk_difficulty = U256::from(block.difficulty);
+
+        let mut evm = Evm::builder()
+            .with_db(&mut self.db)
+            .with_external_context(inspector)
+            .append_handler_register(inspector_handle_register)
+            .modify_cfg_env(|cfg| {
+                cfg.chain_id = chain_id;
+            })
+            .modify_block_env(|b| {
+                b.number = U256::from(blk_number);
+                b.timestamp = blk_timestamp;
+                b.coinbase = blk_coinbase;
+                b.gas_limit = blk_gas_limit;
+                b.basefee = blk_basefee;
+                b.difficulty = blk_difficulty;
+            })
+            .modify_tx_env(|t| {
+                t.caller = tx_caller;
+                t.transact_to = tx_kind;
+                t.value = tx_value;
+                t.data = tx_data;
+                t.gas_limit = tx_gas_limit;
+                t.gas_price = tx_gas_price;
+                t.nonce = Some(tx_nonce);
+            })
+            .build();
+
+        let result = evm
+            .transact_commit()
+            .map_err(|e| EvmError::ExecutionFailed(format!("{:?}", e)))?;
+        let receipt = convert_result(result);
+        let inspector = evm.into_context().external;
+        Ok((receipt, inspector))
     }
 
     /// Execute a single transaction.
