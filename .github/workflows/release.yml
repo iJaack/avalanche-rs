@@ -17,6 +17,8 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace --all-features --locked
@@ -30,6 +32,8 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release
@@ -51,6 +55,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Install cross-compilation tools
@@ -81,6 +86,8 @@ jobs:
       - name: Install protoc
         run: brew install protobuf
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release
