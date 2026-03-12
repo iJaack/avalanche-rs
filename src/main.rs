@@ -20,6 +20,7 @@
 )]
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime};
 use alloy_primitives::U256;
 use bech32::{FromBase32, ToBase32};
 use clap::Parser;
+use lru::LruCache;
 use prost::Message as ProstMessage;
 use rand::{seq::SliceRandom, Rng};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -77,6 +79,7 @@ const MAX_PLATFORM_GET_STAKE_ADDRS: usize = 256;
 const MAX_PLATFORM_GET_UTXOS_ADDRS: usize = 1024;
 const PLATFORM_GET_UTXOS_MAX_PAGE_SIZE: usize = 1024;
 const PROPOSER_VM_RECENTLY_ACCEPTED_WINDOW_SECS: u64 = 30;
+const PLATFORM_TX_DROPPED_CACHE_SIZE: usize = 64;
 const PLATFORM_VM_ID: &str = "11111111111111111111111111111111LpoYY";
 const EVM_VM_ID: &str = "mgj786NP7uDwBCcq6YwThhaN8FLyybkCa4zBWTQbNgmK6k9A6";
 const AVAX_ASSET_ID_MAINNET: &str = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDGCgxN5Z";
@@ -616,10 +619,132 @@ struct AtomicTxMetadata {
     block_height: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PlatformTxMetadata {
-    status: String,
-    reason: Option<String>,
+#[derive(Debug, Clone)]
+struct PendingPlatformTx {
+    ledger: avalanche_rs::pchain::PlatformTxLedgerSummary,
+}
+
+type PlatformBaseInputKey = ([u8; 32], u32);
+type PlatformAtomicInputKey = ([u8; 32], [u8; 32], u32);
+
+#[derive(Debug)]
+struct PlatformTxPool {
+    processing: std::collections::BTreeMap<String, PendingPlatformTx>,
+    processing_inputs: std::collections::BTreeMap<PlatformBaseInputKey, String>,
+    processing_atomic_inputs: std::collections::BTreeMap<PlatformAtomicInputKey, String>,
+    dropped: LruCache<String, String>,
+}
+
+impl Default for PlatformTxPool {
+    fn default() -> Self {
+        Self::new(PLATFORM_TX_DROPPED_CACHE_SIZE)
+    }
+}
+
+impl PlatformTxPool {
+    fn new(dropped_cache_size: usize) -> Self {
+        let capacity = NonZeroUsize::new(dropped_cache_size.max(1)).unwrap();
+        Self {
+            processing: std::collections::BTreeMap::new(),
+            processing_inputs: std::collections::BTreeMap::new(),
+            processing_atomic_inputs: std::collections::BTreeMap::new(),
+            dropped: LruCache::new(capacity),
+        }
+    }
+
+    fn contains_processing(&self, tx_id: &str) -> bool {
+        self.processing.contains_key(tx_id)
+    }
+
+    fn processing_entries(&self) -> Vec<(String, avalanche_rs::pchain::PlatformTxLedgerSummary)> {
+        self.processing
+            .iter()
+            .map(|(tx_id, entry)| (tx_id.clone(), entry.ledger.clone()))
+            .collect()
+    }
+
+    fn drop_reason(&self, tx_id: &str) -> Option<String> {
+        self.dropped.peek(tx_id).cloned()
+    }
+
+    fn add_processing(
+        &mut self,
+        tx_id: &str,
+        ledger: avalanche_rs::pchain::PlatformTxLedgerSummary,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.drop_reason(tx_id) {
+            return Err(reason);
+        }
+
+        if self.contains_processing(tx_id) {
+            return Ok(());
+        }
+
+        for input in &ledger.inputs {
+            if let Some(existing_tx_id) = self
+                .processing_inputs
+                .get(&(input.tx_id, input.output_index))
+            {
+                return Err(format!("conflicts with processing tx {}", existing_tx_id));
+            }
+        }
+
+        if let Some(source_chain) = ledger.import_source_chain {
+            for input in &ledger.imported_inputs {
+                if let Some(existing_tx_id) = self.processing_atomic_inputs.get(&(
+                    source_chain,
+                    input.tx_id,
+                    input.output_index,
+                )) {
+                    return Err(format!("conflicts with processing tx {}", existing_tx_id));
+                }
+            }
+        }
+
+        for input in &ledger.inputs {
+            self.processing_inputs
+                .insert((input.tx_id, input.output_index), tx_id.to_string());
+        }
+
+        if let Some(source_chain) = ledger.import_source_chain {
+            for input in &ledger.imported_inputs {
+                self.processing_atomic_inputs.insert(
+                    (source_chain, input.tx_id, input.output_index),
+                    tx_id.to_string(),
+                );
+            }
+        }
+
+        self.processing
+            .insert(tx_id.to_string(), PendingPlatformTx { ledger });
+        Ok(())
+    }
+
+    fn remove_processing(&mut self, tx_id: &str) {
+        let Some(entry) = self.processing.remove(tx_id) else {
+            return;
+        };
+
+        for input in &entry.ledger.inputs {
+            self.processing_inputs
+                .remove(&(input.tx_id, input.output_index));
+        }
+
+        if let Some(source_chain) = entry.ledger.import_source_chain {
+            for input in &entry.ledger.imported_inputs {
+                self.processing_atomic_inputs.remove(&(
+                    source_chain,
+                    input.tx_id,
+                    input.output_index,
+                ));
+            }
+        }
+    }
+
+    fn mark_dropped(&mut self, tx_id: &str, reason: impl Into<String>) {
+        self.remove_processing(tx_id);
+        self.dropped.put(tx_id.to_string(), reason.into());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -665,6 +790,8 @@ struct NodeState {
     mev_engine: Arc<MevEngine>,
     /// Shared transaction pool for RPC submission and block building.
     txpool: Arc<RwLock<TransactionPool>>,
+    /// P-Chain mempool and recently dropped tx cache for Platform RPC lifecycle.
+    platform_tx_pool: Arc<RwLock<PlatformTxPool>>,
     /// Light client for headers-only mode
     light_client: Arc<RwLock<avalanche_rs::light::LightClient>>,
     /// Archive store for historical state queries
@@ -1008,6 +1135,7 @@ async fn main() {
     };
 
     let txpool = Arc::new(RwLock::new(TransactionPool::new(cli.txpool_size)));
+    let platform_tx_pool = Arc::new(RwLock::new(PlatformTxPool::default()));
     let ws_subscriptions = Arc::new(RwLock::new(SubscriptionManager::new(10_000)));
     let ws_connections = Arc::new(RwLock::new(StdHashMap::new()));
     let resolved_public_ip = Arc::new(RwLock::new(discover_public_ip(cli.staking_port)));
@@ -1028,6 +1156,7 @@ async fn main() {
         c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
         txpool,
+        platform_tx_pool,
         light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
         archive_store,
         subnet_tracker,
@@ -7019,14 +7148,6 @@ fn platform_encoding_param<'a>(params: &'a serde_json::Value, default: &'a str) 
         .unwrap_or(default)
 }
 
-fn platform_tx_storage_key(tx_id: &str) -> String {
-    format!("platform-tx:{tx_id}")
-}
-
-fn platform_tx_meta_key(tx_id: &str) -> String {
-    format!("platform-tx-meta:{tx_id}")
-}
-
 fn normalize_platform_tx_id(tx_id: &str) -> Option<String> {
     parse_platform_id_32(tx_id).map(cb58_encode_id)
 }
@@ -7035,6 +7156,44 @@ fn platform_tx_id_from_bytes(tx_bytes: &[u8]) -> String {
     let mut tx_hash = [0u8; 32];
     tx_hash.copy_from_slice(&Sha256::digest(tx_bytes));
     cb58_encode_id(tx_hash)
+}
+
+fn platform_tx_submission_ledger(
+    node: &NodeState,
+    tx_bytes: &[u8],
+    scan: &PlatformScanState,
+) -> Result<avalanche_rs::pchain::PlatformTxLedgerSummary, String> {
+    let tx_json = avalanche_rs::pchain::parse_platform_tx_json(tx_bytes)
+        .map_err(|err| format!("couldn't parse tx: {}", err))?;
+    let unsigned = tx_json
+        .get("unsignedTx")
+        .ok_or_else(|| "missing unsignedTx".to_string())?;
+    let network_id = unsigned
+        .get("networkID")
+        .and_then(platform_json_u64)
+        .ok_or_else(|| "missing networkID".to_string())?;
+    if network_id != u64::from(node.config.network_id) {
+        return Err(format!(
+            "tx networkID {} does not match node network {}",
+            network_id, node.config.network_id
+        ));
+    }
+
+    let blockchain_id = unsigned
+        .get("blockchainID")
+        .and_then(|value| value.as_str())
+        .and_then(parse_platform_id_32)
+        .ok_or_else(|| "invalid blockchainID".to_string())?;
+    if blockchain_id != platform_pchain_blockchain_id() {
+        return Err("tx blockchainID is not the P-Chain".to_string());
+    }
+
+    let ledger = avalanche_rs::pchain::summarize_platform_tx_ledger(tx_bytes)
+        .map_err(|err| format!("couldn't summarize tx: {}", err))?;
+    if !platform_tx_inputs_available(&ledger, scan) {
+        return Err("inputs unavailable in accepted state".to_string());
+    }
+    Ok(ledger)
 }
 
 fn platform_encode_blob(bytes: &[u8], encoding: &str) -> Result<String, String> {
@@ -7105,6 +7264,73 @@ struct PlatformScanState {
     reward_utxos: std::collections::BTreeMap<String, Vec<PlatformLedgerUtxo>>,
     accepted_atomic_txs: std::collections::BTreeMap<String, AcceptedAtomicTx>,
     current_supply_delta: u64,
+}
+
+fn platform_tx_inputs_available(
+    ledger: &avalanche_rs::pchain::PlatformTxLedgerSummary,
+    scan: &PlatformScanState,
+) -> bool {
+    if ledger
+        .inputs
+        .iter()
+        .any(|input| !scan.utxos.contains_key(&(input.tx_id, input.output_index)))
+    {
+        return false;
+    }
+
+    if let Some(source_chain) = ledger.import_source_chain {
+        let Some(atomic_utxos) = scan
+            .atomic_utxos
+            .get(&(source_chain, platform_pchain_blockchain_id()))
+        else {
+            return ledger.imported_inputs.is_empty();
+        };
+        if ledger
+            .imported_inputs
+            .iter()
+            .any(|input| !atomic_utxos.contains_key(&(input.tx_id, input.output_index)))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn reconcile_platform_tx_pool(node: &NodeState) {
+    let scan = scan_platform_chain_state(node);
+    let processing = {
+        let pool = node.platform_tx_pool.read().await;
+        pool.processing_entries()
+    };
+
+    if processing.is_empty() {
+        return;
+    }
+
+    let mut committed = Vec::new();
+    let mut dropped = Vec::new();
+    for (tx_id, ledger) in processing {
+        if find_committed_platform_tx_bytes(&node.db, &tx_id).is_some() {
+            committed.push(tx_id);
+            continue;
+        }
+        if !platform_tx_inputs_available(&ledger, &scan) {
+            dropped.push((tx_id, "inputs unavailable in accepted state".to_string()));
+        }
+    }
+
+    if committed.is_empty() && dropped.is_empty() {
+        return;
+    }
+
+    let mut pool = node.platform_tx_pool.write().await;
+    for tx_id in committed {
+        pool.remove_processing(&tx_id);
+    }
+    for (tx_id, reason) in dropped {
+        pool.mark_dropped(&tx_id, reason);
+    }
 }
 
 fn platform_input_id(tx_id: [u8; 32], output_index: u32) -> [u8; 32] {
@@ -8057,14 +8283,6 @@ fn avax_atomic_utxos_response(
         encoding,
         |addr, _| format_service_address(node.config.network_id, "C", addr),
     )
-}
-
-fn load_platform_tx_metadata(db: &Database, tx_id: &str) -> Option<PlatformTxMetadata> {
-    let key = platform_tx_meta_key(tx_id);
-    db.get_cf(CF_BLOCKS, key.as_bytes())
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
 fn platform_chain_status_from_phase(phase: &SyncPhase) -> &'static str {
@@ -10445,12 +10663,7 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                 return rpc_error(-32602, "invalid txID", id);
             };
 
-            let key = platform_tx_storage_key(&normalized_tx_id);
-            let tx_bytes = match node.db.get_cf(CF_BLOCKS, key.as_bytes()) {
-                Ok(Some(data)) => Some(data),
-                _ => find_committed_platform_tx_bytes(&node.db, &normalized_tx_id),
-            };
-            match tx_bytes {
+            match find_committed_platform_tx_bytes(&node.db, &normalized_tx_id) {
                 Some(data) => {
                     let response = if encoding.eq_ignore_ascii_case("hex") {
                         serde_json::json!({
@@ -10488,6 +10701,8 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                 return rpc_error(-32602, "invalid txID", id);
             };
 
+            reconcile_platform_tx_pool(node).await;
+
             if find_committed_platform_tx_bytes(&node.db, &normalized_tx_id).is_some() {
                 let response = serde_json::json!({
                     "status": "Committed",
@@ -10495,14 +10710,17 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                 return rpc_ok(&response.to_string(), id);
             }
 
-            let metadata = load_platform_tx_metadata(&node.db, &normalized_tx_id);
-            let mut response = serde_json::json!({
-                "status": metadata
-                    .as_ref()
-                    .map(|meta| meta.status.as_str())
-                    .unwrap_or("Unknown"),
-            });
-            if let Some(reason) = metadata.and_then(|meta| meta.reason) {
+            let pool = node.platform_tx_pool.read().await;
+            if pool.contains_processing(&normalized_tx_id) {
+                return rpc_ok(
+                    &serde_json::json!({ "status": "Processing" }).to_string(),
+                    id,
+                );
+            }
+
+            let mut response = serde_json::json!({ "status": "Unknown" });
+            if let Some(reason) = pool.drop_reason(&normalized_tx_id) {
+                response["status"] = serde_json::Value::String("Dropped".to_string());
                 response["reason"] = serde_json::Value::String(reason);
             }
             rpc_ok(&response.to_string(), id)
@@ -10518,26 +10736,33 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             }
             match parse_hex_bytes(tx_bytes_str) {
                 Some(tx_bytes) => {
-                    let tx_hash = {
-                        let mut hasher = Sha256::new();
-                        hasher.update(&tx_bytes);
-                        hasher.finalize()
-                    };
-                    let tx_hash: [u8; 32] = tx_hash.into();
-                    let tx_id = cb58_encode_id(tx_hash);
+                    let tx_id = platform_tx_id_from_bytes(&tx_bytes);
 
-                    let key = platform_tx_storage_key(&tx_id);
-                    let meta_key = platform_tx_meta_key(&tx_id);
-                    let metadata = PlatformTxMetadata {
-                        status: "Processing".to_string(),
-                        reason: None,
+                    reconcile_platform_tx_pool(node).await;
+
+                    if find_committed_platform_tx_bytes(&node.db, &tx_id).is_some() {
+                        return rpc_ok(&serde_json::json!({ "txID": tx_id }).to_string(), id);
+                    }
+
+                    let scan = scan_platform_chain_state(node);
+                    let ledger = match platform_tx_submission_ledger(node, &tx_bytes, &scan) {
+                        Ok(ledger) => ledger,
+                        Err(err) => {
+                            node.platform_tx_pool
+                                .write()
+                                .await
+                                .mark_dropped(&tx_id, err.clone());
+                            return rpc_error(-32000, &format!("couldn't issue tx: {}", err), id);
+                        }
                     };
-                    let _ = node.db.put_cf(CF_BLOCKS, key.as_bytes(), &tx_bytes);
-                    let _ = node.db.put_cf(
-                        CF_BLOCKS,
-                        meta_key.as_bytes(),
-                        &serde_json::to_vec(&metadata).unwrap_or_default(),
-                    );
+
+                    let insert = {
+                        let mut pool = node.platform_tx_pool.write().await;
+                        pool.add_processing(&tx_id, ledger)
+                    };
+                    if let Err(err) = insert {
+                        return rpc_error(-32000, &format!("couldn't issue tx: {}", err), id);
+                    }
                     rpc_ok(&serde_json::json!({ "txID": tx_id }).to_string(), id)
                 }
                 None => rpc_error(-32602, "invalid tx hex", id),
@@ -11413,6 +11638,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
@@ -11502,6 +11728,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
@@ -14435,9 +14662,9 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_platform_tx_lifecycle_uses_local_pending_store() {
+    async fn test_platform_tx_lifecycle_uses_processing_mempool_and_committed_lookup() {
         let node = make_test_node(1);
-        let tx_bytes = vec![0x00, 0x00, 0x00, 0x09, 0xDE, 0xAD, 0xBE, 0xEF];
+        let tx_bytes = make_signed_platform_base_tx_bytes();
 
         let issue_req = format!(
             r#"{{"jsonrpc":"2.0","method":"platform.issueTx","params":{{"tx":"0x{}","encoding":"hex"}},"id":29}}"#,
@@ -14463,11 +14690,8 @@ mod integration_tests {
         );
         let get_response = handle_rpc_request(&get_req, &node).await;
         let get_json: serde_json::Value = serde_json::from_str(&get_response).unwrap();
-        assert_eq!(get_json["result"]["encoding"], "hex");
-        assert_eq!(
-            get_json["result"]["tx"],
-            format!("0x{}", hex::encode(&tx_bytes))
-        );
+        assert_eq!(get_json["error"]["code"], -32000);
+        assert_eq!(get_json["error"]["message"], "transaction not found");
 
         let tx_hash = parse_cb58_id_32(&tx_id).unwrap();
         let hex_status_req = format!(
@@ -14499,16 +14723,33 @@ mod integration_tests {
             missing_get_json["error"]["message"],
             "transaction not found"
         );
+
+        let raw_block = make_banff_std_with_txs([0x44; 32], 12, std::slice::from_ref(&tx_bytes));
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&raw_block), &raw_block)
+            .unwrap();
+
+        let committed_status_response = handle_rpc_request(&status_req, &node).await;
+        let committed_status_json: serde_json::Value =
+            serde_json::from_str(&committed_status_response).unwrap();
+        assert_eq!(committed_status_json["result"]["status"], "Committed");
+
+        let committed_get_response = handle_rpc_request(&get_req, &node).await;
+        let committed_get_json: serde_json::Value =
+            serde_json::from_str(&committed_get_response).unwrap();
+        assert_eq!(committed_get_json["result"]["encoding"], "hex");
+        assert_eq!(
+            committed_get_json["result"]["tx"],
+            format!("0x{}", hex::encode(&tx_bytes))
+        );
     }
 
     #[tokio::test]
-    async fn test_platform_get_tx_supports_json_encoding_for_decodable_tx() {
+    async fn test_platform_issue_tx_marks_invalid_network_tx_as_dropped() {
         let node = make_test_node(1);
-        let tx_bytes = {
-            let mut bytes = make_signed_platform_base_tx_bytes();
-            bytes.truncate(bytes.len() - 4);
-            bytes
-        };
+        let mut tx_bytes = make_signed_platform_base_tx_bytes();
+        tx_bytes[6..10].copy_from_slice(&5u32.to_be_bytes());
+        let tx_id = cb58_encode_id(sha256_bytes(&tx_bytes));
 
         let issue_req = format!(
             r#"{{"jsonrpc":"2.0","method":"platform.issueTx","params":{{"tx":"0x{}","encoding":"hex"}},"id":35}}"#,
@@ -14516,33 +14757,31 @@ mod integration_tests {
         );
         let issue_response = handle_rpc_request(&issue_req, &node).await;
         let issue_json: serde_json::Value = serde_json::from_str(&issue_response).unwrap();
-        let tx_id = issue_json["result"]["txID"].as_str().unwrap().to_string();
+        assert_eq!(issue_json["error"]["code"], -32000);
+        assert_eq!(
+            issue_json["error"]["message"],
+            "couldn't issue tx: tx networkID 5 does not match node network 1"
+        );
 
-        let get_req = format!(
-            r#"{{"jsonrpc":"2.0","method":"platform.getTx","params":{{"txID":"{}","encoding":"json"}},"id":36}}"#,
+        let status_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getTxStatus","params":{{"txID":"{}"}},"id":36}}"#,
             tx_id
         );
-        let get_response = handle_rpc_request(&get_req, &node).await;
-        let get_json: serde_json::Value = serde_json::from_str(&get_response).unwrap();
-        assert_eq!(get_json["result"]["encoding"], "json");
-        assert_eq!(get_json["result"]["tx"]["unsignedTx"]["networkID"], 1);
+        let status_response = handle_rpc_request(&status_req, &node).await;
+        let status_json: serde_json::Value = serde_json::from_str(&status_response).unwrap();
+        assert_eq!(status_json["result"]["status"], "Dropped");
         assert_eq!(
-            get_json["result"]["tx"]["unsignedTx"]["blockchainID"],
-            "11111111111111111111111111111111LpoYY"
+            status_json["result"]["reason"],
+            "tx networkID 5 does not match node network 1"
         );
+
+        let reissue_response = handle_rpc_request(&issue_req, &node).await;
+        let reissue_json: serde_json::Value = serde_json::from_str(&reissue_response).unwrap();
+        assert_eq!(reissue_json["error"]["code"], -32000);
         assert_eq!(
-            get_json["result"]["tx"]["unsignedTx"]["outputs"],
-            serde_json::json!([])
+            reissue_json["error"]["message"],
+            "couldn't issue tx: tx networkID 5 does not match node network 1"
         );
-        assert_eq!(
-            get_json["result"]["tx"]["unsignedTx"]["inputs"],
-            serde_json::json!([])
-        );
-        assert_eq!(get_json["result"]["tx"]["unsignedTx"]["memo"], "0x");
-        assert!(get_json["result"]["tx"]["id"]
-            .as_str()
-            .unwrap()
-            .starts_with('2'));
     }
 
     #[tokio::test]
@@ -14572,6 +14811,102 @@ mod integration_tests {
         let status_response = handle_rpc_request(&status_req, &node).await;
         let status_json: serde_json::Value = serde_json::from_str(&status_response).unwrap();
         assert_eq!(status_json["result"]["status"], "Committed");
+    }
+
+    #[tokio::test]
+    async fn test_platform_issue_tx_rejects_conflicting_processing_inputs() {
+        let node = make_test_node(1);
+        let funding_output = make_platform_transferable_output_bytes([0x11; 32], 500, [0xAA; 20]);
+        let funding_tx = make_platform_base_tx_with_io(std::slice::from_ref(&funding_output), &[]);
+        let funding_tx_id = sha256_bytes(&funding_tx);
+        let funding_block =
+            make_banff_std_with_txs([0x21; 32], 1, std::slice::from_ref(&funding_tx));
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&funding_block), &funding_block)
+            .unwrap();
+
+        let shared_input =
+            make_platform_transferable_input_bytes(funding_tx_id, 0, [0x11; 32], 500);
+        let tx_a = make_platform_base_tx_with_io(&[], std::slice::from_ref(&shared_input));
+        let tx_b = make_platform_base_tx_with_io(
+            std::slice::from_ref(&make_platform_transferable_output_bytes(
+                [0x11; 32],
+                500,
+                [0xBB; 20],
+            )),
+            std::slice::from_ref(&shared_input),
+        );
+
+        let issue_a = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.issueTx","params":{{"tx":"0x{}","encoding":"hex"}},"id":39}}"#,
+            hex::encode(&tx_a)
+        );
+        let issue_a_response = handle_rpc_request(&issue_a, &node).await;
+        let issue_a_json: serde_json::Value = serde_json::from_str(&issue_a_response).unwrap();
+        assert!(issue_a_json["result"]["txID"].is_string());
+
+        let issue_b = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.issueTx","params":{{"tx":"0x{}","encoding":"hex"}},"id":40}}"#,
+            hex::encode(&tx_b)
+        );
+        let issue_b_response = handle_rpc_request(&issue_b, &node).await;
+        let issue_b_json: serde_json::Value = serde_json::from_str(&issue_b_response).unwrap();
+        assert_eq!(issue_b_json["error"]["code"], -32000);
+        assert!(issue_b_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicts with processing tx"));
+    }
+
+    #[tokio::test]
+    async fn test_platform_processing_tx_becomes_dropped_after_conflicting_commit() {
+        let node = make_test_node(1);
+        let funding_output = make_platform_transferable_output_bytes([0x22; 32], 700, [0xCC; 20]);
+        let funding_tx = make_platform_base_tx_with_io(std::slice::from_ref(&funding_output), &[]);
+        let funding_tx_id = sha256_bytes(&funding_tx);
+        let funding_block =
+            make_banff_std_with_txs([0x31; 32], 1, std::slice::from_ref(&funding_tx));
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&funding_block), &funding_block)
+            .unwrap();
+
+        let shared_input =
+            make_platform_transferable_input_bytes(funding_tx_id, 0, [0x22; 32], 700);
+        let pending_tx = make_platform_base_tx_with_io(&[], std::slice::from_ref(&shared_input));
+        let pending_tx_id = cb58_encode_id(sha256_bytes(&pending_tx));
+        let issue_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.issueTx","params":{{"tx":"0x{}","encoding":"hex"}},"id":41}}"#,
+            hex::encode(&pending_tx)
+        );
+        let issue_response = handle_rpc_request(&issue_req, &node).await;
+        let issue_json: serde_json::Value = serde_json::from_str(&issue_response).unwrap();
+        assert_eq!(issue_json["result"]["txID"], pending_tx_id);
+
+        let committed_spend = make_platform_base_tx_with_io(
+            std::slice::from_ref(&make_platform_transferable_output_bytes(
+                [0x22; 32],
+                700,
+                [0xDD; 20],
+            )),
+            std::slice::from_ref(&shared_input),
+        );
+        let spend_block =
+            make_banff_std_with_txs([0x32; 32], 2, std::slice::from_ref(&committed_spend));
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&spend_block), &spend_block)
+            .unwrap();
+
+        let status_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getTxStatus","params":{{"txID":"{}"}},"id":42}}"#,
+            pending_tx_id
+        );
+        let status_response = handle_rpc_request(&status_req, &node).await;
+        let status_json: serde_json::Value = serde_json::from_str(&status_response).unwrap();
+        assert_eq!(status_json["result"]["status"], "Dropped");
+        assert_eq!(
+            status_json["result"]["reason"],
+            "inputs unavailable in accepted state"
+        );
     }
 
     #[tokio::test]
@@ -17199,6 +17534,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
@@ -17352,6 +17688,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
