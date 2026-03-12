@@ -880,6 +880,31 @@ impl RpcClient {
         .await
     }
 
+    /// Get paginated atomic UTXOs importable into the C-chain from a source chain.
+    pub async fn avax_get_utxos(
+        &self,
+        addresses: &[&str],
+        source_chain: &str,
+        limit: Option<u32>,
+        start_index: Option<UtxoIndex>,
+        encoding: Option<&str>,
+    ) -> Result<UtxosResponse> {
+        let mut request = serde_json::Map::new();
+        request.insert("addresses".into(), json!(addresses));
+        request.insert("sourceChain".into(), json!(source_chain));
+        if let Some(limit) = limit {
+            request.insert("limit".into(), json!(limit));
+        }
+        if let Some(start_index) = start_index {
+            request.insert("startIndex".into(), json!(start_index));
+        }
+        if let Some(encoding) = encoding {
+            request.insert("encoding".into(), json!(encoding));
+        }
+        self.call_parsed("avax.getUTXOs", vec![Value::Object(request)])
+            .await
+    }
+
     /// Fetch an atomic transaction by txID.
     pub async fn avax_get_atomic_tx(
         &self,
@@ -1834,6 +1859,15 @@ mod tests {
                 "avax.issueTx" => json!({
                     "txID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA",
                 }),
+                "avax.getUTXOs" => json!({
+                    "numFetched": "1",
+                    "utxos": ["0xabcdef"],
+                    "endIndex": {
+                        "address": "C-local1",
+                        "utxo": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA"
+                    },
+                    "encoding": "hex",
+                }),
                 "avax.getAtomicTxStatus" => json!({
                     "status": "Processing",
                     "blockHeight": 7,
@@ -2032,6 +2066,23 @@ mod tests {
             .unwrap();
         assert!(issued.tx_id.starts_with('2'));
 
+        let atomic_utxos = client
+            .avax_get_utxos(
+                &["C-local1"],
+                "P",
+                Some(32),
+                Some(UtxoIndex {
+                    address: "C-local1".to_string(),
+                    utxo: "11111111111111111111111111111111LpoYY".to_string(),
+                }),
+                Some("hex"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(atomic_utxos.num_fetched, "1");
+        assert_eq!(atomic_utxos.utxos, vec!["0xabcdef"]);
+        assert_eq!(atomic_utxos.end_index.address, "C-local1");
+
         let status = client
             .avax_get_atomic_tx_status(&issued.tx_id)
             .await
@@ -2211,6 +2262,24 @@ mod tests {
         assert_eq!(
             issue_tx_call["params"],
             json!([{ "tx": "0xdeadbeef", "encoding": "hex" }])
+        );
+
+        let atomic_utxos_call = calls
+            .iter()
+            .find(|call| call["method"] == "avax.getUTXOs")
+            .unwrap();
+        assert_eq!(
+            atomic_utxos_call["params"],
+            json!([{
+                "addresses": ["C-local1"],
+                "sourceChain": "P",
+                "limit": 32,
+                "startIndex": {
+                    "address": "C-local1",
+                    "utxo": "11111111111111111111111111111111LpoYY"
+                },
+                "encoding": "hex"
+            }])
         );
     }
 
