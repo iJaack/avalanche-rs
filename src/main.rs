@@ -43,8 +43,8 @@ use tracing_subscriber::{reload, EnvFilter, Registry};
 
 use avalanche_rs::archive::ArchiveStore;
 use avalanche_rs::block::{
-    extract_cchain_block_fields, extract_cchain_transactions, parse_raw_cchain_transaction,
-    BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
+    extract_cchain_atomic_transactions, extract_cchain_block_fields, extract_cchain_transactions,
+    parse_raw_cchain_transaction, BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
 };
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
@@ -6490,13 +6490,17 @@ fn platform_network_hrp(network_id: u32) -> &'static str {
 }
 
 fn format_platform_address(network_id: u32, address: [u8; 20]) -> String {
+    format_service_address(network_id, "P", address)
+}
+
+fn format_service_address(network_id: u32, chain_alias: &str, address: [u8; 20]) -> String {
     let encoded = bech32::encode(
         platform_network_hrp(network_id),
         address.to_base32(),
         bech32::Variant::Bech32,
     )
     .unwrap_or_default();
-    format!("P-{encoded}")
+    format!("{chain_alias}-{encoded}")
 }
 
 fn platform_subnet_owner_strings(network_id: u32, owner: &PlatformOutputOwner) -> Vec<String> {
@@ -7056,6 +7060,12 @@ struct PlatformLedgerUtxo {
 }
 
 #[derive(Debug, Clone)]
+struct AcceptedAtomicTx {
+    raw_bytes: Vec<u8>,
+    block_height: u64,
+}
+
+#[derive(Debug, Clone)]
 struct PlatformOutputOwner {
     locktime: u64,
     threshold: u32,
@@ -7082,12 +7092,18 @@ struct PlatformStakerRewardInfo {
     shares: u32,
 }
 
+type PlatformLedgerUtxos = std::collections::BTreeMap<([u8; 32], u32), PlatformLedgerUtxo>;
+type PlatformAtomicRoute = ([u8; 32], [u8; 32]);
+type PlatformAtomicUtxos = std::collections::BTreeMap<PlatformAtomicRoute, PlatformLedgerUtxos>;
+
 #[derive(Debug, Default)]
 struct PlatformScanState {
     active_stakers:
         std::collections::BTreeMap<String, avalanche_rs::pchain::PlatformStakeTxSummary>,
-    utxos: std::collections::BTreeMap<([u8; 32], u32), PlatformLedgerUtxo>,
+    utxos: PlatformLedgerUtxos,
+    atomic_utxos: PlatformAtomicUtxos,
     reward_utxos: std::collections::BTreeMap<String, Vec<PlatformLedgerUtxo>>,
+    accepted_atomic_txs: std::collections::BTreeMap<String, AcceptedAtomicTx>,
     current_supply_delta: u64,
 }
 
@@ -7330,6 +7346,21 @@ fn platform_sorted_pchain_blocks(db: &Database) -> Vec<(BlockMetadata, Vec<u8>)>
     blocks
 }
 
+fn cchain_sorted_blocks(db: &Database) -> Vec<(u64, Vec<u8>)> {
+    let mut blocks = db
+        .iter_cf_owned(CF_BLOCKS)
+        .into_iter()
+        .filter_map(|(key, raw)| {
+            let height = <[u8; 8]>::try_from(key.as_slice())
+                .ok()
+                .map(u64::from_be_bytes)?;
+            Some((height, raw))
+        })
+        .collect::<Vec<_>>();
+    blocks.sort_by_key(|(height, _)| *height);
+    blocks
+}
+
 fn platform_proposal_decisions(
     blocks: &[(BlockMetadata, Vec<u8>)],
 ) -> std::collections::HashMap<[u8; 32], PlatformProposalDecision> {
@@ -7356,6 +7387,7 @@ fn scan_platform_chain_state(node: &NodeState) -> PlatformScanState {
     let chain_time = latest_pchain_block_metadata(&node.db)
         .map(|meta| meta.timestamp)
         .unwrap_or(0);
+    let p_chain_id = platform_pchain_blockchain_id();
     let mut state = PlatformScanState::default();
     let mut staker_ledger = std::collections::HashMap::<String, PlatformStakerLedger>::new();
     let mut staker_reward_info =
@@ -7375,22 +7407,49 @@ fn scan_platform_chain_state(node: &NodeState) -> PlatformScanState {
             }
 
             if let Ok(ledger) = avalanche_rs::pchain::summarize_platform_tx_ledger(&tx_bytes) {
+                let tx_id_bytes = parse_platform_id_32(&tx_id).unwrap_or([0u8; 32]);
+
                 for input in &ledger.inputs {
                     state.utxos.remove(&(input.tx_id, input.output_index));
                 }
 
                 for (index, output) in ledger.outputs.iter().cloned().enumerate() {
                     state.utxos.insert(
-                        (
-                            parse_platform_id_32(&tx_id).unwrap_or([0u8; 32]),
-                            index as u32,
-                        ),
+                        (tx_id_bytes, index as u32),
                         PlatformLedgerUtxo {
-                            tx_id: parse_platform_id_32(&tx_id).unwrap_or([0u8; 32]),
+                            tx_id: tx_id_bytes,
                             output_index: index as u32,
                             output,
                         },
                     );
+                }
+
+                if let Some(source_chain) = ledger.import_source_chain {
+                    if let Some(atomic_utxos) =
+                        state.atomic_utxos.get_mut(&(source_chain, p_chain_id))
+                    {
+                        for input in &ledger.imported_inputs {
+                            atomic_utxos.remove(&(input.tx_id, input.output_index));
+                        }
+                    }
+                }
+
+                if let Some(destination_chain) = ledger.export_destination_chain {
+                    let atomic_utxos = state
+                        .atomic_utxos
+                        .entry((p_chain_id, destination_chain))
+                        .or_default();
+                    for (offset, output) in ledger.exported_outputs.iter().cloned().enumerate() {
+                        let output_index = (ledger.outputs.len() + offset) as u32;
+                        atomic_utxos.insert(
+                            (tx_id_bytes, output_index),
+                            PlatformLedgerUtxo {
+                                tx_id: tx_id_bytes,
+                                output_index,
+                                output,
+                            },
+                        );
+                    }
                 }
 
                 if let Some(kind) = ledger.kind {
@@ -7554,6 +7613,71 @@ fn scan_platform_chain_state(node: &NodeState) -> PlatformScanState {
         }
     }
 
+    let c_chain_id = platform_cchain_blockchain_id(node.config.network_id);
+    let ap5_time = upgrade_time_unix(
+        &info_upgrades_result(node.config.network_id),
+        "apricotPhase5Time",
+    );
+    for (stored_height, raw_block) in cchain_sorted_blocks(&node.db) {
+        let Some(fields) = extract_cchain_block_fields(&raw_block) else {
+            continue;
+        };
+        let block_height = if fields.number == 0 {
+            stored_height
+        } else {
+            fields.number
+        };
+        let batch_encoded = fields.timestamp >= ap5_time;
+        let Ok(atomic_txs) = extract_cchain_atomic_transactions(&raw_block, batch_encoded) else {
+            continue;
+        };
+
+        for atomic_tx in atomic_txs {
+            let tx_id_str = cb58_encode_id(atomic_tx.tx_id);
+            state.accepted_atomic_txs.insert(
+                tx_id_str,
+                AcceptedAtomicTx {
+                    raw_bytes: atomic_tx.raw.clone(),
+                    block_height,
+                },
+            );
+
+            if let Some(source_chain) = atomic_tx.source_chain {
+                if let Some(atomic_utxos) = state.atomic_utxos.get_mut(&(source_chain, c_chain_id))
+                {
+                    for input in &atomic_tx.imported_inputs {
+                        atomic_utxos.remove(&(input.tx_id, input.output_index));
+                    }
+                }
+            }
+
+            if let Some(destination_chain) = atomic_tx.destination_chain {
+                let atomic_utxos = state
+                    .atomic_utxos
+                    .entry((c_chain_id, destination_chain))
+                    .or_default();
+                for (output_index, output) in atomic_tx.exported_outputs.into_iter().enumerate() {
+                    atomic_utxos.insert(
+                        (atomic_tx.tx_id, output_index as u32),
+                        PlatformLedgerUtxo {
+                            tx_id: atomic_tx.tx_id,
+                            output_index: output_index as u32,
+                            output: avalanche_rs::pchain::PlatformOwnedOutput {
+                                asset_id: output.asset_id,
+                                amount: output.amount,
+                                owner_locktime: output.owner_locktime,
+                                stakeable_locktime: output.stakeable_locktime,
+                                addresses: output.addresses,
+                                transferable_raw_bytes: output.transferable_raw_bytes,
+                                output_raw_bytes: output.output_raw_bytes,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     state
 }
 
@@ -7567,6 +7691,13 @@ fn find_committed_platform_tx_bytes(db: &Database, tx_id: &str) -> Option<Vec<u8
             txs.into_iter()
                 .find(|tx_bytes| platform_tx_id_from_bytes(tx_bytes) == tx_id)
         })
+}
+
+fn find_committed_atomic_tx(node: &NodeState, tx_id: &str) -> Option<AcceptedAtomicTx> {
+    scan_platform_chain_state(node)
+        .accepted_atomic_txs
+        .get(tx_id)
+        .cloned()
 }
 
 fn platform_block_transactions_json(raw_block: &[u8]) -> Option<Vec<serde_json::Value>> {
@@ -7759,6 +7890,30 @@ fn platform_native_utxos_response(
     encoding: &str,
 ) -> Result<serde_json::Value, String> {
     let scan = scan_platform_chain_state(node);
+    let utxos = scan.utxos.values().collect::<Vec<_>>();
+    platform_paginated_utxos_response(
+        utxos,
+        requested_addrs,
+        limit,
+        start_addr,
+        start_utxo,
+        encoding,
+        |_, canonical| canonical.to_string(),
+    )
+}
+
+fn platform_paginated_utxos_response<F>(
+    utxos: Vec<&PlatformLedgerUtxo>,
+    requested_addrs: &[(String, [u8; 20])],
+    limit: usize,
+    start_addr: Option<[u8; 20]>,
+    start_utxo: Option<[u8; 32]>,
+    encoding: &str,
+    format_end_address: F,
+) -> Result<serde_json::Value, String>
+where
+    F: Fn([u8; 20], &str) -> String,
+{
     let mut canonical_for_addr = std::collections::BTreeMap::<[u8; 20], String>::new();
     for (canonical, addr) in requested_addrs {
         canonical_for_addr
@@ -7770,7 +7925,7 @@ fn platform_native_utxos_response(
     sorted_addrs.sort();
 
     let mut per_addr = std::collections::BTreeMap::<[u8; 20], Vec<&PlatformLedgerUtxo>>::new();
-    for utxo in scan.utxos.values() {
+    for utxo in utxos {
         for addr in utxo.output.addresses.iter().copied() {
             if canonical_for_addr.contains_key(&addr) {
                 per_addr.entry(addr).or_default().push(utxo);
@@ -7816,7 +7971,13 @@ fn platform_native_utxos_response(
                 &utxo.output,
                 encoding,
             )?);
-            end_address = canonical_for_addr.get(&addr).cloned().unwrap_or_default();
+            end_address = format_end_address(
+                addr,
+                canonical_for_addr
+                    .get(&addr)
+                    .map(|value| value.as_str())
+                    .unwrap_or_default(),
+            );
             end_utxo = cb58_encode_id(utxo_id);
             if encoded_utxos.len() >= limit {
                 return Ok(serde_json::json!({
@@ -7841,6 +8002,61 @@ fn platform_native_utxos_response(
         },
         "encoding": encoding,
     }))
+}
+
+fn platform_atomic_utxos_response(
+    node: &NodeState,
+    source_chain_id: [u8; 32],
+    requested_addrs: &[(String, [u8; 20])],
+    limit: usize,
+    start_addr: Option<[u8; 20]>,
+    start_utxo: Option<[u8; 32]>,
+    encoding: &str,
+) -> Result<serde_json::Value, String> {
+    let scan = scan_platform_chain_state(node);
+    let utxos = scan
+        .atomic_utxos
+        .get(&(source_chain_id, platform_pchain_blockchain_id()))
+        .map(|utxos| utxos.values().collect::<Vec<_>>())
+        .unwrap_or_default();
+    platform_paginated_utxos_response(
+        utxos,
+        requested_addrs,
+        limit,
+        start_addr,
+        start_utxo,
+        encoding,
+        |_, canonical| canonical.to_string(),
+    )
+}
+
+fn avax_atomic_utxos_response(
+    node: &NodeState,
+    source_chain_id: [u8; 32],
+    requested_addrs: &[(String, [u8; 20])],
+    limit: usize,
+    start_addr: Option<[u8; 20]>,
+    start_utxo: Option<[u8; 32]>,
+    encoding: &str,
+) -> Result<serde_json::Value, String> {
+    let scan = scan_platform_chain_state(node);
+    let utxos = scan
+        .atomic_utxos
+        .get(&(
+            source_chain_id,
+            platform_cchain_blockchain_id(node.config.network_id),
+        ))
+        .map(|utxos| utxos.values().collect::<Vec<_>>())
+        .unwrap_or_default();
+    platform_paginated_utxos_response(
+        utxos,
+        requested_addrs,
+        limit,
+        start_addr,
+        start_utxo,
+        encoding,
+        |addr, _| format_service_address(node.config.network_id, "C", addr),
+    )
 }
 
 fn load_platform_tx_metadata(db: &Database, tx_id: &str) -> Option<PlatformTxMetadata> {
@@ -9774,15 +9990,15 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                 .or_else(|| params.get(1))
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            if !source_chain.is_empty() {
+            let source_chain_id = if source_chain.is_empty() {
+                platform_pchain_blockchain_id()
+            } else {
                 let Some(chain_id) = info_blockchain_alias_id(source_chain, node.config.network_id)
                 else {
                     return rpc_error(-32602, "invalid sourceChain", id);
                 };
-                if chain_id != platform_pchain_blockchain_id() {
-                    return rpc_error(-32000, "atomic UTXOs unsupported for source chain", id);
-                }
-            }
+                chain_id
+            };
 
             let limit = platform_params_object(params)
                 .and_then(|obj| obj.get("limit"))
@@ -9818,9 +10034,22 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
                 None => None,
             };
 
-            match platform_native_utxos_response(
-                node, &requested, limit, start_addr, start_utxo, encoding,
-            ) {
+            let response = if source_chain_id == platform_pchain_blockchain_id() {
+                platform_native_utxos_response(
+                    node, &requested, limit, start_addr, start_utxo, encoding,
+                )
+            } else {
+                platform_atomic_utxos_response(
+                    node,
+                    source_chain_id,
+                    &requested,
+                    limit,
+                    start_addr,
+                    start_utxo,
+                    encoding,
+                )
+            };
+            match response {
                 Ok(response) => rpc_ok(&response.to_string(), id),
                 Err(err) => rpc_error(-32602, &err, id),
             }
@@ -10531,6 +10760,103 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         }
 
         // -----------------------------------------------------------------
+        // avax.getUTXOs
+        // -----------------------------------------------------------------
+        "avax.getUTXOs" => {
+            let addresses = avax_params_object(params)
+                .and_then(|obj| obj.get("addresses"))
+                .or_else(|| params.get(0))
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if addresses.is_empty() {
+                return rpc_error(-32602, "no addresses provided", id);
+            }
+            if addresses.len() > MAX_PLATFORM_GET_UTXOS_ADDRS {
+                return rpc_error(
+                    -32602,
+                    &format!(
+                        "number of addresses given, {}, exceeds maximum, {}",
+                        addresses.len(),
+                        MAX_PLATFORM_GET_UTXOS_ADDRS
+                    ),
+                    id,
+                );
+            }
+
+            let mut requested = Vec::with_capacity(addresses.len());
+            for address in addresses {
+                let Some(address) = address.as_str() else {
+                    return rpc_error(-32602, "invalid address", id);
+                };
+                let Some(parsed) = parse_platform_address_20(address) else {
+                    return rpc_error(-32602, "invalid address", id);
+                };
+                requested.push((address.to_string(), parsed));
+            }
+
+            let Some(source_chain) = avax_params_object(params)
+                .and_then(|obj| obj.get("sourceChain"))
+                .or_else(|| params.get(1))
+                .and_then(|value| value.as_str())
+            else {
+                return rpc_error(-32602, "missing sourceChain", id);
+            };
+            let Some(source_chain_id) =
+                info_blockchain_alias_id(source_chain, node.config.network_id)
+            else {
+                return rpc_error(-32602, "invalid sourceChain", id);
+            };
+
+            let limit = avax_params_object(params)
+                .and_then(|obj| obj.get("limit"))
+                .or_else(|| params.get(2))
+                .and_then(parse_quantity_u64)
+                .map(|value| value as usize)
+                .filter(|value| *value > 0 && *value <= PLATFORM_GET_UTXOS_MAX_PAGE_SIZE)
+                .unwrap_or(PLATFORM_GET_UTXOS_MAX_PAGE_SIZE);
+            let encoding = avax_encoding_param(params, "hex");
+            let start_index = avax_params_object(params)
+                .and_then(|obj| obj.get("startIndex"))
+                .or_else(|| params.get(3));
+            let start_addr_value = start_index
+                .and_then(|value| value.get("address"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            let start_addr = match start_addr_value {
+                Some(value) => match parse_platform_address_20(value) {
+                    Some(addr) => Some(addr),
+                    None => return rpc_error(-32602, "couldn't parse start index address", id),
+                },
+                None => None,
+            };
+            let start_utxo_value = start_index
+                .and_then(|value| value.get("utxo"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            let start_utxo = match start_utxo_value {
+                Some(value) => match parse_platform_utxo_end_index(value) {
+                    Some(utxo) => Some(utxo),
+                    None => return rpc_error(-32602, "couldn't parse start index utxo", id),
+                },
+                None => None,
+            };
+
+            match avax_atomic_utxos_response(
+                node,
+                source_chain_id,
+                &requested,
+                limit,
+                start_addr,
+                start_utxo,
+                encoding,
+            ) {
+                Ok(response) => rpc_ok(&response.to_string(), id),
+                Err(err) => rpc_error(-32602, &err, id),
+            }
+        }
+
+        // -----------------------------------------------------------------
         // avax.getAtomicTx
         // -----------------------------------------------------------------
         "avax.getAtomicTx" | "avax_getAtomicTx" => {
@@ -10544,6 +10870,15 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             let Some(normalized_tx_id) = normalize_atomic_tx_id(tx_id_str) else {
                 return rpc_error(-32602, "invalid txID", id);
             };
+
+            if let Some(committed) = find_committed_atomic_tx(node, &normalized_tx_id) {
+                let response = serde_json::json!({
+                    "tx": format!("0x{}", hex::encode(&committed.raw_bytes)),
+                    "encoding": "hex",
+                    "blockHeight": committed.block_height,
+                });
+                return rpc_ok(&response.to_string(), id);
+            }
 
             let key = atomic_tx_storage_key(&normalized_tx_id);
             match node.db.get_cf(CF_BLOCKS, key.as_bytes()) {
@@ -10572,6 +10907,13 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             let Some(normalized_tx_id) = normalize_atomic_tx_id(tx_id_str) else {
                 return rpc_error(-32602, "invalid txID", id);
             };
+            if let Some(committed) = find_committed_atomic_tx(node, &normalized_tx_id) {
+                let response = serde_json::json!({
+                    "status": "Accepted",
+                    "blockHeight": committed.block_height,
+                });
+                return rpc_ok(&response.to_string(), id);
+            }
             let metadata = load_atomic_tx_metadata(&node.db, &normalized_tx_id);
             let mut response = serde_json::json!({
                 "status": metadata
@@ -11587,6 +11929,149 @@ mod integration_tests {
         let mut h = Sha256::new();
         h.update(data);
         h.finalize().into()
+    }
+
+    fn encode_rlp_u64_for_test(buf: &mut Vec<u8>, value: u64) {
+        if value == 0 {
+            buf.push(0x80);
+            return;
+        }
+        let bytes = value.to_be_bytes();
+        let start = bytes.iter().position(|&byte| byte != 0).unwrap_or(7);
+        let slice = &bytes[start..];
+        buf.push(0x80 + slice.len() as u8);
+        buf.extend_from_slice(slice);
+    }
+
+    fn rlp_list_for_test(payload: Vec<u8>) -> Vec<u8> {
+        let len = payload.len();
+        let mut encoded = Vec::new();
+        if len <= 55 {
+            encoded.push(0xc0 + len as u8);
+        } else {
+            let len_bytes = len.to_be_bytes();
+            let start = len_bytes.iter().position(|&byte| byte != 0).unwrap_or(7);
+            let slice = &len_bytes[start..];
+            encoded.push(0xf7 + slice.len() as u8);
+            encoded.extend_from_slice(slice);
+        }
+        encoded.extend_from_slice(&payload);
+        encoded
+    }
+
+    fn rlp_bytes_for_test(bytes: &[u8]) -> Vec<u8> {
+        if bytes.is_empty() {
+            return vec![0x80];
+        }
+        if bytes.len() == 1 && bytes[0] < 0x80 {
+            return vec![bytes[0]];
+        }
+
+        let mut encoded = Vec::new();
+        if bytes.len() <= 55 {
+            encoded.push(0x80 + bytes.len() as u8);
+        } else {
+            let len_bytes = bytes.len().to_be_bytes();
+            let start = len_bytes.iter().position(|&byte| byte != 0).unwrap_or(7);
+            let slice = &len_bytes[start..];
+            encoded.push(0xb7 + slice.len() as u8);
+            encoded.extend_from_slice(slice);
+        }
+        encoded.extend_from_slice(bytes);
+        encoded
+    }
+
+    fn make_cchain_atomic_export_tx_bytes(
+        network_id: u32,
+        destination_chain: [u8; 32],
+        exported_outputs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&network_id.to_be_bytes());
+        bytes.extend_from_slice(&platform_cchain_blockchain_id(network_id));
+        bytes.extend_from_slice(&destination_chain);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&(exported_outputs.len() as u32).to_be_bytes());
+        for output in exported_outputs {
+            bytes.extend_from_slice(output);
+        }
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes
+    }
+
+    fn make_cchain_atomic_import_tx_bytes(
+        network_id: u32,
+        source_chain: [u8; 32],
+        imported_inputs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&network_id.to_be_bytes());
+        bytes.extend_from_slice(&platform_cchain_blockchain_id(network_id));
+        bytes.extend_from_slice(&source_chain);
+        bytes.extend_from_slice(&(imported_inputs.len() as u32).to_be_bytes());
+        for input in imported_inputs {
+            bytes.extend_from_slice(input);
+        }
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes
+    }
+
+    fn make_cchain_atomic_batch_extdata(txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&(txs.len() as u32).to_be_bytes());
+        for tx in txs {
+            bytes.extend_from_slice(&tx[2..]);
+        }
+        bytes
+    }
+
+    fn make_cchain_coreth_block_with_extdata(
+        parent: [u8; 32],
+        number: u64,
+        timestamp: u64,
+        extdata: &[u8],
+    ) -> Vec<u8> {
+        let mut header_payload = Vec::new();
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&parent);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0x1d; 32]);
+        header_payload.push(0x94);
+        header_payload.extend_from_slice(&[0u8; 20]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xb9);
+        header_payload.push(0x01);
+        header_payload.push(0x00);
+        header_payload.extend_from_slice(&[0u8; 256]);
+        header_payload.push(0x80);
+        encode_rlp_u64_for_test(&mut header_payload, number);
+        encode_rlp_u64_for_test(&mut header_payload, 30_000_000);
+        header_payload.push(0x80);
+        encode_rlp_u64_for_test(&mut header_payload, timestamp);
+        header_payload.push(0x80);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]);
+        encode_rlp_u64_for_test(&mut header_payload, 25_000_000_000);
+
+        let mut outer_payload = Vec::new();
+        outer_payload.extend_from_slice(&rlp_list_for_test(header_payload));
+        outer_payload.push(0xc0); // txs = empty
+        outer_payload.push(0xc0); // uncles = empty
+        outer_payload.push(0x80); // version = 0
+        outer_payload.extend_from_slice(&rlp_bytes_for_test(extdata));
+        rlp_list_for_test(outer_payload)
     }
 
     fn append_platform_id_for_test(id: [u8; 32], suffix: u32) -> [u8; 32] {
@@ -14369,6 +14854,218 @@ mod integration_tests {
         let missing_status_json: serde_json::Value =
             serde_json::from_str(&missing_status_response).unwrap();
         assert_eq!(missing_status_json["result"]["status"], "Unknown");
+    }
+
+    #[tokio::test]
+    async fn test_avax_get_utxos_uses_committed_pchain_exports() {
+        let node = make_test_node(1);
+        let owner = [0x58; 20];
+        let asset_id = parse_platform_id_32(AVAX_ASSET_ID_MAINNET).unwrap();
+
+        let funding_tx = make_platform_base_tx_with_io(
+            &[make_platform_transferable_output_bytes(asset_id, 80, owner)],
+            &[],
+        );
+        let funding_tx_id = sha256_bytes(&funding_tx);
+        let export_tx = make_platform_export_tx_bytes_with_io(
+            &[],
+            &[make_platform_transferable_input_bytes(
+                funding_tx_id,
+                0,
+                asset_id,
+                80,
+            )],
+            platform_cchain_blockchain_id(node.config.network_id),
+            &[make_platform_transferable_output_bytes(asset_id, 70, owner)],
+        );
+        let export_tx_id = sha256_bytes(&export_tx);
+        let raw_block = make_banff_std_with_txs([0x93; 32], 24, &[funding_tx, export_tx.clone()]);
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&raw_block), &raw_block)
+            .unwrap();
+
+        let expected_output = avalanche_rs::pchain::summarize_platform_tx_ledger(&export_tx)
+            .unwrap()
+            .exported_outputs
+            .into_iter()
+            .next()
+            .unwrap();
+        let expected_utxo = platform_encode_utxo(export_tx_id, 0, &expected_output, "hex").unwrap();
+        let owner_addr = cb58_encode(&owner);
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"avax.getUTXOs","params":{{"addresses":["{}"],"sourceChain":"P","limit":"0xa","encoding":"hex"}},"id":31}}"#,
+            owner_addr
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let json_value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json_value["result"]["numFetched"], "1");
+        assert_eq!(
+            json_value["result"]["utxos"],
+            serde_json::json!([expected_utxo])
+        );
+        assert_eq!(json_value["result"]["encoding"], "hex");
+        assert_eq!(
+            json_value["result"]["endIndex"]["address"],
+            format_service_address(node.config.network_id, "C", owner)
+        );
+        assert_eq!(
+            json_value["result"]["endIndex"]["utxo"],
+            cb58_encode_id(platform_input_id(export_tx_id, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_avax_get_utxos_drops_committed_exports_after_cchain_import() {
+        let node = make_test_node(1);
+        let owner = [0x5A; 20];
+        let asset_id = parse_platform_id_32(AVAX_ASSET_ID_MAINNET).unwrap();
+
+        let funding_tx = make_platform_base_tx_with_io(
+            &[make_platform_transferable_output_bytes(asset_id, 80, owner)],
+            &[],
+        );
+        let funding_tx_id = sha256_bytes(&funding_tx);
+        let export_tx = make_platform_export_tx_bytes_with_io(
+            &[],
+            &[make_platform_transferable_input_bytes(
+                funding_tx_id,
+                0,
+                asset_id,
+                80,
+            )],
+            platform_cchain_blockchain_id(node.config.network_id),
+            &[make_platform_transferable_output_bytes(asset_id, 70, owner)],
+        );
+        let export_tx_id = sha256_bytes(&export_tx);
+        let p_block = make_banff_std_with_txs([0x93; 32], 24, &[funding_tx, export_tx]);
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&p_block), &p_block)
+            .unwrap();
+
+        let ap5_time = upgrade_time_unix(
+            &info_upgrades_result(node.config.network_id),
+            "apricotPhase5Time",
+        );
+        let c_import_tx = make_cchain_atomic_import_tx_bytes(
+            node.config.network_id,
+            platform_pchain_blockchain_id(),
+            &[make_platform_transferable_input_bytes(
+                export_tx_id,
+                0,
+                asset_id,
+                70,
+            )],
+        );
+        let c_block = make_cchain_coreth_block_with_extdata(
+            [0xA1; 32],
+            1,
+            ap5_time + 10,
+            &make_cchain_atomic_batch_extdata(&[c_import_tx]),
+        );
+        node.db.put_block(1, &c_block).unwrap();
+
+        let owner_addr = cb58_encode(&owner);
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"avax.getUTXOs","params":{{"addresses":["{}"],"sourceChain":"P","limit":"0xa","encoding":"hex"}},"id":31}}"#,
+            owner_addr
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let json_value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json_value["result"]["numFetched"], "0");
+        assert_eq!(json_value["result"]["utxos"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_utxos_atomic_source_chain_returns_empty_without_exports() {
+        let node = make_test_node(1);
+        let owner = cb58_encode(&[0x59; 20]);
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getUTXOs","params":{{"addresses":["{}"],"sourceChain":"C","limit":"0xa","encoding":"hex"}},"id":32}}"#,
+            owner
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let json_value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json_value["result"]["numFetched"], "0");
+        assert_eq!(json_value["result"]["utxos"], serde_json::json!([]));
+        assert_eq!(json_value["result"]["encoding"], "hex");
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_utxos_and_atomic_lookup_use_committed_cchain_exports() {
+        let node = make_test_node(1);
+        let owner = [0x61; 20];
+        let owner_addr = cb58_encode(&owner);
+        let asset_id = parse_platform_id_32(AVAX_ASSET_ID_MAINNET).unwrap();
+
+        let c_export_tx = make_cchain_atomic_export_tx_bytes(
+            node.config.network_id,
+            platform_pchain_blockchain_id(),
+            &[make_platform_transferable_output_bytes(asset_id, 33, owner)],
+        );
+        let c_export_tx_id = sha256_bytes(&c_export_tx);
+        let expected_output = avalanche_rs::pchain::PlatformOwnedOutput {
+            asset_id,
+            amount: 33,
+            owner_locktime: 0,
+            stakeable_locktime: None,
+            addresses: vec![owner],
+            transferable_raw_bytes: make_platform_transferable_output_bytes(asset_id, 33, owner),
+            output_raw_bytes: make_platform_transferable_output_bytes(asset_id, 33, owner)[32..]
+                .to_vec(),
+        };
+
+        let ap5_time = upgrade_time_unix(
+            &info_upgrades_result(node.config.network_id),
+            "apricotPhase5Time",
+        );
+        let c_block = make_cchain_coreth_block_with_extdata(
+            [0xA2; 32],
+            2,
+            ap5_time + 20,
+            &make_cchain_atomic_batch_extdata(std::slice::from_ref(&c_export_tx)),
+        );
+        node.db.put_block(2, &c_block).unwrap();
+
+        let utxo_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getUTXOs","params":{{"addresses":["{}"],"sourceChain":"C","limit":"0xa","encoding":"hex"}},"id":32}}"#,
+            owner_addr
+        );
+        let utxo_response = handle_rpc_request(&utxo_req, &node).await;
+        let utxo_json: serde_json::Value = serde_json::from_str(&utxo_response).unwrap();
+        assert_eq!(utxo_json["result"]["numFetched"], "1");
+        assert_eq!(
+            utxo_json["result"]["utxos"],
+            serde_json::json!([
+                platform_encode_utxo(c_export_tx_id, 0, &expected_output, "hex").unwrap()
+            ])
+        );
+        assert_eq!(utxo_json["result"]["endIndex"]["address"], owner_addr);
+        assert_eq!(
+            utxo_json["result"]["endIndex"]["utxo"],
+            cb58_encode_id(platform_input_id(c_export_tx_id, 0))
+        );
+
+        let tx_id = cb58_encode_id(c_export_tx_id);
+        let status_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"avax.getAtomicTxStatus","params":{{"txID":"{}"}},"id":33}}"#,
+            tx_id
+        );
+        let status_response = handle_rpc_request(&status_req, &node).await;
+        let status_json: serde_json::Value = serde_json::from_str(&status_response).unwrap();
+        assert_eq!(status_json["result"]["status"], "Accepted");
+        assert_eq!(status_json["result"]["blockHeight"], 2);
+
+        let get_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"avax.getAtomicTx","params":{{"txID":"{}","encoding":"hex"}},"id":34}}"#,
+            tx_id
+        );
+        let get_response = handle_rpc_request(&get_req, &node).await;
+        let get_json: serde_json::Value = serde_json::from_str(&get_response).unwrap();
+        assert_eq!(
+            get_json["result"]["tx"],
+            format!("0x{}", hex::encode(&c_export_tx))
+        );
+        assert_eq!(get_json["result"]["blockHeight"], 2);
     }
 
     #[tokio::test]

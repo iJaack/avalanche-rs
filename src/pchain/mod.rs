@@ -101,6 +101,10 @@ pub struct PlatformTxLedgerSummary {
     pub outputs: Vec<PlatformOwnedOutput>,
     pub stake_outputs: Vec<PlatformOwnedOutput>,
     pub reward_validator_tx_id: Option<[u8; 32]>,
+    pub import_source_chain: Option<[u8; 32]>,
+    pub imported_inputs: Vec<PlatformInputRef>,
+    pub export_destination_chain: Option<[u8; 32]>,
+    pub exported_outputs: Vec<PlatformOwnedOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +270,10 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
                 outputs,
                 stake_outputs: Vec::new(),
                 reward_validator_tx_id: None,
+                import_source_chain: None,
+                imported_inputs: Vec::new(),
+                export_destination_chain: None,
+                exported_outputs: Vec::new(),
             })
         }
         TYPE_CREATE_CHAIN_TX => {
@@ -285,6 +293,10 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
                 outputs,
                 stake_outputs: Vec::new(),
                 reward_validator_tx_id: None,
+                import_source_chain: None,
+                imported_inputs: Vec::new(),
+                export_destination_chain: None,
+                exported_outputs: Vec::new(),
             })
         }
         TYPE_CREATE_SUBNET_TX => {
@@ -296,6 +308,10 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
                 outputs,
                 stake_outputs: Vec::new(),
                 reward_validator_tx_id: None,
+                import_source_chain: None,
+                imported_inputs: Vec::new(),
+                export_destination_chain: None,
+                exported_outputs: Vec::new(),
             })
         }
         TYPE_REMOVE_SUBNET_VALIDATOR_TX => {
@@ -309,6 +325,10 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
                 outputs,
                 stake_outputs: Vec::new(),
                 reward_validator_tx_id: None,
+                import_source_chain: None,
+                imported_inputs: Vec::new(),
+                export_destination_chain: None,
+                exported_outputs: Vec::new(),
             })
         }
         TYPE_TRANSFER_SUBNET_OWNERSHIP_TX => {
@@ -322,14 +342,19 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
                 outputs,
                 stake_outputs: Vec::new(),
                 reward_validator_tx_id: None,
+                import_source_chain: None,
+                imported_inputs: Vec::new(),
+                export_destination_chain: None,
+                exported_outputs: Vec::new(),
             })
         }
         TYPE_IMPORT_TX => {
             let (outputs, inputs) = parse_base_tx_ledger(&mut cursor)?;
-            cursor.read_array::<32>()?;
+            let import_source_chain = cursor.read_array::<32>()?;
             let import_count = cursor.read_u32()? as usize;
+            let mut imported_inputs = Vec::with_capacity(import_count);
             for _ in 0..import_count {
-                let _ = parse_transferable_input(&mut cursor)?;
+                imported_inputs.push(parse_input_ref(&mut cursor)?);
             }
             Ok(PlatformTxLedgerSummary {
                 kind: None,
@@ -337,21 +362,26 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
                 outputs,
                 stake_outputs: Vec::new(),
                 reward_validator_tx_id: None,
+                import_source_chain: Some(import_source_chain),
+                imported_inputs,
+                export_destination_chain: None,
+                exported_outputs: Vec::new(),
             })
         }
         TYPE_EXPORT_TX => {
             let (outputs, inputs) = parse_base_tx_ledger(&mut cursor)?;
-            cursor.read_array::<32>()?;
-            let export_count = cursor.read_u32()? as usize;
-            for _ in 0..export_count {
-                let _ = parse_transferable_output(&mut cursor)?;
-            }
+            let export_destination_chain = cursor.read_array::<32>()?;
+            let exported_outputs = parse_owned_transferable_outputs(&mut cursor)?;
             Ok(PlatformTxLedgerSummary {
                 kind: None,
                 inputs,
                 outputs,
                 stake_outputs: Vec::new(),
                 reward_validator_tx_id: None,
+                import_source_chain: None,
+                imported_inputs: Vec::new(),
+                export_destination_chain: Some(export_destination_chain),
+                exported_outputs,
             })
         }
         TYPE_ADD_VALIDATOR_TX => {
@@ -372,6 +402,10 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
             outputs: Vec::new(),
             stake_outputs: Vec::new(),
             reward_validator_tx_id: Some(cursor.read_array::<32>()?),
+            import_source_chain: None,
+            imported_inputs: Vec::new(),
+            export_destination_chain: None,
+            exported_outputs: Vec::new(),
         }),
         TYPE_ADVANCE_TIME_TX => Ok(PlatformTxLedgerSummary {
             kind: None,
@@ -379,6 +413,10 @@ pub fn summarize_platform_tx_ledger(bytes: &[u8]) -> Result<PlatformTxLedgerSumm
             outputs: Vec::new(),
             stake_outputs: Vec::new(),
             reward_validator_tx_id: None,
+            import_source_chain: None,
+            imported_inputs: Vec::new(),
+            export_destination_chain: None,
+            exported_outputs: Vec::new(),
         }),
         other => Err(format!("unsupported platform tx type {}", other)),
     }
@@ -1232,6 +1270,10 @@ fn parse_generic_base_tx_ledger_summary(
         outputs,
         stake_outputs: Vec::new(),
         reward_validator_tx_id: None,
+        import_source_chain: None,
+        imported_inputs: Vec::new(),
+        export_destination_chain: None,
+        exported_outputs: Vec::new(),
     })
 }
 
@@ -1286,6 +1328,10 @@ fn parse_staker_tx_ledger_summary(
         outputs,
         stake_outputs,
         reward_validator_tx_id: None,
+        import_source_chain: None,
+        imported_inputs: Vec::new(),
+        export_destination_chain: None,
+        exported_outputs: Vec::new(),
     })
 }
 
@@ -1311,6 +1357,10 @@ fn parse_permissionless_tx_ledger_summary(
         outputs,
         stake_outputs,
         reward_validator_tx_id: None,
+        import_source_chain: None,
+        imported_inputs: Vec::new(),
+        export_destination_chain: None,
+        exported_outputs: Vec::new(),
     })
 }
 
@@ -3047,6 +3097,12 @@ mod tests {
         assert_eq!(import_ledger.outputs.len(), 1);
         assert_eq!(import_ledger.inputs.len(), 1);
         assert_eq!(import_ledger.inputs[0].tx_id, [0x92; 32]);
+        assert_eq!(import_ledger.import_source_chain, Some([0x44; 32]));
+        assert_eq!(import_ledger.imported_inputs.len(), 1);
+        assert_eq!(import_ledger.imported_inputs[0].tx_id, [0x94; 32]);
+        assert_eq!(import_ledger.imported_inputs[0].output_index, 3);
+        assert!(import_ledger.export_destination_chain.is_none());
+        assert!(import_ledger.exported_outputs.is_empty());
 
         let exported_output = transferable_output_bytes([0x96; 32], 13, [0x12; 20]);
         let export_tx = export_tx_with_base_io_bytes(
@@ -3059,6 +3115,12 @@ mod tests {
         assert_eq!(export_ledger.outputs.len(), 1);
         assert_eq!(export_ledger.inputs.len(), 1);
         assert_eq!(export_ledger.outputs[0].amount, 5);
+        assert!(export_ledger.import_source_chain.is_none());
+        assert!(export_ledger.imported_inputs.is_empty());
+        assert_eq!(export_ledger.export_destination_chain, Some([0x45; 32]));
+        assert_eq!(export_ledger.exported_outputs.len(), 1);
+        assert_eq!(export_ledger.exported_outputs[0].asset_id, [0x96; 32]);
+        assert_eq!(export_ledger.exported_outputs[0].amount, 13);
     }
 
     #[test]

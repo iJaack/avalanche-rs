@@ -676,6 +676,33 @@ pub struct CChainBlockFields {
     pub miner: [u8; 20],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CChainAtomicInputRef {
+    pub tx_id: [u8; 32],
+    pub output_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CChainAtomicOutput {
+    pub asset_id: [u8; 32],
+    pub amount: u64,
+    pub owner_locktime: u64,
+    pub stakeable_locktime: Option<u64>,
+    pub addresses: Vec<[u8; 20]>,
+    pub transferable_raw_bytes: Vec<u8>,
+    pub output_raw_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CChainAtomicTx {
+    pub tx_id: [u8; 32],
+    pub raw: Vec<u8>,
+    pub source_chain: Option<[u8; 32]>,
+    pub destination_chain: Option<[u8; 32]>,
+    pub imported_inputs: Vec<CChainAtomicInputRef>,
+    pub exported_outputs: Vec<CChainAtomicOutput>,
+}
+
 /// Extract all transactions from a raw C-Chain block (handles both
 /// Avalanche-wrapped and raw RLP formats).
 ///
@@ -688,18 +715,14 @@ pub fn extract_cchain_transactions(raw: &[u8]) -> Vec<CChainRawTx> {
         return vec![];
     }
 
-    // Navigate: outer list → skip header → skip uncles → txs list
-    let (_, outer_start) = match rlp_list_start(rlp, 0) {
-        Ok(v) => v,
+    let outer_fields = match cchain_outer_field_positions(rlp) {
+        Ok(fields) => fields,
         Err(_) => return vec![],
     };
-    let after_header = match rlp_skip(rlp, outer_start) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    let txs_list_pos = match rlp_skip(rlp, after_header) {
-        Ok(v) => v,
-        Err(_) => return vec![],
+    let txs_list_pos = match outer_fields.len() {
+        len if len >= 5 => outer_fields[1],
+        len if len >= 3 => outer_fields[2],
+        _ => return vec![],
     };
     if txs_list_pos >= rlp.len() || rlp[txs_list_pos] < 0xc0 {
         return vec![];
@@ -743,6 +766,312 @@ pub fn extract_cchain_transactions(raw: &[u8]) -> Vec<CChainRawTx> {
         }
     }
     txs
+}
+
+pub fn extract_cchain_atomic_transactions(
+    raw: &[u8],
+    batch_encoded: bool,
+) -> Result<Vec<CChainAtomicTx>, String> {
+    let extdata = extract_cchain_block_extdata(raw)?;
+    if extdata.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut cursor = AtomicCursor::new(&extdata);
+    let version = cursor.read_u16()?;
+    if version != 0 {
+        return Err(format!("unsupported atomic codec version {}", version));
+    }
+
+    let mut txs = Vec::new();
+    if batch_encoded {
+        let tx_count = cursor.read_u32()? as usize;
+        if tx_count == 0 {
+            return Err("atomic batch contained zero transactions".to_string());
+        }
+        for _ in 0..tx_count {
+            txs.push(parse_cchain_atomic_tx_without_version(&mut cursor)?);
+        }
+    } else {
+        txs.push(parse_cchain_atomic_tx_without_version(&mut cursor)?);
+    }
+
+    if cursor.remaining() != 0 {
+        return Err(format!(
+            "unexpected trailing atomic extdata bytes: {}",
+            cursor.remaining()
+        ));
+    }
+
+    Ok(txs)
+}
+
+fn cchain_outer_field_positions(rlp: &[u8]) -> Result<Vec<usize>, String> {
+    let (outer_len, mut pos) = rlp_list_start(rlp, 0)?;
+    let outer_end = pos
+        .checked_add(outer_len)
+        .ok_or_else(|| "c-chain outer list length overflow".to_string())?;
+    if outer_end > rlp.len() {
+        return Err("c-chain outer list out of bounds".to_string());
+    }
+
+    let mut fields = Vec::new();
+    while pos < outer_end {
+        fields.push(pos);
+        pos = rlp_skip(rlp, pos)?;
+    }
+    if pos != outer_end {
+        return Err("c-chain outer list did not end cleanly".to_string());
+    }
+    Ok(fields)
+}
+
+fn extract_cchain_block_extdata(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let rlp = strip_avalanche_wrapper(raw);
+    if rlp.is_empty() || rlp[0] < 0xc0 {
+        return Ok(Vec::new());
+    }
+
+    let outer_fields = cchain_outer_field_positions(rlp)?;
+    if outer_fields.len() < 5 {
+        return Ok(Vec::new());
+    }
+
+    rlp_read_bytes_vec(rlp, outer_fields[4])
+}
+
+const ATOMIC_IMPORT_TX: u32 = 0;
+const ATOMIC_EXPORT_TX: u32 = 1;
+const ATOMIC_SECP_TRANSFER_INPUT: u32 = 5;
+const ATOMIC_SECP_TRANSFER_OUTPUT: u32 = 7;
+const ATOMIC_SECP_CREDENTIAL: u32 = 9;
+const ATOMIC_SECP_INPUT: u32 = 10;
+const ATOMIC_LOCK_IN: u32 = 21;
+const ATOMIC_LOCK_OUT: u32 = 22;
+const ATOMIC_SECP256K1_SIGNATURE_LEN: usize = 65;
+
+type AtomicOutputDetails = (u64, u64, Option<u64>, Vec<[u8; 20]>);
+
+struct AtomicCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> AtomicCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, String> {
+        let bytes = self.read_exact(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        let bytes = self.read_exact(4)?;
+        Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, String> {
+        let bytes = self.read_exact(8)?;
+        Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let bytes = self.read_exact(N)?;
+        bytes
+            .try_into()
+            .map_err(|_| format!("failed to read {}-byte array", N))
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], String> {
+        if self.pos + len > self.bytes.len() {
+            return Err(format!(
+                "atomic cursor out of bounds: pos={} len={} total={}",
+                self.pos,
+                len,
+                self.bytes.len()
+            ));
+        }
+        let start = self.pos;
+        self.pos += len;
+        Ok(&self.bytes[start..self.pos])
+    }
+}
+
+fn parse_cchain_atomic_tx_without_version(
+    cursor: &mut AtomicCursor<'_>,
+) -> Result<CChainAtomicTx, String> {
+    let tx_start = cursor.pos;
+    let tx_type = cursor.read_u32()?;
+    let (source_chain, destination_chain, imported_inputs, exported_outputs) = match tx_type {
+        ATOMIC_IMPORT_TX => {
+            cursor.read_u32()?;
+            cursor.read_array::<32>()?;
+            let source_chain = cursor.read_array::<32>()?;
+            let input_count = cursor.read_u32()? as usize;
+            let mut imported_inputs = Vec::with_capacity(input_count);
+            for _ in 0..input_count {
+                imported_inputs.push(parse_cchain_atomic_input_ref(cursor)?);
+            }
+            let output_count = cursor.read_u32()? as usize;
+            for _ in 0..output_count {
+                skip_cchain_atomic_evm_output(cursor)?;
+            }
+            (Some(source_chain), None, imported_inputs, Vec::new())
+        }
+        ATOMIC_EXPORT_TX => {
+            cursor.read_u32()?;
+            cursor.read_array::<32>()?;
+            let destination_chain = cursor.read_array::<32>()?;
+            let input_count = cursor.read_u32()? as usize;
+            for _ in 0..input_count {
+                skip_cchain_atomic_evm_input(cursor)?;
+            }
+            let output_count = cursor.read_u32()? as usize;
+            let mut exported_outputs = Vec::with_capacity(output_count);
+            for _ in 0..output_count {
+                exported_outputs.push(parse_cchain_atomic_transferable_output(cursor)?);
+            }
+            (None, Some(destination_chain), Vec::new(), exported_outputs)
+        }
+        other => return Err(format!("unsupported atomic tx type {}", other)),
+    };
+
+    skip_cchain_atomic_credentials(cursor)?;
+    let tx_end = cursor.pos;
+
+    let mut raw = Vec::with_capacity(2 + tx_end.saturating_sub(tx_start));
+    raw.extend_from_slice(&0u16.to_be_bytes());
+    raw.extend_from_slice(&cursor.bytes[tx_start..tx_end]);
+    let tx_id = sha256(&raw);
+
+    Ok(CChainAtomicTx {
+        tx_id,
+        raw,
+        source_chain,
+        destination_chain,
+        imported_inputs,
+        exported_outputs,
+    })
+}
+
+fn parse_cchain_atomic_input_ref(
+    cursor: &mut AtomicCursor<'_>,
+) -> Result<CChainAtomicInputRef, String> {
+    let tx_id = cursor.read_array::<32>()?;
+    let output_index = cursor.read_u32()?;
+    cursor.read_array::<32>()?;
+    let input_type = cursor.read_u32()?;
+    skip_cchain_atomic_input(cursor, input_type)?;
+    Ok(CChainAtomicInputRef {
+        tx_id,
+        output_index,
+    })
+}
+
+fn parse_cchain_atomic_transferable_output(
+    cursor: &mut AtomicCursor<'_>,
+) -> Result<CChainAtomicOutput, String> {
+    let transferable_start = cursor.pos;
+    let asset_id = cursor.read_array::<32>()?;
+    let output_start = cursor.pos;
+    let output_type = cursor.read_u32()?;
+    let (amount, owner_locktime, stakeable_locktime, addresses) =
+        parse_cchain_atomic_output_details(cursor, output_type)?;
+    let end = cursor.pos;
+
+    Ok(CChainAtomicOutput {
+        asset_id,
+        amount,
+        owner_locktime,
+        stakeable_locktime,
+        addresses,
+        transferable_raw_bytes: cursor.bytes[transferable_start..end].to_vec(),
+        output_raw_bytes: cursor.bytes[output_start..end].to_vec(),
+    })
+}
+
+fn parse_cchain_atomic_output_details(
+    cursor: &mut AtomicCursor<'_>,
+    output_type: u32,
+) -> Result<AtomicOutputDetails, String> {
+    match output_type {
+        ATOMIC_SECP_TRANSFER_OUTPUT => {
+            let amount = cursor.read_u64()?;
+            let owner_locktime = cursor.read_u64()?;
+            let _threshold = cursor.read_u32()?;
+            let address_count = cursor.read_u32()? as usize;
+            let mut addresses = Vec::with_capacity(address_count);
+            for _ in 0..address_count {
+                addresses.push(cursor.read_array::<20>()?);
+            }
+            Ok((amount, owner_locktime, None, addresses))
+        }
+        ATOMIC_LOCK_OUT => {
+            let stakeable_locktime = cursor.read_u64()?;
+            let inner_type = cursor.read_u32()?;
+            let (amount, owner_locktime, _, addresses) =
+                parse_cchain_atomic_output_details(cursor, inner_type)?;
+            Ok((amount, owner_locktime, Some(stakeable_locktime), addresses))
+        }
+        other => Err(format!("unsupported atomic output type {}", other)),
+    }
+}
+
+fn skip_cchain_atomic_input(cursor: &mut AtomicCursor<'_>, input_type: u32) -> Result<(), String> {
+    match input_type {
+        ATOMIC_SECP_TRANSFER_INPUT => {
+            cursor.read_u64()?;
+            let sig_count = cursor.read_u32()? as usize;
+            cursor.read_exact(sig_count.saturating_mul(4))?;
+            Ok(())
+        }
+        ATOMIC_LOCK_IN => {
+            cursor.read_u64()?;
+            let inner_type = cursor.read_u32()?;
+            skip_cchain_atomic_input(cursor, inner_type)
+        }
+        ATOMIC_SECP_INPUT => {
+            let sig_count = cursor.read_u32()? as usize;
+            cursor.read_exact(sig_count.saturating_mul(4))?;
+            Ok(())
+        }
+        other => Err(format!("unsupported atomic input type {}", other)),
+    }
+}
+
+fn skip_cchain_atomic_evm_input(cursor: &mut AtomicCursor<'_>) -> Result<(), String> {
+    cursor.read_exact(20)?;
+    cursor.read_u64()?;
+    cursor.read_array::<32>()?;
+    cursor.read_u64()?;
+    Ok(())
+}
+
+fn skip_cchain_atomic_evm_output(cursor: &mut AtomicCursor<'_>) -> Result<(), String> {
+    cursor.read_exact(20)?;
+    cursor.read_u64()?;
+    cursor.read_array::<32>()?;
+    Ok(())
+}
+
+fn skip_cchain_atomic_credentials(cursor: &mut AtomicCursor<'_>) -> Result<(), String> {
+    let credential_count = cursor.read_u32()? as usize;
+    for _ in 0..credential_count {
+        match cursor.read_u32()? {
+            ATOMIC_SECP_CREDENTIAL => {
+                let sig_count = cursor.read_u32()? as usize;
+                cursor.read_exact(sig_count.saturating_mul(ATOMIC_SECP256K1_SIGNATURE_LEN))?;
+            }
+            other => return Err(format!("unsupported atomic credential type {}", other)),
+        }
+    }
+    Ok(())
 }
 
 /// Parse a single raw Ethereum/C-Chain transaction.
@@ -1997,6 +2326,163 @@ mod tests {
         rlp_list(outer_payload)
     }
 
+    fn rlp_bytes(payload: &[u8]) -> Vec<u8> {
+        if payload.is_empty() {
+            return vec![0x80];
+        }
+        if payload.len() == 1 && payload[0] < 0x80 {
+            return vec![payload[0]];
+        }
+
+        let mut encoded = Vec::new();
+        if payload.len() <= 55 {
+            encoded.push(0x80 + payload.len() as u8);
+        } else {
+            let len_bytes = payload.len().to_be_bytes();
+            let start = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
+            let slice = &len_bytes[start..];
+            encoded.push(0xb7 + slice.len() as u8);
+            encoded.extend_from_slice(slice);
+        }
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
+    fn make_cchain_coreth_block_with_extdata(
+        parent: [u8; 32],
+        number: u64,
+        timestamp: u64,
+        txs: &[Vec<u8>],
+        extdata: &[u8],
+    ) -> Vec<u8> {
+        let mut header_payload: Vec<u8> = Vec::new();
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&parent);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0x1du8; 32]);
+        header_payload.push(0x94);
+        header_payload.extend_from_slice(&[0u8; 20]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xb9);
+        header_payload.push(0x01);
+        header_payload.push(0x00);
+        header_payload.extend_from_slice(&[0u8; 256]);
+        header_payload.push(0x80);
+        encode_rlp_u64(&mut header_payload, number);
+        encode_rlp_u64(&mut header_payload, 30_000_000);
+        header_payload.push(0x80);
+        encode_rlp_u64(&mut header_payload, timestamp);
+        header_payload.push(0x80);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]);
+        encode_rlp_u64(&mut header_payload, 25_000_000_000);
+
+        let header_list = rlp_list(header_payload);
+        let txs_payload = txs
+            .iter()
+            .flat_map(|tx| tx.iter().copied())
+            .collect::<Vec<_>>();
+        let txs_list = rlp_list(txs_payload);
+
+        let mut outer_payload = Vec::new();
+        outer_payload.extend_from_slice(&header_list);
+        outer_payload.extend_from_slice(&txs_list);
+        outer_payload.push(0xc0); // uncles
+        outer_payload.push(0x80); // version = 0
+        outer_payload.extend_from_slice(&rlp_bytes(extdata));
+        rlp_list(outer_payload)
+    }
+
+    fn make_atomic_transferable_output(
+        asset_id: [u8; 32],
+        amount: u64,
+        owner: [u8; 20],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&asset_id);
+        bytes.extend_from_slice(&7u32.to_be_bytes());
+        bytes.extend_from_slice(&amount.to_be_bytes());
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&owner);
+        bytes
+    }
+
+    fn make_atomic_transferable_input(
+        tx_id: [u8; 32],
+        output_index: u32,
+        asset_id: [u8; 32],
+        amount: u64,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&tx_id);
+        bytes.extend_from_slice(&output_index.to_be_bytes());
+        bytes.extend_from_slice(&asset_id);
+        bytes.extend_from_slice(&5u32.to_be_bytes());
+        bytes.extend_from_slice(&amount.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes
+    }
+
+    fn make_atomic_export_tx(
+        network_id: u32,
+        blockchain_id: [u8; 32],
+        destination_chain: [u8; 32],
+        exported_outputs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&network_id.to_be_bytes());
+        bytes.extend_from_slice(&blockchain_id);
+        bytes.extend_from_slice(&destination_chain);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&(exported_outputs.len() as u32).to_be_bytes());
+        for output in exported_outputs {
+            bytes.extend_from_slice(output);
+        }
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes
+    }
+
+    fn make_atomic_import_tx(
+        network_id: u32,
+        blockchain_id: [u8; 32],
+        source_chain: [u8; 32],
+        imported_inputs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&network_id.to_be_bytes());
+        bytes.extend_from_slice(&blockchain_id);
+        bytes.extend_from_slice(&source_chain);
+        bytes.extend_from_slice(&(imported_inputs.len() as u32).to_be_bytes());
+        for input in imported_inputs {
+            bytes.extend_from_slice(input);
+        }
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes
+    }
+
+    fn make_atomic_batch_extdata(txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&(txs.len() as u32).to_be_bytes());
+        for tx in txs {
+            bytes.extend_from_slice(&tx[2..]);
+        }
+        bytes
+    }
+
     #[test]
     fn test_extract_cchain_transactions_empty_block() {
         // A block with no transactions should return empty vec
@@ -2025,6 +2511,72 @@ mod tests {
         assert_eq!(txs[0].to, Some(to_addr));
         assert_eq!(txs[0].value, 1_000_000_000_000_000_000);
         assert_eq!(txs[0].tx_type, 0);
+    }
+
+    #[test]
+    fn test_extract_cchain_transactions_coreth_order_with_extdata() {
+        let to_addr = [0x24u8; 20];
+        let tx = make_legacy_tx_rlp(2, 99, 30_000, Some(to_addr), 7, &[0xAB]);
+        let raw = make_cchain_coreth_block_with_extdata(
+            [0u8; 32],
+            5,
+            1_700_000_000,
+            std::slice::from_ref(&tx),
+            &[0x01, 0x02, 0x03],
+        );
+        let txs = extract_cchain_transactions(&raw);
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].nonce, 2);
+        assert_eq!(txs[0].gas_price, 99);
+        assert_eq!(txs[0].gas_limit, 30_000);
+        assert_eq!(txs[0].to, Some(to_addr));
+        assert_eq!(txs[0].value, 7);
+        assert_eq!(txs[0].data, vec![0xAB]);
+    }
+
+    #[test]
+    fn test_extract_cchain_atomic_transactions_batch_export_and_import() {
+        let c_chain_id = [0xCC; 32];
+        let p_chain_id = [0u8; 32];
+        let asset_id = [0xAA; 32];
+        let owner = [0x44; 20];
+
+        let export_tx = make_atomic_export_tx(
+            1,
+            c_chain_id,
+            p_chain_id,
+            &[make_atomic_transferable_output(asset_id, 55, owner)],
+        );
+        let export_tx_id = sha256(&export_tx);
+        let import_tx = make_atomic_import_tx(
+            1,
+            c_chain_id,
+            p_chain_id,
+            &[make_atomic_transferable_input(
+                export_tx_id,
+                0,
+                asset_id,
+                55,
+            )],
+        );
+        let extdata = make_atomic_batch_extdata(&[export_tx.clone(), import_tx]);
+        let raw = make_cchain_coreth_block_with_extdata([0u8; 32], 7, 1_700_000_000, &[], &extdata);
+
+        let atomic_txs = extract_cchain_atomic_transactions(&raw, true).unwrap();
+        assert_eq!(atomic_txs.len(), 2);
+
+        assert_eq!(atomic_txs[0].tx_id, export_tx_id);
+        assert_eq!(atomic_txs[0].destination_chain, Some(p_chain_id));
+        assert_eq!(atomic_txs[0].exported_outputs.len(), 1);
+        assert_eq!(atomic_txs[0].exported_outputs[0].asset_id, asset_id);
+        assert_eq!(atomic_txs[0].exported_outputs[0].amount, 55);
+        assert_eq!(atomic_txs[0].exported_outputs[0].addresses, vec![owner]);
+        assert_eq!(atomic_txs[0].raw, export_tx);
+
+        assert_eq!(atomic_txs[1].source_chain, Some(p_chain_id));
+        assert_eq!(atomic_txs[1].imported_inputs.len(), 1);
+        assert_eq!(atomic_txs[1].imported_inputs[0].tx_id, export_tx_id);
+        assert_eq!(atomic_txs[1].imported_inputs[0].output_index, 0);
     }
 
     #[test]
