@@ -202,21 +202,12 @@ pub struct TransactionID(pub ID);
 pub struct ChainID(pub ID);
 
 // Blockchain ID constants
-pub const BLOCKCHAIN_X: &str = "2oYMBNV4eNHyqk2fjjV5nVQLDbtrnNJR5k6Gfc2KTKY51gPt3Z";
 pub const BLOCKCHAIN_C: &str = "C";
 pub const BLOCKCHAIN_P: &str = "P";
 
-/// Represents a single transaction on the Avalanche network
+/// Represents a single transaction on the supported Avalanche chains.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Transaction {
-    /// X-Chain (exchange) transaction
-    XChain {
-        id: TransactionID,
-        /// Inputs are UTXOs being spent
-        inputs: Vec<UTXO>,
-        /// Outputs are new UTXOs being created
-        outputs: Vec<UTXO>,
-    },
     /// C-Chain (contract) transaction
     CChain {
         id: TransactionID,
@@ -240,7 +231,6 @@ pub enum Transaction {
 impl Transaction {
     pub fn id(&self) -> TransactionID {
         match self {
-            Transaction::XChain { id, .. } => *id,
             Transaction::CChain { id, .. } => *id,
             Transaction::PChain { id, .. } => *id,
         }
@@ -248,7 +238,6 @@ impl Transaction {
 
     pub fn chain_type(&self) -> &str {
         match self {
-            Transaction::XChain { .. } => "X",
             Transaction::CChain { .. } => "C",
             Transaction::PChain { .. } => "P",
         }
@@ -557,16 +546,6 @@ mod tests {
 
     // Transaction Tests
     #[test]
-    fn test_transaction_x_chain() {
-        let tx = Transaction::XChain {
-            id: TransactionID(ID::new([1u8; 32])),
-            inputs: vec![],
-            outputs: vec![],
-        };
-        assert_eq!(tx.chain_type(), "X");
-    }
-
-    #[test]
     fn test_transaction_c_chain() {
         let tx = Transaction::CChain {
             id: TransactionID(ID::new([2u8; 32])),
@@ -699,10 +678,14 @@ mod tests {
 
     #[test]
     fn test_transaction_json_roundtrip() {
-        let tx = Transaction::XChain {
+        let tx = Transaction::CChain {
             id: TransactionID(ID::new([1u8; 32])),
-            inputs: vec![],
-            outputs: vec![],
+            nonce: 1,
+            gas_price: 1_000,
+            gas_limit: 21_000,
+            to: Some("0x123".to_string()),
+            value: 7,
+            data: vec![0xAA, 0xBB],
         };
 
         let json = serde_json::to_string(&tx).unwrap();
@@ -792,7 +775,7 @@ pub mod errors {
 
 pub mod types {
     pub use super::{Block, BlockID, ChainID, NodeID, Transaction, TransactionID, ID, UTXO};
-    pub use super::{BLOCKCHAIN_C, BLOCKCHAIN_P, BLOCKCHAIN_X};
+    pub use super::{BLOCKCHAIN_C, BLOCKCHAIN_P};
 }
 
 pub mod codec {

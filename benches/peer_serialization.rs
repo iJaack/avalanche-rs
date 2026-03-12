@@ -11,6 +11,8 @@ fn bench_peer_message_serialize(c: &mut Criterion) {
         my_version_time: 1_700_000_000,
         sig: vec![0x22; 65],
         tracked_subnets: vec![avalanche_rs::network::ChainId([0x33; 32])],
+        supported_acps: vec![],
+        objected_acps: vec![],
     };
 
     c.bench_function("peer_serialization_version_proto", |b| {

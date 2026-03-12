@@ -123,16 +123,6 @@ mod tests {
         }
 
         #[test]
-        fn test_transaction_x_chain() {
-            let tx = Transaction::XChain {
-                id: TransactionID(ID::hash(b"tx1")),
-                inputs: vec![],
-                outputs: vec![],
-            };
-            assert_eq!(tx.chain_type(), "X");
-        }
-
-        #[test]
         fn test_transaction_c_chain() {
             let tx = Transaction::CChain {
                 id: TransactionID(ID::hash(b"tx2")),
