@@ -24,7 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use bech32::FromBase32;
+use alloy_primitives::U256;
+use bech32::{FromBase32, ToBase32};
 use clap::Parser;
 use prost::Message as ProstMessage;
 use rand::{seq::SliceRandom, Rng};
@@ -77,11 +78,57 @@ const MAX_PLATFORM_GET_UTXOS_ADDRS: usize = 1024;
 const PLATFORM_GET_UTXOS_MAX_PAGE_SIZE: usize = 1024;
 const PROPOSER_VM_RECENTLY_ACCEPTED_WINDOW_SECS: u64 = 30;
 const PLATFORM_VM_ID: &str = "11111111111111111111111111111111LpoYY";
-const AVM_VM_ID: &str = "jvYyfQTxGMJLuGWa55kdP2p2zSUYsQ5Raupu4TW34ZAUBAbtq";
 const EVM_VM_ID: &str = "mgj786NP7uDwBCcq6YwThhaN8FLyybkCa4zBWTQbNgmK6k9A6";
 const AVAX_ASSET_ID_MAINNET: &str = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDGCgxN5Z";
 const AVAX_ASSET_ID_FUJI: &str = "U8iRqJoiJm8xZHAacmvYyZVwqQx6uDNtQeP3CQ6fcgQk3JqnK";
 const BAD_BLOCK_LIMIT: usize = 10;
+
+#[derive(Debug, Clone, Copy)]
+struct PlatformDynamicFeeConfig {
+    weights: [u64; 4],
+    max_capacity: u64,
+    max_per_second: u64,
+    target_per_second: u64,
+    min_price: u64,
+    excess_conversion_constant: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlatformValidatorFeeConfig {
+    capacity: u64,
+    target: u64,
+    min_price: u64,
+    excess_conversion_constant: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PlatformGasState {
+    capacity: u64,
+    excess: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlatformValidatorFeeState {
+    active: u64,
+    excess: u64,
+    accrued_fees: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PlatformL1ValidatorFeeRecord {
+    subnet_id: [u8; 32],
+    node_id: [u8; 20],
+    public_key: Vec<u8>,
+    remaining_balance_owner: Option<avalanche_rs::pchain::PlatformPChainOwner>,
+    deactivation_owner: Option<avalanche_rs::pchain::PlatformPChainOwner>,
+    start_time: u64,
+    weight: u64,
+    min_nonce: u64,
+    end_accumulated_fee: u64,
+}
+
+type PlatformL1ValidatorMap = std::collections::HashMap<[u8; 32], PlatformL1ValidatorFeeRecord>;
+type PlatformL1ValidatorScan = (PlatformL1ValidatorMap, PlatformValidatorFeeState, u64);
 
 #[cfg(feature = "indexer")]
 use avalanche_rs::api;
@@ -4528,20 +4575,10 @@ fn info_network_name(network_id: u32) -> &'static str {
     }
 }
 
-fn info_xchain_blockchain_id(network_id: u32) -> Option<[u8; 32]> {
-    let cb58 = match network_id {
-        1 => "2oYMBNV4eNHyqk2fjjV5nVQLDbtmNJzq5s3qs3Lo6ftnC6FByM",
-        5 => "2JVSBoinj9C2J33VntvzYtVJNZdN2NKiwwKjcumHUWEb5DbBrm",
-        _ => return None,
-    };
-    parse_platform_id_32(cb58)
-}
-
 fn info_blockchain_alias_id(alias: &str, network_id: u32) -> Option<[u8; 32]> {
     match alias.to_ascii_lowercase().as_str() {
         "p" | "platform" => Some(platform_pchain_blockchain_id()),
         "c" | "evm" => Some(platform_cchain_blockchain_id(network_id)),
-        "x" | "avm" => info_xchain_blockchain_id(network_id),
         _ => parse_platform_id_32(alias),
     }
 }
@@ -4608,15 +4645,12 @@ fn reload_logger_filter(levels: &StdHashMap<String, LoggerLevelState>) -> Result
         .map_err(|e| format!("failed to reload logger filter: {e}"))
 }
 
-fn canonical_blockchain_alias(network_id: u32, chain_id: [u8; 32]) -> String {
+fn canonical_blockchain_alias(chain_id: [u8; 32], network_id: u32) -> String {
     if chain_id == platform_pchain_blockchain_id() {
         return "P".to_string();
     }
     if chain_id == platform_cchain_blockchain_id(network_id) {
         return "C".to_string();
-    }
-    if info_xchain_blockchain_id(network_id) == Some(chain_id) {
-        return "X".to_string();
     }
     cb58_encode_id(chain_id)
 }
@@ -4654,9 +4688,6 @@ async fn blockchain_aliases_for_id(node: &NodeState, chain_id: [u8; 32]) -> Vec<
         id if id == platform_cchain_blockchain_id(node.config.network_id) => {
             vec!["C".to_string(), "evm".to_string()]
         }
-        id if info_xchain_blockchain_id(node.config.network_id) == Some(id) => {
-            vec!["X".to_string(), "avm".to_string()]
-        }
         _ => Vec::new(),
     };
 
@@ -4691,42 +4722,42 @@ fn admin_normalize_endpoint_path(endpoint: &str) -> Option<String> {
     }
 }
 
-fn admin_endpoint_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn admin_endpoint_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("endpoint"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(0).and_then(|value| value.as_str()))
 }
 
-fn admin_alias_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn admin_alias_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("alias"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(1).and_then(|value| value.as_str()))
 }
 
-fn admin_chain_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn admin_chain_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("chain"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(0).and_then(|value| value.as_str()))
 }
 
-fn admin_logger_name_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn admin_logger_name_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("loggerName"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(0).and_then(|value| value.as_str()))
 }
 
-fn admin_log_level_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn admin_log_level_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("logLevel"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(1).and_then(|value| value.as_str()))
 }
 
-fn admin_display_level_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn admin_display_level_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("displayLevel"))
         .and_then(|value| value.as_str())
@@ -4810,7 +4841,7 @@ async fn resolve_request_path(node: &NodeState, path: &str) -> String {
             .map(|(segment, suffix)| (segment, format!("/{}", suffix)))
             .unwrap_or((rest, String::new()));
         if let Some(chain_id) = resolve_blockchain_alias_id(node, alias).await {
-            let canonical = canonical_blockchain_alias(node.config.network_id, chain_id);
+            let canonical = canonical_blockchain_alias(chain_id, node.config.network_id);
             return format!("/ext/bc/{}{}", canonical, suffix);
         }
     }
@@ -4832,14 +4863,14 @@ fn info_node_ids_param(params: &serde_json::Value) -> Vec<[u8; 20]> {
         .unwrap_or_default()
 }
 
-fn info_alias_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn info_alias_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("alias"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(0).and_then(|value| value.as_str()))
 }
 
-fn info_chain_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn info_chain_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("chain"))
         .and_then(|value| value.as_str())
@@ -4888,33 +4919,104 @@ fn info_get_tx_fee_result(network_id: u32) -> serde_json::Value {
     })
 }
 
-fn platform_fee_config_result(_network_id: u32) -> serde_json::Value {
+fn platform_dynamic_fee_config(_network_id: u32) -> PlatformDynamicFeeConfig {
+    PlatformDynamicFeeConfig {
+        weights: [1, 1_000, 1_000, 4],
+        max_capacity: 1_000_000,
+        max_per_second: 100_000,
+        target_per_second: 50_000,
+        min_price: 1,
+        excess_conversion_constant: 2_164_043,
+    }
+}
+
+fn platform_fee_config_result(network_id: u32) -> serde_json::Value {
+    let config = platform_dynamic_fee_config(network_id);
     serde_json::json!({
-        "weights": [1u64, 1_000u64, 1_000u64, 4u64],
-        "maxCapacity": 1_000_000u64,
-        "maxPerSecond": 100_000u64,
-        "targetPerSecond": 50_000u64,
-        "minPrice": 1u64,
-        "excessConversionConstant": 2_164_043u64,
+        "weights": config.weights,
+        "maxCapacity": config.max_capacity,
+        "maxPerSecond": config.max_per_second,
+        "targetPerSecond": config.target_per_second,
+        "minPrice": config.min_price,
+        "excessConversionConstant": config.excess_conversion_constant,
     })
 }
 
-fn platform_validator_fee_config_result(network_id: u32) -> serde_json::Value {
-    let min_price = match network_id {
-        1 | 5 => 512u64,
-        _ => 1u64,
-    };
-    let excess_conversion_constant = match network_id {
-        1 => 1_246_488_515u64,
-        5 => 51_937_021u64,
-        _ => 865_617u64,
-    };
+fn platform_validator_fee_config(network_id: u32) -> PlatformValidatorFeeConfig {
+    PlatformValidatorFeeConfig {
+        capacity: 20_000,
+        target: 10_000,
+        min_price: match network_id {
+            1 | 5 => 512u64,
+            _ => 1u64,
+        },
+        excess_conversion_constant: match network_id {
+            1 => 1_246_488_515u64,
+            5 => 51_937_021u64,
+            _ => 865_617u64,
+        },
+    }
+}
 
+fn platform_validator_fee_config_result(network_id: u32) -> serde_json::Value {
+    let config = platform_validator_fee_config(network_id);
     serde_json::json!({
-        "capacity": 20_000u64,
-        "target": 10_000u64,
-        "minPrice": min_price,
-        "excessConversionConstant": excess_conversion_constant,
+        "capacity": config.capacity,
+        "target": config.target,
+        "minPrice": config.min_price,
+        "excessConversionConstant": config.excess_conversion_constant,
+    })
+}
+
+fn platform_gas_price(min_price: u64, excess: u64, excess_conversion_constant: u64) -> u64 {
+    let numerator = U256::from(excess);
+    let denominator = U256::from(excess_conversion_constant);
+    let mut i = U256::from(1u64);
+    let mut output = U256::ZERO;
+    let mut numerator_accum = U256::from(min_price) * denominator;
+    let max_output = denominator * U256::from(u64::MAX);
+
+    while numerator_accum > U256::ZERO {
+        output += numerator_accum;
+        if output >= max_output {
+            return u64::MAX;
+        }
+        numerator_accum = (numerator_accum * numerator) / denominator / i;
+        i += U256::from(1u64);
+    }
+
+    ((output / denominator).to::<u128>()).min(u64::MAX as u128) as u64
+}
+
+fn platform_gas_state_advance(
+    state: PlatformGasState,
+    config: PlatformDynamicFeeConfig,
+    seconds: u64,
+) -> PlatformGasState {
+    PlatformGasState {
+        capacity: state
+            .capacity
+            .saturating_add(config.max_per_second.saturating_mul(seconds))
+            .min(config.max_capacity),
+        excess: state
+            .excess
+            .saturating_sub(config.target_per_second.saturating_mul(seconds)),
+    }
+}
+
+fn platform_gas_state_consume(
+    state: PlatformGasState,
+    gas: u64,
+) -> Result<PlatformGasState, String> {
+    if gas > state.capacity {
+        return Err(format!(
+            "insufficient gas capacity: capacity ({}) < gas ({})",
+            state.capacity, gas
+        ));
+    }
+    Ok(PlatformGasState {
+        capacity: state.capacity - gas,
+        excess: state.excess.saturating_add(gas),
     })
 }
 
@@ -5358,7 +5460,7 @@ async fn info_is_bootstrapped(node: &NodeState, chain: &str) -> Result<bool, Str
     let bootstrapped = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
     if matches!(
         chain.to_ascii_lowercase().as_str(),
-        "p" | "platform" | "c" | "evm" | "x" | "avm"
+        "p" | "platform" | "c" | "evm"
     ) {
         return Ok(bootstrapped);
     }
@@ -5368,9 +5470,6 @@ async fn info_is_bootstrapped(node: &NodeState, chain: &str) -> Result<bool, Str
             return Ok(bootstrapped);
         }
         if chain_id == platform_cchain_blockchain_id(node.config.network_id) {
-            return Ok(bootstrapped);
-        }
-        if info_xchain_blockchain_id(node.config.network_id) == Some(chain_id) {
             return Ok(bootstrapped);
         }
 
@@ -5431,7 +5530,7 @@ fn avax_params_object(
     }
 }
 
-fn avax_tx_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn avax_tx_param(params: &serde_json::Value) -> Option<&str> {
     avax_params_object(params)
         .and_then(|obj| obj.get("tx"))
         .and_then(|value| value.as_str())
@@ -5446,7 +5545,7 @@ fn avax_encoding_param<'a>(params: &'a serde_json::Value, default: &'a str) -> &
         .unwrap_or(default)
 }
 
-fn avax_tx_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn avax_tx_id_param(params: &serde_json::Value) -> Option<&str> {
     avax_params_object(params)
         .and_then(|obj| obj.get("txID"))
         .and_then(|value| value.as_str())
@@ -5775,14 +5874,31 @@ struct PlatformValidatorRecord {
     node_id: String,
     weight: u64,
     start_time: u64,
-    end_time: u64,
+    end_time: Option<u64>,
+    l1: Option<PlatformL1ValidatorApiRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct PlatformL1ValidatorApiRecord {
+    validation_id: [u8; 32],
+    public_key: Vec<u8>,
+    remaining_balance_owner: avalanche_rs::pchain::PlatformPChainOwner,
+    deactivation_owner: avalanche_rs::pchain::PlatformPChainOwner,
+    min_nonce: u64,
+    balance: u64,
+    active: bool,
 }
 
 impl PlatformValidatorRecord {
     fn status(&self, now: u64) -> &'static str {
+        if let Some(l1) = &self.l1 {
+            return if l1.active { "current" } else { "completed" };
+        }
+
+        let end_time = self.end_time.unwrap_or_default();
         if now < self.start_time {
             "pending"
-        } else if now < self.end_time {
+        } else if now < end_time {
             "current"
         } else {
             "completed"
@@ -5800,21 +5916,21 @@ fn platform_params_object(
     }
 }
 
-fn platform_subnet_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn platform_subnet_id_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("subnetID"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(0).and_then(|value| value.as_str()))
 }
 
-fn platform_tx_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn platform_tx_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("tx"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(0).and_then(|value| value.as_str()))
 }
 
-fn platform_tx_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn platform_tx_id_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("txID"))
         .and_then(|value| value.as_str())
@@ -5835,7 +5951,7 @@ fn platform_node_ids_param(params: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn platform_node_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn platform_node_id_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("nodeID"))
         .and_then(|value| value.as_str())
@@ -5853,7 +5969,6 @@ fn platform_size_param(params: &serde_json::Value) -> Option<usize> {
 fn platform_vm_id_for_name(vm_type: &str) -> Option<String> {
     match vm_type.trim().to_ascii_lowercase().as_str() {
         "platformvm" => Some(PLATFORM_VM_ID.to_string()),
-        "avm" => Some(AVM_VM_ID.to_string()),
         "evm" => Some(EVM_VM_ID.to_string()),
         _ => parse_platform_id_32(vm_type).map(cb58_encode_id),
     }
@@ -5888,6 +6003,410 @@ async fn platform_current_supply_result(
     let supply = initial_supply.saturating_add(scan.current_supply_delta);
     Ok(serde_json::json!({
         "supply": supply.to_string(),
+        "height": height.to_string(),
+    }))
+}
+
+fn platform_latest_chain_timestamp(node: &NodeState) -> u64 {
+    latest_pchain_block_metadata(&node.db)
+        .map(|meta| meta.timestamp)
+        .unwrap_or_else(unix_timestamp_secs)
+}
+
+fn scan_platform_dynamic_fee_state(node: &NodeState) -> Result<(PlatformGasState, u64), String> {
+    let config = platform_dynamic_fee_config(node.config.network_id);
+    let latest_timestamp = platform_latest_chain_timestamp(node);
+    let etna_time = upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
+
+    if latest_timestamp < etna_time {
+        return Ok((PlatformGasState::default(), latest_timestamp));
+    }
+
+    let mut state = PlatformGasState::default();
+    let mut last_timestamp = etna_time;
+    for (meta, raw_block) in platform_sorted_pchain_blocks(&node.db) {
+        if meta.timestamp < etna_time {
+            continue;
+        }
+
+        state = platform_gas_state_advance(
+            state,
+            config,
+            meta.timestamp.saturating_sub(last_timestamp),
+        );
+        last_timestamp = meta.timestamp;
+
+        let txs = avalanche_rs::pchain::extract_platform_tx_bytes_from_block(&raw_block)
+            .map_err(|err| format!("fee state unavailable: {}", err))?;
+        for tx_bytes in txs {
+            let gas = avalanche_rs::pchain::platform_tx_dynamic_fee_gas(&tx_bytes, config.weights)
+                .map_err(|err| format!("fee state unavailable: {}", err))?;
+            if let Some(gas) = gas {
+                state = platform_gas_state_consume(state, gas)
+                    .map_err(|err| format!("fee state unavailable: {}", err))?;
+            }
+        }
+    }
+
+    Ok((state, latest_timestamp))
+}
+
+fn platform_fee_state_result(node: &NodeState) -> Result<serde_json::Value, String> {
+    let config = platform_dynamic_fee_config(node.config.network_id);
+    let (state, timestamp) = scan_platform_dynamic_fee_state(node)?;
+    Ok(serde_json::json!({
+        "capacity": state.capacity,
+        "excess": state.excess,
+        "price": platform_gas_price(
+            config.min_price,
+            state.excess,
+            config.excess_conversion_constant,
+        ),
+        "timestamp": unix_timestamp_to_rfc3339_seconds(timestamp),
+    }))
+}
+
+fn platform_active_l1_validator_count(validators: &PlatformL1ValidatorMap) -> u64 {
+    validators
+        .values()
+        .filter(|validator| validator.weight != 0 && validator.end_accumulated_fee != 0)
+        .count() as u64
+}
+
+fn platform_validator_fee_excess_after_seconds(
+    excess: u64,
+    current: u64,
+    target: u64,
+    seconds: u64,
+) -> u64 {
+    if current < target {
+        excess.saturating_sub(target.saturating_sub(current).saturating_mul(seconds))
+    } else {
+        excess.saturating_add(current.saturating_sub(target).saturating_mul(seconds))
+    }
+}
+
+fn platform_validator_fee_cost(
+    current: u64,
+    excess: u64,
+    config: PlatformValidatorFeeConfig,
+    seconds: u64,
+) -> Result<u64, String> {
+    if seconds == 0 {
+        return Ok(0);
+    }
+
+    if current == config.target {
+        let price = platform_gas_price(config.min_price, excess, config.excess_conversion_constant);
+        return price
+            .checked_mul(seconds)
+            .ok_or_else(|| "validator fee cost overflow".to_string());
+    }
+
+    let mut cost = 0u64;
+    let mut running_excess = excess;
+    for elapsed in 0..seconds {
+        running_excess =
+            platform_validator_fee_excess_after_seconds(running_excess, current, config.target, 1);
+        if running_excess == 0 {
+            let remaining_seconds = seconds.saturating_sub(elapsed);
+            let zero_excess_cost = config
+                .min_price
+                .checked_mul(remaining_seconds)
+                .ok_or_else(|| "validator fee cost overflow".to_string())?;
+            return cost
+                .checked_add(zero_excess_cost)
+                .ok_or_else(|| "validator fee cost overflow".to_string());
+        }
+
+        let price = platform_gas_price(
+            config.min_price,
+            running_excess,
+            config.excess_conversion_constant,
+        );
+        cost = cost
+            .checked_add(price)
+            .ok_or_else(|| "validator fee cost overflow".to_string())?;
+    }
+    Ok(cost)
+}
+
+fn platform_advance_validator_fee_state(
+    state: &mut PlatformValidatorFeeState,
+    validators: &mut PlatformL1ValidatorMap,
+    config: PlatformValidatorFeeConfig,
+    seconds: u64,
+) -> Result<(), String> {
+    let current = platform_active_l1_validator_count(validators);
+    let validator_cost = platform_validator_fee_cost(current, state.excess, config, seconds)?;
+    state.accrued_fees = state
+        .accrued_fees
+        .checked_add(validator_cost)
+        .ok_or_else(|| "validator accrued fees overflow".to_string())?;
+
+    for validator in validators.values_mut() {
+        if validator.weight != 0
+            && validator.end_accumulated_fee != 0
+            && validator.end_accumulated_fee <= state.accrued_fees
+        {
+            validator.end_accumulated_fee = 0;
+        }
+    }
+
+    state.excess =
+        platform_validator_fee_excess_after_seconds(state.excess, current, config.target, seconds);
+    state.active = platform_active_l1_validator_count(validators);
+    Ok(())
+}
+
+fn platform_apply_l1_validator_tx(
+    state: &mut PlatformValidatorFeeState,
+    validators: &mut PlatformL1ValidatorMap,
+    config: PlatformValidatorFeeConfig,
+    timestamp: u64,
+    summary: avalanche_rs::pchain::PlatformL1ValidatorTxSummary,
+) -> Result<(), String> {
+    match summary {
+        avalanche_rs::pchain::PlatformL1ValidatorTxSummary::ConvertSubnetToL1 {
+            validators: new,
+        } => {
+            for validator in new {
+                let mut end_accumulated_fee = 0u64;
+                if validator.balance != 0 {
+                    if platform_active_l1_validator_count(validators) >= config.capacity {
+                        return Err("active L1 validator capacity exceeded".to_string());
+                    }
+                    end_accumulated_fee = state
+                        .accrued_fees
+                        .checked_add(validator.balance)
+                        .ok_or_else(|| "validator balance overflow".to_string())?;
+                }
+                validators.insert(
+                    validator.validation_id,
+                    PlatformL1ValidatorFeeRecord {
+                        subnet_id: validator.subnet_id,
+                        node_id: validator.node_id,
+                        public_key: validator.public_key.to_vec(),
+                        remaining_balance_owner: Some(validator.remaining_balance_owner),
+                        deactivation_owner: Some(validator.deactivation_owner),
+                        start_time: timestamp,
+                        weight: validator.weight,
+                        min_nonce: 0,
+                        end_accumulated_fee,
+                    },
+                );
+            }
+        }
+        avalanche_rs::pchain::PlatformL1ValidatorTxSummary::RegisterL1Validator { validator } => {
+            let mut end_accumulated_fee = 0u64;
+            if validator.balance != 0 {
+                if platform_active_l1_validator_count(validators) >= config.capacity {
+                    return Err("active L1 validator capacity exceeded".to_string());
+                }
+                end_accumulated_fee = state
+                    .accrued_fees
+                    .checked_add(validator.balance)
+                    .ok_or_else(|| "validator balance overflow".to_string())?;
+            }
+            validators.insert(
+                validator.validation_id,
+                PlatformL1ValidatorFeeRecord {
+                    subnet_id: validator.subnet_id,
+                    node_id: validator.node_id,
+                    public_key: validator.public_key.to_vec(),
+                    remaining_balance_owner: Some(validator.remaining_balance_owner),
+                    deactivation_owner: Some(validator.deactivation_owner),
+                    start_time: timestamp,
+                    weight: validator.weight,
+                    min_nonce: 0,
+                    end_accumulated_fee,
+                },
+            );
+        }
+        avalanche_rs::pchain::PlatformL1ValidatorTxSummary::SetL1ValidatorWeight {
+            validation_id,
+            nonce,
+            weight,
+        } => {
+            let Some(current) = validators.get_mut(&validation_id) else {
+                return Err("unknown L1 validator".to_string());
+            };
+            if nonce < current.min_nonce {
+                return Err("stale L1 validator nonce".to_string());
+            }
+            if weight == 0 {
+                validators.remove(&validation_id);
+            } else {
+                current.min_nonce = nonce.saturating_add(1);
+                current.weight = weight;
+            }
+        }
+        avalanche_rs::pchain::PlatformL1ValidatorTxSummary::IncreaseL1ValidatorBalance {
+            validation_id,
+            balance,
+        } => {
+            let currently_active = platform_active_l1_validator_count(validators);
+            let Some(current) = validators.get_mut(&validation_id) else {
+                return Err("unknown L1 validator".to_string());
+            };
+            if current.end_accumulated_fee == 0 {
+                if currently_active >= config.capacity {
+                    return Err("active L1 validator capacity exceeded".to_string());
+                }
+                current.end_accumulated_fee = state.accrued_fees;
+            }
+            current.end_accumulated_fee = current
+                .end_accumulated_fee
+                .checked_add(balance)
+                .ok_or_else(|| "validator balance overflow".to_string())?;
+        }
+        avalanche_rs::pchain::PlatformL1ValidatorTxSummary::DisableL1Validator {
+            validation_id,
+        } => {
+            let Some(current) = validators.get_mut(&validation_id) else {
+                return Err("unknown L1 validator".to_string());
+            };
+            current.end_accumulated_fee = 0;
+        }
+        avalanche_rs::pchain::PlatformL1ValidatorTxSummary::Other => {}
+    }
+    state.active = platform_active_l1_validator_count(validators);
+    Ok(())
+}
+
+fn scan_platform_l1_validator_records(node: &NodeState) -> Result<PlatformL1ValidatorScan, String> {
+    let latest_timestamp = platform_latest_chain_timestamp(node);
+    let etna_time = upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
+    if latest_timestamp < etna_time {
+        return Ok((
+            PlatformL1ValidatorMap::new(),
+            PlatformValidatorFeeState::default(),
+            latest_timestamp,
+        ));
+    }
+
+    let config = platform_validator_fee_config(node.config.network_id);
+    let mut state = PlatformValidatorFeeState::default();
+    let mut last_timestamp = etna_time;
+    let mut validators = PlatformL1ValidatorMap::new();
+
+    for (meta, raw_block) in platform_sorted_pchain_blocks(&node.db) {
+        if meta.timestamp < etna_time {
+            continue;
+        }
+
+        platform_advance_validator_fee_state(
+            &mut state,
+            &mut validators,
+            config,
+            meta.timestamp.saturating_sub(last_timestamp),
+        )
+        .map_err(|err| format!("validator fee state unavailable: {}", err))?;
+        last_timestamp = meta.timestamp;
+
+        let txs = avalanche_rs::pchain::extract_platform_tx_bytes_from_block(&raw_block)
+            .map_err(|err| format!("validator fee state unavailable: {}", err))?;
+        for tx_bytes in txs {
+            let summary = avalanche_rs::pchain::summarize_platform_l1_validator_tx(&tx_bytes)
+                .map_err(|err| format!("validator fee state unavailable: {}", err))?;
+            platform_apply_l1_validator_tx(
+                &mut state,
+                &mut validators,
+                config,
+                meta.timestamp,
+                summary,
+            )
+            .map_err(|err| format!("validator fee state unavailable: {}", err))?;
+        }
+    }
+
+    state.active = platform_active_l1_validator_count(&validators);
+    Ok((validators, state, latest_timestamp))
+}
+
+fn scan_platform_validator_fee_state(
+    node: &NodeState,
+) -> Result<(PlatformValidatorFeeState, u64), String> {
+    let (_, state, latest_timestamp) = scan_platform_l1_validator_records(node)?;
+    Ok((state, latest_timestamp))
+}
+
+fn platform_validator_fee_state_result(node: &NodeState) -> Result<serde_json::Value, String> {
+    let config = platform_validator_fee_config(node.config.network_id);
+    let (state, latest_timestamp) = scan_platform_validator_fee_state(node)?;
+    Ok(serde_json::json!({
+        "excess": state.excess,
+        "price": platform_gas_price(
+            config.min_price,
+            state.excess,
+            config.excess_conversion_constant,
+        ),
+        "timestamp": unix_timestamp_to_rfc3339_seconds(latest_timestamp),
+    }))
+}
+
+fn platform_l1_owner_json(
+    network_id: u32,
+    owner: &avalanche_rs::pchain::PlatformPChainOwner,
+) -> serde_json::Value {
+    serde_json::json!({
+        "locktime": "0",
+        "threshold": owner.threshold.to_string(),
+        "addresses": owner
+            .addresses
+            .iter()
+            .map(|address| format_platform_address(network_id, *address))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn platform_l1_validator_result(
+    node: &NodeState,
+    validation_id: [u8; 32],
+) -> Result<serde_json::Value, String> {
+    let (validators, state, _) = scan_platform_l1_validator_records(node)?;
+    let Some(validator) = validators.get(&validation_id) else {
+        return Err(format!(
+            "fetching L1 validator \"{}\" failed: not found",
+            cb58_encode_id(validation_id)
+        ));
+    };
+
+    let Some(remaining_balance_owner) = validator.remaining_balance_owner.as_ref() else {
+        return Err("L1 validator missing remaining balance owner".to_string());
+    };
+    let Some(deactivation_owner) = validator.deactivation_owner.as_ref() else {
+        return Err("L1 validator missing deactivation owner".to_string());
+    };
+
+    let balance = if validator.end_accumulated_fee == 0 {
+        0
+    } else {
+        validator
+            .end_accumulated_fee
+            .saturating_sub(state.accrued_fees)
+    };
+    let height = latest_pchain_block_metadata(&node.db)
+        .map(|meta| meta.height)
+        .unwrap_or(0);
+
+    Ok(serde_json::json!({
+        "subnetID": cb58_encode_id(validator.subnet_id),
+        "nodeID": format!("NodeID-{}", cb58_encode(&validator.node_id)),
+        "weight": validator.weight.to_string(),
+        "startTime": validator.start_time.to_string(),
+        "validationID": cb58_encode_id(validation_id),
+        "publicKey": format!("0x{}", hex::encode(&validator.public_key)),
+        "remainingBalanceOwner": platform_l1_owner_json(
+            node.config.network_id,
+            remaining_balance_owner,
+        ),
+        "deactivationOwner": platform_l1_owner_json(
+            node.config.network_id,
+            deactivation_owner,
+        ),
+        "minNonce": validator.min_nonce.to_string(),
+        "balance": balance.to_string(),
         "height": height.to_string(),
     }))
 }
@@ -5944,11 +6463,189 @@ fn platform_subnet_ids_param(params: &serde_json::Value) -> Result<Option<Vec<Su
     Ok(Some(parsed))
 }
 
-fn platform_subnet_summary_json(subnet_id: &SubnetId) -> serde_json::Value {
+fn platform_validation_id_param(params: &serde_json::Value) -> Option<&str> {
+    platform_params_object(params)
+        .and_then(|obj| obj.get("validationID"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get(0).and_then(|value| value.as_str()))
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlatformSubnetApiState {
+    owner: Option<PlatformOutputOwner>,
+    subnet_transformation_tx_id: Option<[u8; 32]>,
+    conversion_id: Option<[u8; 32]>,
+    manager_chain_id: Option<[u8; 32]>,
+    manager_address: Option<Vec<u8>>,
+}
+
+fn platform_network_hrp(network_id: u32) -> &'static str {
+    match network_id {
+        1 => "avax",
+        5 => "fuji",
+        10 => "testing",
+        12345 => "local",
+        _ => "custom",
+    }
+}
+
+fn format_platform_address(network_id: u32, address: [u8; 20]) -> String {
+    let encoded = bech32::encode(
+        platform_network_hrp(network_id),
+        address.to_base32(),
+        bech32::Variant::Bech32,
+    )
+    .unwrap_or_default();
+    format!("P-{encoded}")
+}
+
+fn platform_subnet_owner_strings(network_id: u32, owner: &PlatformOutputOwner) -> Vec<String> {
+    owner
+        .addresses
+        .iter()
+        .copied()
+        .map(|address| format_platform_address(network_id, address))
+        .collect()
+}
+
+fn platform_subnet_to_l1_conversion_id(unsigned_tx: &serde_json::Value) -> Option<[u8; 32]> {
+    let subnet_id = parse_platform_id_32(unsigned_tx.get("subnetID")?.as_str()?)?;
+    let manager_chain_id = parse_platform_id_32(unsigned_tx.get("chainID")?.as_str()?)?;
+    let manager_address = parse_hex_bytes(unsigned_tx.get("address")?.as_str()?)?;
+    let validators = unsigned_tx.get("validators")?.as_array()?;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&subnet_id);
+    bytes.extend_from_slice(&manager_chain_id);
+    bytes.extend_from_slice(&(manager_address.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&manager_address);
+    bytes.extend_from_slice(&(validators.len() as u32).to_be_bytes());
+    for validator in validators {
+        let node_id = parse_node_id_20(validator.get("nodeID")?.as_str()?)?;
+        let public_key = parse_hex_bytes(validator.get("signer")?.get("publicKey")?.as_str()?)?;
+        if public_key.len() != 48 {
+            return None;
+        }
+        let weight = platform_json_u64(validator.get("weight")?)?;
+        bytes.extend_from_slice(&20u32.to_be_bytes());
+        bytes.extend_from_slice(&node_id);
+        bytes.extend_from_slice(&public_key);
+        bytes.extend_from_slice(&weight.to_be_bytes());
+    }
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(&bytes));
+    Some(out)
+}
+
+fn scan_platform_subnet_api_state(
+    node: &NodeState,
+) -> std::collections::BTreeMap<[u8; 32], PlatformSubnetApiState> {
+    let mut subnets = std::collections::BTreeMap::<[u8; 32], PlatformSubnetApiState>::new();
+    let mut seen_txs = std::collections::HashSet::new();
+
+    for (_, raw_block) in platform_sorted_pchain_blocks(&node.db) {
+        let Ok(txs) = avalanche_rs::pchain::extract_platform_tx_bytes_from_block(&raw_block) else {
+            continue;
+        };
+        for tx_bytes in txs {
+            let mut tx_id = [0u8; 32];
+            tx_id.copy_from_slice(&Sha256::digest(&tx_bytes));
+            if !seen_txs.insert(tx_id) {
+                continue;
+            }
+
+            let Ok(tx_json) = avalanche_rs::pchain::parse_platform_tx_json(&tx_bytes) else {
+                continue;
+            };
+            let Some(unsigned_tx) = tx_json.get("unsignedTx") else {
+                continue;
+            };
+
+            if let Some(owner_value) = unsigned_tx.get("owner") {
+                if unsigned_tx.get("subnetID").is_none() {
+                    if let Some(owner) = platform_output_owner_from_value(owner_value) {
+                        subnets.entry(tx_id).or_default().owner = Some(owner);
+                    }
+                    continue;
+                }
+            }
+
+            if let Some(new_owner_value) = unsigned_tx.get("newOwner") {
+                if let Some(subnet_id) = unsigned_tx
+                    .get("subnetID")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_platform_id_32)
+                {
+                    if let Some(owner) = platform_output_owner_from_value(new_owner_value) {
+                        subnets.entry(subnet_id).or_default().owner = Some(owner);
+                    }
+                }
+                continue;
+            }
+
+            if unsigned_tx.get("assetID").is_some() && unsigned_tx.get("subnetID").is_some() {
+                if let Some(subnet_id) = unsigned_tx
+                    .get("subnetID")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_platform_id_32)
+                {
+                    subnets
+                        .entry(subnet_id)
+                        .or_default()
+                        .subnet_transformation_tx_id = Some(tx_id);
+                }
+                continue;
+            }
+
+            if unsigned_tx.get("chainID").is_some() && unsigned_tx.get("validators").is_some() {
+                if let Some(subnet_id) = unsigned_tx
+                    .get("subnetID")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_platform_id_32)
+                {
+                    let subnet = subnets.entry(subnet_id).or_default();
+                    subnet.conversion_id = platform_subnet_to_l1_conversion_id(unsigned_tx);
+                    subnet.manager_chain_id = unsigned_tx
+                        .get("chainID")
+                        .and_then(|value| value.as_str())
+                        .and_then(parse_platform_id_32);
+                    subnet.manager_address = unsigned_tx
+                        .get("address")
+                        .and_then(|value| value.as_str())
+                        .and_then(parse_hex_bytes);
+                }
+            }
+        }
+    }
+
+    subnets
+}
+
+fn platform_subnet_summary_json(
+    network_id: u32,
+    subnet_id: &SubnetId,
+    subnet: Option<&PlatformSubnetApiState>,
+) -> serde_json::Value {
+    let (control_keys, threshold) = match subnet {
+        Some(subnet) if subnet.subnet_transformation_tx_id.is_none() => subnet
+            .owner
+            .as_ref()
+            .map(|owner| {
+                (
+                    platform_subnet_owner_strings(network_id, owner),
+                    owner.threshold.to_string(),
+                )
+            })
+            .unwrap_or_else(|| (Vec::new(), "0".to_string())),
+        _ => (Vec::new(), "0".to_string()),
+    };
+
     serde_json::json!({
         "id": cb58_encode_id(subnet_id.0),
-        "controlKeys": [],
-        "threshold": "0",
+        "controlKeys": control_keys,
+        "threshold": threshold,
     })
 }
 
@@ -5960,24 +6657,23 @@ async fn platform_get_subnet_result(
         return Err("the primary network isn't a subnet".to_string());
     }
 
-    let tracker = node.subnet_tracker.read().await;
-    if !tracker.tracked_subnets().contains(subnet_id) {
+    let subnets = scan_platform_subnet_api_state(node);
+    let Some(subnet) = subnets.get(&subnet_id.0) else {
         return Err(format!(
             "\"{}\" is not a subnet",
             cb58_encode_id(subnet_id.0)
         ));
-    }
+    };
 
-    let empty_id = cb58_encode_id([0u8; 32]);
     Ok(serde_json::json!({
-        "isPermissioned": false,
-        "controlKeys": [],
-        "threshold": "0",
-        "locktime": "0",
-        "subnetTransformationTxID": empty_id,
-        "conversionID": cb58_encode_id([0u8; 32]),
-        "managerChainID": cb58_encode_id([0u8; 32]),
-        "managerAddress": serde_json::Value::Null,
+        "isPermissioned": subnet.subnet_transformation_tx_id.is_none() && subnet.conversion_id.is_none(),
+        "controlKeys": subnet.owner.as_ref().map(|owner| platform_subnet_owner_strings(node.config.network_id, owner)).unwrap_or_default(),
+        "threshold": subnet.owner.as_ref().map(|owner| owner.threshold.to_string()).unwrap_or_else(|| "0".to_string()),
+        "locktime": subnet.owner.as_ref().map(|owner| owner.locktime.to_string()).unwrap_or_else(|| "0".to_string()),
+        "subnetTransformationTxID": subnet.subnet_transformation_tx_id.map(cb58_encode_id).unwrap_or_else(|| cb58_encode_id([0u8; 32])),
+        "conversionID": subnet.conversion_id.map(cb58_encode_id).unwrap_or_else(|| cb58_encode_id([0u8; 32])),
+        "managerChainID": subnet.manager_chain_id.map(cb58_encode_id).unwrap_or_else(|| cb58_encode_id([0u8; 32])),
+        "managerAddress": subnet.manager_address.as_ref().map(hex::encode),
     }))
 }
 
@@ -5985,12 +6681,18 @@ async fn platform_get_subnets_result(
     node: &NodeState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let tracker = node.subnet_tracker.read().await;
-    let tracked_subnets = tracker.tracked_subnets();
-    let mut subnet_ids = if let Some(requested) = platform_subnet_ids_param(params)? {
+    let subnets_by_id = scan_platform_subnet_api_state(node);
+    let requested_subnet_ids = platform_subnet_ids_param(params)?;
+    let mut subnet_ids = if let Some(requested) = requested_subnet_ids {
         requested
     } else {
-        tracked_subnets.clone()
+        let mut all = subnets_by_id
+            .keys()
+            .copied()
+            .map(SubnetId)
+            .collect::<Vec<_>>();
+        all.push(SubnetId::primary_network());
+        all
     };
 
     if subnet_ids.is_empty() {
@@ -6002,11 +6704,22 @@ async fn platform_get_subnets_result(
 
     let mut subnets = Vec::new();
     for subnet_id in subnet_ids {
-        if subnet_id != SubnetId::primary_network() && !tracked_subnets.contains(&subnet_id) {
+        if subnet_id == SubnetId::primary_network() {
+            subnets.push(platform_subnet_summary_json(
+                node.config.network_id,
+                &subnet_id,
+                None,
+            ));
             continue;
         }
 
-        subnets.push(platform_subnet_summary_json(&subnet_id));
+        if let Some(subnet) = subnets_by_id.get(&subnet_id.0) {
+            subnets.push(platform_subnet_summary_json(
+                node.config.network_id,
+                &subnet_id,
+                Some(subnet),
+            ));
+        }
     }
 
     Ok(serde_json::json!({ "subnets": subnets }))
@@ -6021,22 +6734,10 @@ async fn platform_blockchains_result(node: &NodeState) -> serde_json::Value {
         "vmID": EVM_VM_ID,
     })];
 
-    if let Some(x_chain_id) = info_xchain_blockchain_id(node.config.network_id) {
-        blockchains.push(serde_json::json!({
-            "id": cb58_encode_id(x_chain_id),
-            "name": "X-Chain",
-            "subnetID": cb58_encode_id(SubnetId::primary_network().0),
-            "vmID": AVM_VM_ID,
-        }));
-    }
-
-    let mut builtins = std::collections::HashSet::from([
+    let builtins = std::collections::HashSet::from([
         platform_pchain_blockchain_id(),
         platform_cchain_blockchain_id(node.config.network_id),
     ]);
-    if let Some(x_chain_id) = info_xchain_blockchain_id(node.config.network_id) {
-        builtins.insert(x_chain_id);
-    }
 
     let tracker = node.subnet_tracker.read().await;
     let mut custom = tracker
@@ -6085,9 +6786,6 @@ async fn platform_validates_ids(node: &NodeState, subnet_id: &SubnetId) -> Vec<S
         blockchain_ids.push(cb58_encode_id(platform_cchain_blockchain_id(
             node.config.network_id,
         )));
-        if let Some(x_chain_id) = info_xchain_blockchain_id(node.config.network_id) {
-            blockchain_ids.push(cb58_encode_id(x_chain_id));
-        }
     }
 
     let tracker = node.subnet_tracker.read().await;
@@ -6110,8 +6808,10 @@ async fn platform_validator_records(
     node: &NodeState,
     params: &serde_json::Value,
 ) -> Vec<PlatformValidatorRecord> {
-    let mut records = if let Some(subnet_id_str) = platform_subnet_id_param(params) {
-        match SubnetId::from_str_any(subnet_id_str) {
+    let requested_subnet_id = platform_subnet_id_param(params).and_then(SubnetId::from_str_any);
+
+    let mut records = if let Some(subnet_id) = requested_subnet_id.clone() {
+        match Some(subnet_id) {
             Some(subnet_id) if subnet_id != SubnetId::primary_network() => {
                 let tracker = node.subnet_tracker.read().await;
                 tracker
@@ -6125,7 +6825,8 @@ async fn platform_validator_records(
                                 node_id: validator.node_id.to_string(),
                                 weight: validator.weight,
                                 start_time: validator.start_time,
-                                end_time: validator.end_time,
+                                end_time: Some(validator.end_time),
+                                l1: None,
                             })
                             .collect::<Vec<_>>()
                     })
@@ -6138,7 +6839,8 @@ async fn platform_validator_records(
                     node_id: validator.node_id.clone(),
                     weight: validator.weight,
                     start_time: validator.start_time,
-                    end_time: validator.end_time,
+                    end_time: Some(validator.end_time),
+                    l1: None,
                 })
                 .collect::<Vec<_>>(),
         }
@@ -6149,10 +6851,50 @@ async fn platform_validator_records(
                 node_id: validator.node_id.clone(),
                 weight: validator.weight,
                 start_time: validator.start_time,
-                end_time: validator.end_time,
+                end_time: Some(validator.end_time),
+                l1: None,
             })
             .collect::<Vec<_>>()
     };
+
+    if let Some(subnet_id) = requested_subnet_id.filter(|id| *id != SubnetId::primary_network()) {
+        if let Ok((validators, fee_state, _)) = scan_platform_l1_validator_records(node) {
+            records.extend(
+                validators
+                    .into_iter()
+                    .filter_map(|(validation_id, validator)| {
+                        if validator.subnet_id != subnet_id.0 {
+                            return None;
+                        }
+                        let remaining_balance_owner = validator.remaining_balance_owner?;
+                        let deactivation_owner = validator.deactivation_owner?;
+                        let active = validator.weight != 0 && validator.end_accumulated_fee != 0;
+                        let balance = if active {
+                            validator
+                                .end_accumulated_fee
+                                .saturating_sub(fee_state.accrued_fees)
+                        } else {
+                            0
+                        };
+                        Some(PlatformValidatorRecord {
+                            node_id: format!("NodeID-{}", cb58_encode(&validator.node_id)),
+                            weight: validator.weight,
+                            start_time: validator.start_time,
+                            end_time: None,
+                            l1: Some(PlatformL1ValidatorApiRecord {
+                                validation_id,
+                                public_key: validator.public_key,
+                                remaining_balance_owner,
+                                deactivation_owner,
+                                min_nonce: validator.min_nonce,
+                                balance,
+                                active,
+                            }),
+                        })
+                    }),
+            );
+        }
+    }
 
     let requested_node_ids = platform_node_ids_param(params);
     if !requested_node_ids.is_empty() {
@@ -6162,7 +6904,11 @@ async fn platform_validator_records(
         records.retain(|record| requested.contains(&record.node_id));
     }
 
-    records.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    records.sort_by(|a, b| {
+        a.node_id
+            .cmp(&b.node_id)
+            .then_with(|| a.start_time.cmp(&b.start_time))
+    });
     records
 }
 
@@ -6176,11 +6922,31 @@ async fn platform_validator_response_values(
         .into_iter()
         .map(|validator| {
             let status = validator.status(now);
+            if let Some(l1) = validator.l1 {
+                return serde_json::json!({
+                    "nodeID": validator.node_id,
+                    "startTime": validator.start_time.to_string(),
+                    "weight": validator.weight.to_string(),
+                    "validationID": cb58_encode_id(l1.validation_id),
+                    "publicKey": format!("0x{}", hex::encode(l1.public_key)),
+                    "remainingBalanceOwner": platform_l1_owner_json(
+                        node.config.network_id,
+                        &l1.remaining_balance_owner,
+                    ),
+                    "deactivationOwner": platform_l1_owner_json(
+                        node.config.network_id,
+                        &l1.deactivation_owner,
+                    ),
+                    "minNonce": l1.min_nonce.to_string(),
+                    "balance": l1.balance.to_string(),
+                    "status": status,
+                });
+            }
             let is_connected = connected.contains(&validator.node_id);
             serde_json::json!({
                 "nodeID": validator.node_id,
                 "startTime": validator.start_time.to_string(),
-                "endTime": validator.end_time.to_string(),
+                "endTime": validator.end_time.unwrap_or_default().to_string(),
                 "weight": validator.weight.to_string(),
                 "stakeAmount": validator.weight.to_string(),
                 "delegationFee": "0.0000",
@@ -6220,14 +6986,14 @@ fn platform_pchain_blockchain_id() -> [u8; 32] {
     [0u8; 32]
 }
 
-fn platform_block_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn platform_block_id_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("blockID"))
         .and_then(|value| value.as_str())
         .or_else(|| params.get(0).and_then(|value| value.as_str()))
 }
 
-fn platform_blockchain_id_param<'a>(params: &'a serde_json::Value) -> Option<&'a str> {
+fn platform_blockchain_id_param(params: &serde_json::Value) -> Option<&str> {
     platform_params_object(params)
         .and_then(|obj| obj.get("blockchainID"))
         .and_then(|value| value.as_str())
@@ -9159,7 +9925,6 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
 
             let subnet_id = if blockchain_id == platform_pchain_blockchain_id()
                 || blockchain_id == platform_cchain_blockchain_id(node.config.network_id)
-                || info_xchain_blockchain_id(node.config.network_id) == Some(blockchain_id)
             {
                 Some(SubnetId::primary_network())
             } else {
@@ -9257,6 +10022,19 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             }
         }
 
+        "platform.getL1Validator" => {
+            let Some(validation_id_str) = platform_validation_id_param(params) else {
+                return rpc_error(-32602, "missing validationID", id);
+            };
+            let Some(validation_id) = parse_platform_id_32(validation_id_str) else {
+                return rpc_error(-32602, "invalid validationID", id);
+            };
+            match platform_l1_validator_result(node, validation_id) {
+                Ok(result) => rpc_ok(&result.to_string(), id),
+                Err(err) => rpc_error(-32000, &err, id),
+            }
+        }
+
         "platform.getFeeConfig" => rpc_ok(
             &platform_fee_config_result(node.config.network_id).to_string(),
             id,
@@ -9266,6 +10044,16 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             &platform_validator_fee_config_result(node.config.network_id).to_string(),
             id,
         ),
+
+        "platform.getFeeState" => match platform_fee_state_result(node) {
+            Ok(result) => rpc_ok(&result.to_string(), id),
+            Err(err) => rpc_error(-32000, &err, id),
+        },
+
+        "platform.getValidatorFeeState" => match platform_validator_fee_state_result(node) {
+            Ok(result) => rpc_ok(&result.to_string(), id),
+            Err(err) => rpc_error(-32000, &err, id),
+        },
 
         "health" | "health.health" => {
             let tags = health_tags_param(params);
@@ -10208,9 +10996,9 @@ fn init_logging(level: &str, format: &str) {
 mod integration_tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::sync::Mutex;
 
     static FILTER_TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -10388,13 +11176,17 @@ mod integration_tests {
         })
     }
 
-    fn make_banff_std(parent: [u8; 32], height: u64) -> Vec<u8> {
+    fn make_banff_std_with_timestamp(parent: [u8; 32], height: u64, timestamp: u64) -> Vec<u8> {
         let mut raw = vec![0u8; 54];
         raw[2..6].copy_from_slice(&32u32.to_be_bytes());
-        raw[6..14].copy_from_slice(&1_700_000_000u64.to_be_bytes());
+        raw[6..14].copy_from_slice(&timestamp.to_be_bytes());
         raw[14..46].copy_from_slice(&parent);
         raw[46..54].copy_from_slice(&height.to_be_bytes());
         raw
+    }
+
+    fn make_banff_std(parent: [u8; 32], height: u64) -> Vec<u8> {
+        make_banff_std_with_timestamp(parent, height, 1_700_000_000)
     }
 
     fn make_signed_platform_base_tx_bytes() -> Vec<u8> {
@@ -10466,10 +11258,12 @@ mod integration_tests {
         bytes
     }
 
-    fn make_platform_base_tx_with_io(outputs: &[Vec<u8>], inputs: &[Vec<u8>]) -> Vec<u8> {
+    fn make_platform_base_tx_fields_with_io(
+        outputs: &[Vec<u8>],
+        inputs: &[Vec<u8>],
+        memo: &[u8],
+    ) -> Vec<u8> {
         let mut tx_bytes = Vec::new();
-        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
-        tx_bytes.extend_from_slice(&34u32.to_be_bytes());
         tx_bytes.extend_from_slice(&1u32.to_be_bytes());
         tx_bytes.extend_from_slice(&[0u8; 32]);
         tx_bytes.extend_from_slice(&(outputs.len() as u32).to_be_bytes());
@@ -10480,7 +11274,101 @@ mod integration_tests {
         for input in inputs {
             tx_bytes.extend_from_slice(input);
         }
+        tx_bytes.extend_from_slice(&(memo.len() as u32).to_be_bytes());
+        tx_bytes.extend_from_slice(memo);
+        tx_bytes
+    }
+
+    fn make_platform_base_tx_with_io(outputs: &[Vec<u8>], inputs: &[Vec<u8>]) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&34u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&make_platform_base_tx_fields_with_io(outputs, inputs, &[]));
         tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_add_subnet_validator_tx_bytes_with_io(
+        node_id: [u8; 20],
+        subnet_id: [u8; 32],
+        outputs: &[Vec<u8>],
+        inputs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&13u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&make_platform_base_tx_fields_with_io(outputs, inputs, &[]));
+        tx_bytes.extend_from_slice(&node_id);
+        tx_bytes.extend_from_slice(&100u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&200u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&300u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&subnet_id);
+        tx_bytes.extend_from_slice(&make_platform_auth_bytes(&[]));
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_create_chain_tx_bytes_with_io(
+        outputs: &[Vec<u8>],
+        inputs: &[Vec<u8>],
+        subnet_id: [u8; 32],
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&15u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&make_platform_base_tx_fields_with_io(
+            outputs, inputs, b"memo",
+        ));
+        tx_bytes.extend_from_slice(&subnet_id);
+        tx_bytes.extend_from_slice(&(3u16).to_be_bytes());
+        tx_bytes.extend_from_slice(b"evm");
+        tx_bytes.extend_from_slice(&[0x88; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&(2u32).to_be_bytes());
+        tx_bytes.extend_from_slice(&[0xAA, 0xBB]);
+        tx_bytes.extend_from_slice(&make_platform_auth_bytes(&[]));
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_import_tx_bytes_with_io(
+        outputs: &[Vec<u8>],
+        inputs: &[Vec<u8>],
+        source_chain: [u8; 32],
+        imported_inputs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&17u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&make_platform_base_tx_fields_with_io(
+            outputs, inputs, b"memo",
+        ));
+        tx_bytes.extend_from_slice(&source_chain);
+        tx_bytes.extend_from_slice(&(imported_inputs.len() as u32).to_be_bytes());
+        for input in imported_inputs {
+            tx_bytes.extend_from_slice(input);
+        }
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_export_tx_bytes_with_io(
+        outputs: &[Vec<u8>],
+        inputs: &[Vec<u8>],
+        destination_chain: [u8; 32],
+        exported_outputs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&18u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&make_platform_base_tx_fields_with_io(
+            outputs, inputs, b"memo",
+        ));
+        tx_bytes.extend_from_slice(&destination_chain);
+        tx_bytes.extend_from_slice(&(exported_outputs.len() as u32).to_be_bytes());
+        for output in exported_outputs {
+            tx_bytes.extend_from_slice(output);
+        }
         tx_bytes.extend_from_slice(&0u32.to_be_bytes());
         tx_bytes
     }
@@ -10569,6 +11457,93 @@ mod integration_tests {
         tx_bytes
     }
 
+    fn make_platform_output_owner_interface_bytes(
+        owners: &[[u8; 20]],
+        locktime: u64,
+        threshold: u32,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&11u32.to_be_bytes());
+        bytes.extend_from_slice(&locktime.to_be_bytes());
+        bytes.extend_from_slice(&threshold.to_be_bytes());
+        bytes.extend_from_slice(&(owners.len() as u32).to_be_bytes());
+        for owner in owners {
+            bytes.extend_from_slice(owner);
+        }
+        bytes
+    }
+
+    fn make_platform_create_subnet_tx_bytes(
+        owners: &[[u8; 20]],
+        locktime: u64,
+        threshold: u32,
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&16u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&make_platform_output_owner_interface_bytes(
+            owners, locktime, threshold,
+        ));
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_transfer_subnet_ownership_tx_bytes(
+        subnet_id: [u8; 32],
+        owners: &[[u8; 20]],
+        locktime: u64,
+        threshold: u32,
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&33u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&subnet_id);
+        tx_bytes.extend_from_slice(&make_platform_auth_bytes(&[]));
+        tx_bytes.extend_from_slice(&make_platform_output_owner_interface_bytes(
+            owners, locktime, threshold,
+        ));
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_transform_subnet_tx_bytes(subnet_id: [u8; 32], asset_id: [u8; 32]) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&24u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&subnet_id);
+        tx_bytes.extend_from_slice(&asset_id);
+        tx_bytes.extend_from_slice(&1_000u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&10_000u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&100_000u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&100u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&1_000u64.to_be_bytes());
+        tx_bytes.extend_from_slice(&86_400u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&(86_400u32 * 30).to_be_bytes());
+        tx_bytes.extend_from_slice(&1_000u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&25u64.to_be_bytes());
+        tx_bytes.push(5u8);
+        tx_bytes.extend_from_slice(&80_000u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&make_platform_auth_bytes(&[]));
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
     fn make_banff_proposal_with_tx(parent: [u8; 32], height: u64, proposal_tx: &[u8]) -> Vec<u8> {
         let mut raw = Vec::new();
         raw.extend_from_slice(&0u16.to_be_bytes());
@@ -10591,7 +11566,16 @@ mod integration_tests {
     }
 
     fn make_banff_std_with_txs(parent: [u8; 32], height: u64, txs: &[Vec<u8>]) -> Vec<u8> {
-        let mut raw = make_banff_std(parent, height);
+        make_banff_std_with_txs_at(parent, height, 1_700_000_000, txs)
+    }
+
+    fn make_banff_std_with_txs_at(
+        parent: [u8; 32],
+        height: u64,
+        timestamp: u64,
+        txs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut raw = make_banff_std_with_timestamp(parent, height, timestamp);
         raw.extend_from_slice(&(txs.len() as u32).to_be_bytes());
         for tx in txs {
             raw.extend_from_slice(tx);
@@ -10603,6 +11587,227 @@ mod integration_tests {
         let mut h = Sha256::new();
         h.update(data);
         h.finalize().into()
+    }
+
+    fn append_platform_id_for_test(id: [u8; 32], suffix: u32) -> [u8; 32] {
+        let mut bytes = Vec::with_capacity(36);
+        bytes.extend_from_slice(&id);
+        bytes.extend_from_slice(&suffix.to_be_bytes());
+        sha256_bytes(&bytes)
+    }
+
+    fn make_platform_pchain_owner_bytes(owner: [u8; 20]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&owner);
+        bytes
+    }
+
+    fn make_platform_auth_bytes(sig_indices: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&10u32.to_be_bytes());
+        bytes.extend_from_slice(&(sig_indices.len() as u32).to_be_bytes());
+        for sig_index in sig_indices {
+            bytes.extend_from_slice(&sig_index.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn make_platform_bitset(signers: usize) -> Vec<u8> {
+        if signers == 0 {
+            return Vec::new();
+        }
+        let mut bytes = vec![0u8; signers.div_ceil(8)];
+        for signer in 0..signers {
+            let byte_index = signer / 8;
+            let bit_index = signer % 8;
+            bytes[byte_index] |= 1u8 << bit_index;
+        }
+        bytes
+    }
+
+    fn make_platform_warp_message_bytes(payload: &[u8], signer_count: usize) -> Vec<u8> {
+        let signers = make_platform_bitset(signer_count);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&[0xAA; 32]);
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&(signers.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&signers);
+        bytes.extend_from_slice(&[0xBB; 96]);
+        bytes
+    }
+
+    fn make_platform_addressed_call_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&20u32.to_be_bytes());
+        bytes.extend_from_slice(&[0xCC; 20]);
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn make_platform_register_l1_validator_message_payload(
+        subnet_id: [u8; 32],
+        node_id: [u8; 20],
+        owner: [u8; 20],
+        weight: u64,
+        expiry: u64,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&subnet_id);
+        bytes.extend_from_slice(&20u32.to_be_bytes());
+        bytes.extend_from_slice(&node_id);
+        bytes.extend_from_slice(&[0x11; 48]);
+        bytes.extend_from_slice(&expiry.to_be_bytes());
+        bytes.extend_from_slice(&make_platform_pchain_owner_bytes(owner));
+        bytes.extend_from_slice(&make_platform_pchain_owner_bytes(owner));
+        bytes.extend_from_slice(&weight.to_be_bytes());
+        bytes
+    }
+
+    fn make_platform_l1_validator_weight_message_payload(
+        validation_id: [u8; 32],
+        nonce: u64,
+        weight: u64,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&3u32.to_be_bytes());
+        bytes.extend_from_slice(&validation_id);
+        bytes.extend_from_slice(&nonce.to_be_bytes());
+        bytes.extend_from_slice(&weight.to_be_bytes());
+        bytes
+    }
+
+    fn make_platform_convert_subnet_to_l1_tx_bytes(
+        subnet_id: [u8; 32],
+        validators: &[([u8; 20], u64, u64, [u8; 20])],
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&35u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&subnet_id);
+        tx_bytes.extend_from_slice(&[0x44; 32]);
+        tx_bytes.extend_from_slice(&3u32.to_be_bytes());
+        tx_bytes.extend_from_slice(b"mgr");
+        tx_bytes.extend_from_slice(&(validators.len() as u32).to_be_bytes());
+        for (node_id, weight, balance, owner) in validators {
+            tx_bytes.extend_from_slice(&20u32.to_be_bytes());
+            tx_bytes.extend_from_slice(node_id);
+            tx_bytes.extend_from_slice(&weight.to_be_bytes());
+            tx_bytes.extend_from_slice(&balance.to_be_bytes());
+            tx_bytes.extend_from_slice(&[0x22; 48]);
+            tx_bytes.extend_from_slice(&[0x33; 96]);
+            tx_bytes.extend_from_slice(&make_platform_pchain_owner_bytes(*owner));
+            tx_bytes.extend_from_slice(&make_platform_pchain_owner_bytes(*owner));
+        }
+        tx_bytes.extend_from_slice(&make_platform_auth_bytes(&[]));
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_register_l1_validator_tx_bytes(
+        subnet_id: [u8; 32],
+        node_id: [u8; 20],
+        owner: [u8; 20],
+        weight: u64,
+        balance: u64,
+        expiry: u64,
+        signer_count: usize,
+    ) -> (Vec<u8>, [u8; 32]) {
+        let payload = make_platform_register_l1_validator_message_payload(
+            subnet_id, node_id, owner, weight, expiry,
+        );
+        let validation_id = sha256_bytes(&payload);
+        let addressed_call = make_platform_addressed_call_bytes(&payload);
+        let warp_message = make_platform_warp_message_bytes(&addressed_call, signer_count);
+
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&36u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&balance.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0x55; 96]);
+        tx_bytes.extend_from_slice(&(warp_message.len() as u32).to_be_bytes());
+        tx_bytes.extend_from_slice(&warp_message);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        (tx_bytes, validation_id)
+    }
+
+    fn make_platform_set_l1_validator_weight_tx_bytes(
+        validation_id: [u8; 32],
+        nonce: u64,
+        weight: u64,
+        signer_count: usize,
+    ) -> Vec<u8> {
+        let payload =
+            make_platform_l1_validator_weight_message_payload(validation_id, nonce, weight);
+        let addressed_call = make_platform_addressed_call_bytes(&payload);
+        let warp_message = make_platform_warp_message_bytes(&addressed_call, signer_count);
+
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&37u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&(warp_message.len() as u32).to_be_bytes());
+        tx_bytes.extend_from_slice(&warp_message);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_increase_l1_validator_balance_tx_bytes(
+        validation_id: [u8; 32],
+        balance: u64,
+    ) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&38u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&validation_id);
+        tx_bytes.extend_from_slice(&balance.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
+    }
+
+    fn make_platform_disable_l1_validator_tx_bytes(validation_id: [u8; 32]) -> Vec<u8> {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&0u16.to_be_bytes());
+        tx_bytes.extend_from_slice(&39u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&1u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&[0u8; 32]);
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes.extend_from_slice(&validation_id);
+        tx_bytes.extend_from_slice(&make_platform_auth_bytes(&[]));
+        tx_bytes.extend_from_slice(&0u32.to_be_bytes());
+        tx_bytes
     }
 
     fn make_test_log(
@@ -10829,60 +12034,233 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_platform_get_subnets_supports_ids_filter_and_shapes() {
-        let node = make_test_node(1);
-        let custom_subnet = SubnetId([0xAA; 32]);
-        node.subnet_tracker
-            .write()
-            .await
-            .add_subnet(custom_subnet.clone());
+        let node = make_test_node(12345);
+        let transformed_owner = [0xAA; 20];
+        let converted_owner = [0xBB; 20];
+        let converted_new_owner = [0xBC; 20];
+
+        let transform_create_tx = make_platform_create_subnet_tx_bytes(&[transformed_owner], 5, 1);
+        let transformed_subnet = SubnetId(sha256_bytes(&transform_create_tx));
+        let transform_tx =
+            make_platform_transform_subnet_tx_bytes(transformed_subnet.0, [0x11; 32]);
+
+        let convert_create_tx = make_platform_create_subnet_tx_bytes(&[converted_owner], 0, 1);
+        let converted_subnet = SubnetId(sha256_bytes(&convert_create_tx));
+        let transfer_tx = make_platform_transfer_subnet_ownership_tx_bytes(
+            converted_subnet.0,
+            &[converted_new_owner],
+            9,
+            1,
+        );
+        let convert_tx = make_platform_convert_subnet_to_l1_tx_bytes(
+            converted_subnet.0,
+            &[([0x10; 20], 1, 0, converted_new_owner)],
+        );
+
+        let block1 =
+            make_banff_std_with_txs([0x10; 32], 1, &[transform_create_tx, convert_create_tx]);
+        let block1_id = sha256_bytes(&block1);
+        let block2 =
+            make_banff_std_with_txs(block1_id, 2, &[transform_tx, transfer_tx, convert_tx]);
+        node.db.put_cf(CF_BLOCKS, &block1_id, &block1).unwrap();
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block2), &block2)
+            .unwrap();
 
         let req = format!(
-            r#"{{"jsonrpc":"2.0","method":"platform.getSubnets","params":{{"ids":["{}","{}","{}"]}},"id":4}}"#,
+            r#"{{"jsonrpc":"2.0","method":"platform.getSubnets","params":{{"ids":["{}","{}","{}","{}"]}},"id":4}}"#,
             cb58_encode_id(SubnetId::primary_network().0),
-            cb58_encode_id(custom_subnet.0),
+            cb58_encode_id(transformed_subnet.0),
+            cb58_encode_id(converted_subnet.0),
             cb58_encode_id([0xBB; 32]),
         );
         let response = handle_rpc_request(&req, &node).await;
         let json: serde_json::Value = serde_json::from_str(&response).unwrap();
         let subnets = json["result"]["subnets"].as_array().unwrap();
-        assert_eq!(subnets.len(), 2);
+        assert_eq!(subnets.len(), 3);
+
+        let subnets_by_id = subnets
+            .iter()
+            .map(|subnet| (subnet["id"].as_str().unwrap().to_string(), subnet.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let primary_id = cb58_encode_id(SubnetId::primary_network().0);
+        let transformed_id = cb58_encode_id(transformed_subnet.0);
+        let converted_id = cb58_encode_id(converted_subnet.0);
+
         assert_eq!(
-            subnets[0]["id"],
-            cb58_encode_id(SubnetId::primary_network().0)
+            subnets_by_id[&primary_id]["controlKeys"],
+            serde_json::json!([])
         );
-        assert_eq!(subnets[1]["id"], cb58_encode_id(custom_subnet.0));
-        assert_eq!(subnets[0]["controlKeys"], serde_json::json!([]));
-        assert_eq!(subnets[1]["controlKeys"], serde_json::json!([]));
-        assert_eq!(subnets[0]["threshold"], "0");
-        assert_eq!(subnets[1]["threshold"], "0");
+        assert_eq!(
+            subnets_by_id[&transformed_id]["controlKeys"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            subnets_by_id[&converted_id]["controlKeys"],
+            serde_json::json!([format_platform_address(
+                node.config.network_id,
+                converted_new_owner
+            )])
+        );
+        assert_eq!(subnets_by_id[&primary_id]["threshold"], "0");
+        assert_eq!(subnets_by_id[&transformed_id]["threshold"], "0");
+        assert_eq!(subnets_by_id[&converted_id]["threshold"], "1");
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_subnets_default_includes_primary_and_hides_transformed_owner() {
+        let node = make_test_node(12345);
+        let transformed_owner = [0xD1; 20];
+        let permissioned_owner = [0xD2; 20];
+
+        let transformed_create_tx =
+            make_platform_create_subnet_tx_bytes(&[transformed_owner], 5, 1);
+        let transformed_subnet = SubnetId(sha256_bytes(&transformed_create_tx));
+        let transform_tx =
+            make_platform_transform_subnet_tx_bytes(transformed_subnet.0, [0x31; 32]);
+
+        let permissioned_create_tx =
+            make_platform_create_subnet_tx_bytes(&[permissioned_owner], 7, 1);
+        let permissioned_subnet = SubnetId(sha256_bytes(&permissioned_create_tx));
+
+        let block1 = make_banff_std_with_txs(
+            [0x40; 32],
+            1,
+            &[transformed_create_tx, permissioned_create_tx],
+        );
+        let block1_id = sha256_bytes(&block1);
+        let block2 = make_banff_std_with_txs(block1_id, 2, &[transform_tx]);
+        node.db.put_cf(CF_BLOCKS, &block1_id, &block1).unwrap();
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block2), &block2)
+            .unwrap();
+
+        let response = handle_rpc_request(
+            r#"{"jsonrpc":"2.0","method":"platform.getSubnets","params":[],"id":41}"#,
+            &node,
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let subnets = json["result"]["subnets"].as_array().unwrap();
+        assert_eq!(subnets.len(), 3);
+
+        let subnets_by_id = subnets
+            .iter()
+            .map(|subnet| (subnet["id"].as_str().unwrap().to_string(), subnet.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let primary_id = cb58_encode_id(SubnetId::primary_network().0);
+        let transformed_id = cb58_encode_id(transformed_subnet.0);
+        let permissioned_id = cb58_encode_id(permissioned_subnet.0);
+
+        assert_eq!(
+            subnets_by_id[&primary_id]["controlKeys"],
+            serde_json::json!([])
+        );
+        assert_eq!(subnets_by_id[&primary_id]["threshold"], "0");
+        assert_eq!(
+            subnets_by_id[&transformed_id]["controlKeys"],
+            serde_json::json!([])
+        );
+        assert_eq!(subnets_by_id[&transformed_id]["threshold"], "0");
+        assert_eq!(
+            subnets_by_id[&permissioned_id]["controlKeys"],
+            serde_json::json!([format_platform_address(
+                node.config.network_id,
+                permissioned_owner
+            )])
+        );
+        assert_eq!(subnets_by_id[&permissioned_id]["threshold"], "1");
     }
 
     #[tokio::test]
     async fn test_platform_get_subnet_returns_shape_and_errors() {
-        let node = make_test_node(1);
-        let custom_subnet = SubnetId([0xCC; 32]);
-        node.subnet_tracker
-            .write()
-            .await
-            .add_subnet(custom_subnet.clone());
+        let node = make_test_node(12345);
+        let transformed_owner = [0xCD; 20];
+        let converted_owner_a = [0xCE; 20];
+        let converted_owner_b = [0xCF; 20];
+
+        let transform_create_tx = make_platform_create_subnet_tx_bytes(&[transformed_owner], 7, 1);
+        let transformed_subnet = SubnetId(sha256_bytes(&transform_create_tx));
+        let transform_tx =
+            make_platform_transform_subnet_tx_bytes(transformed_subnet.0, [0x21; 32]);
+        let transform_tx_id = cb58_encode_id(sha256_bytes(&transform_tx));
+
+        let convert_create_tx = make_platform_create_subnet_tx_bytes(&[converted_owner_a], 3, 1);
+        let converted_subnet = SubnetId(sha256_bytes(&convert_create_tx));
+        let transfer_tx = make_platform_transfer_subnet_ownership_tx_bytes(
+            converted_subnet.0,
+            &[converted_owner_a, converted_owner_b],
+            9,
+            2,
+        );
+        let convert_tx = make_platform_convert_subnet_to_l1_tx_bytes(
+            converted_subnet.0,
+            &[([0x20; 20], 1, 5, converted_owner_a)],
+        );
+        let convert_tx_json = avalanche_rs::pchain::parse_platform_tx_json(&convert_tx).unwrap();
+        let conversion_id = platform_subnet_to_l1_conversion_id(&convert_tx_json["unsignedTx"])
+            .map(cb58_encode_id)
+            .unwrap();
+
+        let block1 =
+            make_banff_std_with_txs([0x30; 32], 1, &[transform_create_tx, convert_create_tx]);
+        let block1_id = sha256_bytes(&block1);
+        let block2 =
+            make_banff_std_with_txs(block1_id, 2, &[transform_tx, transfer_tx, convert_tx]);
+        node.db.put_cf(CF_BLOCKS, &block1_id, &block1).unwrap();
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block2), &block2)
+            .unwrap();
 
         let req = format!(
             r#"{{"jsonrpc":"2.0","method":"platform.getSubnet","params":{{"subnetID":"{}"}},"id":5}}"#,
-            cb58_encode_id(custom_subnet.0)
+            cb58_encode_id(transformed_subnet.0)
         );
         let response = handle_rpc_request(&req, &node).await;
         let json: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(json["result"]["isPermissioned"], false);
-        assert_eq!(json["result"]["controlKeys"], serde_json::json!([]));
-        assert_eq!(json["result"]["threshold"], "0");
-        assert_eq!(json["result"]["locktime"], "0");
         assert_eq!(
-            json["result"]["subnetTransformationTxID"],
-            cb58_encode_id([0u8; 32])
+            json["result"]["controlKeys"],
+            serde_json::json!([format_platform_address(
+                node.config.network_id,
+                transformed_owner
+            )])
         );
+        assert_eq!(json["result"]["threshold"], "1");
+        assert_eq!(json["result"]["locktime"], "7");
+        assert_eq!(json["result"]["subnetTransformationTxID"], transform_tx_id);
         assert_eq!(json["result"]["conversionID"], cb58_encode_id([0u8; 32]));
         assert_eq!(json["result"]["managerChainID"], cb58_encode_id([0u8; 32]));
         assert!(json["result"]["managerAddress"].is_null());
+
+        let converted_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getSubnet","params":{{"subnetID":"{}"}},"id":55}}"#,
+            cb58_encode_id(converted_subnet.0)
+        );
+        let converted_response = handle_rpc_request(&converted_req, &node).await;
+        let converted_json: serde_json::Value = serde_json::from_str(&converted_response).unwrap();
+        assert_eq!(converted_json["result"]["isPermissioned"], false);
+        assert_eq!(
+            converted_json["result"]["controlKeys"],
+            serde_json::json!([
+                format_platform_address(node.config.network_id, converted_owner_a),
+                format_platform_address(node.config.network_id, converted_owner_b),
+            ])
+        );
+        assert_eq!(converted_json["result"]["threshold"], "2");
+        assert_eq!(converted_json["result"]["locktime"], "9");
+        assert_eq!(
+            converted_json["result"]["subnetTransformationTxID"],
+            cb58_encode_id([0u8; 32])
+        );
+        assert_eq!(converted_json["result"]["conversionID"], conversion_id);
+        assert_eq!(
+            converted_json["result"]["managerChainID"],
+            cb58_encode_id([0x44; 32])
+        );
+        assert_eq!(converted_json["result"]["managerAddress"], "6d6772");
 
         let primary_req = format!(
             r#"{{"jsonrpc":"2.0","method":"platform.getSubnet","params":{{"subnetID":"{}"}},"id":6}}"#,
@@ -10994,6 +12372,93 @@ mod integration_tests {
         let validator_json: serde_json::Value = serde_json::from_str(&validator_response).unwrap();
         assert_eq!(validator_json["result"]["nodeID"], current_node);
         assert_eq!(validator_json["result"]["weight"], "2000000000000");
+    }
+
+    #[tokio::test]
+    async fn test_platform_current_validator_endpoints_include_l1_validators_for_converted_subnets()
+    {
+        let node = make_test_node(12345);
+        let subnet_id = [0x98; 32];
+        let node_id = [0x99; 20];
+        let owner = [0x9A; 20];
+        let etna_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
+
+        let convert_tx =
+            make_platform_convert_subnet_to_l1_tx_bytes(subnet_id, &[(node_id, 7, 20, owner)]);
+        let validation_id = append_platform_id_for_test(subnet_id, 0);
+        let register_node_id = [0x9B; 20];
+        let (register_tx, register_validation_id) = make_platform_register_l1_validator_tx_bytes(
+            subnet_id,
+            register_node_id,
+            owner,
+            5,
+            15,
+            etna_time + 86_400,
+            2,
+        );
+        let set_weight_tx =
+            make_platform_set_l1_validator_weight_tx_bytes(register_validation_id, 0, 9, 1);
+
+        let block1 = make_banff_std_with_txs_at([0x14; 32], 1, etna_time + 10, &[convert_tx]);
+        let block1_id = sha256_bytes(&block1);
+        let block2 = make_banff_std_with_txs_at(block1_id, 2, etna_time + 20, &[register_tx]);
+        let block2_id = sha256_bytes(&block2);
+        let block3 = make_banff_std_with_txs_at(block2_id, 3, etna_time + 30, &[set_weight_tx]);
+        node.db.put_cf(CF_BLOCKS, &block1_id, &block1).unwrap();
+        node.db.put_cf(CF_BLOCKS, &block2_id, &block2).unwrap();
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block3), &block3)
+            .unwrap();
+
+        let current_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getCurrentValidators","params":{{"subnetID":"{}"}},"id":56}}"#,
+            cb58_encode_id(subnet_id)
+        );
+        let current_response = handle_rpc_request(&current_req, &node).await;
+        let current_json: serde_json::Value = serde_json::from_str(&current_response).unwrap();
+        let current_validators = current_json["result"]["validators"].as_array().unwrap();
+        assert_eq!(current_validators.len(), 1);
+        assert!(current_validators.iter().any(|validator| {
+            validator["validationID"] == cb58_encode_id(register_validation_id)
+                && validator["weight"] == "9"
+                && validator["balance"] == "5"
+                && validator["minNonce"] == "1"
+                && validator["remainingBalanceOwner"]["addresses"]
+                    == serde_json::json!([format_platform_address(node.config.network_id, owner)])
+                && validator["status"] == "current"
+        }));
+
+        let validator_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getValidator","params":{{"subnetID":"{}","nodeID":"{}"}},"id":57}}"#,
+            cb58_encode_id(subnet_id),
+            full_node_id_string(&NodeId(register_node_id))
+        );
+        let validator_response = handle_rpc_request(&validator_req, &node).await;
+        let validator_json: serde_json::Value = serde_json::from_str(&validator_response).unwrap();
+        assert_eq!(
+            validator_json["result"]["validationID"],
+            cb58_encode_id(register_validation_id)
+        );
+        assert_eq!(validator_json["result"]["weight"], "9");
+
+        let all_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getValidators","params":{{"subnetID":"{}"}},"id":58}}"#,
+            cb58_encode_id(subnet_id)
+        );
+        let all_response = handle_rpc_request(&all_req, &node).await;
+        let all_json: serde_json::Value = serde_json::from_str(&all_response).unwrap();
+        let validators = all_json["result"]["validators"].as_array().unwrap();
+        assert_eq!(validators.len(), 2);
+        assert!(validators.iter().any(|validator| {
+            validator["validationID"] == cb58_encode_id(validation_id)
+                && validator["balance"] == "0"
+                && validator["status"] == "completed"
+        }));
+        assert!(validators.iter().any(|validator| {
+            validator["validationID"] == cb58_encode_id(register_validation_id)
+                && validator["status"] == "current"
+        }));
     }
 
     #[tokio::test]
@@ -11354,6 +12819,184 @@ mod integration_tests {
             .all(|value| value.as_str().unwrap().starts_with("0x")));
         assert_eq!(utxos_json["result"]["encoding"], "hex");
         assert_eq!(utxos_json["result"]["endIndex"]["address"], owner_addr);
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_balance_and_utxos_include_admin_tx_base_io() {
+        let node = make_test_node(1);
+        let owner = [0x56; 20];
+        let asset_id = parse_platform_id_32(AVAX_ASSET_ID_MAINNET).unwrap();
+
+        let funding_tx = make_platform_base_tx_with_io(
+            &[
+                make_platform_transferable_output_bytes(asset_id, 90, owner),
+                make_platform_transferable_output_bytes(asset_id, 70, owner),
+            ],
+            &[],
+        );
+        let funding_tx_id = sha256_bytes(&funding_tx);
+
+        let create_chain_tx = make_platform_create_chain_tx_bytes_with_io(
+            &[make_platform_transferable_output_bytes(asset_id, 30, owner)],
+            &[make_platform_transferable_input_bytes(
+                funding_tx_id,
+                0,
+                asset_id,
+                90,
+            )],
+            [0x61; 32],
+        );
+        let create_chain_tx_id = sha256_bytes(&create_chain_tx);
+
+        let add_subnet_tx = make_platform_add_subnet_validator_tx_bytes_with_io(
+            [0x62; 20],
+            [0x63; 32],
+            &[make_platform_transferable_output_bytes(asset_id, 20, owner)],
+            &[make_platform_transferable_input_bytes(
+                funding_tx_id,
+                1,
+                asset_id,
+                70,
+            )],
+        );
+        let add_subnet_tx_id = sha256_bytes(&add_subnet_tx);
+
+        let block = make_banff_std_with_txs(
+            [0x80; 32],
+            18,
+            &[funding_tx, create_chain_tx, add_subnet_tx],
+        );
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block), &block)
+            .unwrap();
+
+        let owner_addr = cb58_encode(&owner);
+        let balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBalance","params":{{"addresses":["{}"]}},"id":49}}"#,
+            owner_addr
+        );
+        let balance_response = handle_rpc_request(&balance_req, &node).await;
+        let balance_json: serde_json::Value = serde_json::from_str(&balance_response).unwrap();
+        assert_eq!(balance_json["result"]["balance"], "50");
+        assert_eq!(balance_json["result"]["unlocked"], "50");
+
+        let mut utxo_ids = balance_json["result"]["utxoIDs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| {
+                format!(
+                    "{}:{}",
+                    value["txID"].as_str().unwrap(),
+                    value["outputIndex"].as_u64().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        utxo_ids.sort();
+
+        let mut expected_utxo_ids = vec![
+            format!("{}:0", cb58_encode_id(create_chain_tx_id)),
+            format!("{}:0", cb58_encode_id(add_subnet_tx_id)),
+        ];
+        expected_utxo_ids.sort();
+        assert_eq!(utxo_ids, expected_utxo_ids);
+
+        let utxos_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getUTXOs","params":{{"addresses":["{}"],"limit":"0xa","encoding":"hex"}},"id":50}}"#,
+            owner_addr
+        );
+        let utxos_response = handle_rpc_request(&utxos_req, &node).await;
+        let utxos_json: serde_json::Value = serde_json::from_str(&utxos_response).unwrap();
+        assert_eq!(utxos_json["result"]["numFetched"], "2");
+        assert_eq!(utxos_json["result"]["utxos"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_balance_and_utxos_ignore_shared_memory_import_export_sides() {
+        let node = make_test_node(1);
+        let owner = [0x57; 20];
+        let asset_id = parse_platform_id_32(AVAX_ASSET_ID_MAINNET).unwrap();
+
+        let funding_tx = make_platform_base_tx_with_io(
+            &[
+                make_platform_transferable_output_bytes(asset_id, 80, owner),
+                make_platform_transferable_output_bytes(asset_id, 25, owner),
+            ],
+            &[],
+        );
+        let funding_tx_id = sha256_bytes(&funding_tx);
+
+        let import_tx = make_platform_import_tx_bytes_with_io(
+            &[make_platform_transferable_output_bytes(asset_id, 40, owner)],
+            &[],
+            [0x91; 32],
+            &[make_platform_transferable_input_bytes(
+                funding_tx_id,
+                1,
+                asset_id,
+                25,
+            )],
+        );
+        let import_tx_id = sha256_bytes(&import_tx);
+
+        let export_tx = make_platform_export_tx_bytes_with_io(
+            &[make_platform_transferable_output_bytes(asset_id, 10, owner)],
+            &[make_platform_transferable_input_bytes(
+                funding_tx_id,
+                0,
+                asset_id,
+                80,
+            )],
+            [0x92; 32],
+            &[make_platform_transferable_output_bytes(asset_id, 70, owner)],
+        );
+        let export_tx_id = sha256_bytes(&export_tx);
+
+        let block = make_banff_std_with_txs([0x81; 32], 19, &[funding_tx, import_tx, export_tx]);
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block), &block)
+            .unwrap();
+
+        let owner_addr = cb58_encode(&owner);
+        let balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBalance","params":{{"addresses":["{}"]}},"id":51}}"#,
+            owner_addr
+        );
+        let balance_response = handle_rpc_request(&balance_req, &node).await;
+        let balance_json: serde_json::Value = serde_json::from_str(&balance_response).unwrap();
+        assert_eq!(balance_json["result"]["balance"], "75");
+        assert_eq!(balance_json["result"]["unlocked"], "75");
+
+        let mut utxo_ids = balance_json["result"]["utxoIDs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| {
+                format!(
+                    "{}:{}",
+                    value["txID"].as_str().unwrap(),
+                    value["outputIndex"].as_u64().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        utxo_ids.sort();
+
+        let mut expected_utxo_ids = vec![
+            format!("{}:1", cb58_encode_id(funding_tx_id)),
+            format!("{}:0", cb58_encode_id(import_tx_id)),
+            format!("{}:0", cb58_encode_id(export_tx_id)),
+        ];
+        expected_utxo_ids.sort();
+        assert_eq!(utxo_ids, expected_utxo_ids);
+
+        let utxos_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getUTXOs","params":{{"addresses":["{}"],"limit":"0xa","encoding":"hex"}},"id":52}}"#,
+            owner_addr
+        );
+        let utxos_response = handle_rpc_request(&utxos_req, &node).await;
+        let utxos_json: serde_json::Value = serde_json::from_str(&utxos_response).unwrap();
+        assert_eq!(utxos_json["result"]["numFetched"], "3");
+        assert_eq!(utxos_json["result"]["utxos"].as_array().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -11826,6 +13469,7 @@ mod integration_tests {
             chain["id"] == cb58_encode_id(platform_cchain_blockchain_id(node.config.network_id))
                 && chain["vmID"] == EVM_VM_ID
         }));
+        assert!(!blockchains.iter().any(|chain| chain["name"] == "X-Chain"));
         assert!(blockchains.iter().any(|chain| {
             chain["id"] == cb58_encode_id(custom_chain.0)
                 && chain["subnetID"] == cb58_encode_id(custom_subnet.0)
@@ -11859,10 +13503,7 @@ mod integration_tests {
             .collect::<Vec<_>>();
         let expected_c_chain =
             cb58_encode_id(platform_cchain_blockchain_id(node.config.network_id));
-        let expected_x_chain =
-            cb58_encode_id(info_xchain_blockchain_id(node.config.network_id).unwrap());
-        assert!(primary_ids.contains(&expected_c_chain.as_str()));
-        assert!(primary_ids.contains(&expected_x_chain.as_str()));
+        assert_eq!(primary_ids, vec![expected_c_chain.as_str()]);
 
         let validates_custom_req = format!(
             r#"{{"jsonrpc":"2.0","method":"platform.validates","params":{{"subnetID":"{}"}},"id":19}}"#,
@@ -12029,6 +13670,286 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_platform_fee_state_endpoints_use_committed_dynamic_state() {
+        let node = make_test_node(12345);
+        let asset_id = [0x44; 32];
+        let prev_tx_id = [0x55; 32];
+        let owner = [0x66; 20];
+        let tx_bytes = make_platform_base_tx_with_io(
+            &[make_platform_transferable_output_bytes(
+                asset_id, 500, owner,
+            )],
+            &[make_platform_transferable_input_bytes(
+                prev_tx_id, 0, asset_id, 500,
+            )],
+        );
+        let raw_block = make_banff_std_with_txs([0x77; 32], 60, std::slice::from_ref(&tx_bytes));
+        let block_id = sha256_bytes(&raw_block);
+        node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+
+        let tx_gas = tx_bytes.len() as u64 + 3_000;
+        let expected_capacity = 1_000_000u64.saturating_sub(tx_gas);
+        let expected_excess = tx_gas;
+        let expected_timestamp = unix_timestamp_to_rfc3339_seconds(1_700_000_000);
+
+        let fee_state_response = handle_rpc_request(
+            r#"{"jsonrpc":"2.0","method":"platform.getFeeState","params":{},"id":29}"#,
+            &node,
+        )
+        .await;
+        let fee_state_json: serde_json::Value = serde_json::from_str(&fee_state_response).unwrap();
+        assert_eq!(fee_state_json["result"]["capacity"], expected_capacity);
+        assert_eq!(fee_state_json["result"]["excess"], expected_excess);
+        assert_eq!(
+            fee_state_json["result"]["price"],
+            platform_gas_price(1, expected_excess, 2_164_043)
+        );
+        assert_eq!(fee_state_json["result"]["timestamp"], expected_timestamp);
+        assert!(fee_state_json["result"]["state"].is_null());
+
+        let validator_fee_state_response = handle_rpc_request(
+            r#"{"jsonrpc":"2.0","method":"platform.getValidatorFeeState","params":{},"id":30}"#,
+            &node,
+        )
+        .await;
+        let validator_fee_state_json: serde_json::Value =
+            serde_json::from_str(&validator_fee_state_response).unwrap();
+        assert_eq!(validator_fee_state_json["result"]["excess"], 0);
+        assert_eq!(validator_fee_state_json["result"]["price"], 1);
+        assert_eq!(
+            validator_fee_state_json["result"]["timestamp"],
+            expected_timestamp
+        );
+    }
+
+    #[tokio::test]
+    async fn test_platform_validator_fee_state_tracks_committed_l1_validator_txs() {
+        let node = make_test_node(12345);
+        let subnet_id = [0x91; 32];
+        let owner = [0x71; 20];
+        let etna_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
+
+        let convert_tx = make_platform_convert_subnet_to_l1_tx_bytes(
+            subnet_id,
+            &[([0x10; 20], 1, 12, owner), ([0x20; 20], 1, 0, owner)],
+        );
+        let converted_active_id = append_platform_id_for_test(subnet_id, 0);
+        let converted_inactive_id = append_platform_id_for_test(subnet_id, 1);
+        let (register_tx, register_validation_id) = make_platform_register_l1_validator_tx_bytes(
+            subnet_id,
+            [0x30; 20],
+            owner,
+            1,
+            25,
+            etna_time + 86_400,
+            3,
+        );
+        let increase_tx =
+            make_platform_increase_l1_validator_balance_tx_bytes(converted_inactive_id, 30);
+        let set_weight_tx =
+            make_platform_set_l1_validator_weight_tx_bytes(register_validation_id, 0, 0, 2);
+        let disable_tx = make_platform_disable_l1_validator_tx_bytes(converted_inactive_id);
+
+        let block1 = make_banff_std_with_txs_at([0x01; 32], 1, etna_time + 5, &[convert_tx]);
+        let block1_id = sha256_bytes(&block1);
+        let block2 = make_banff_std_with_txs_at(block1_id, 2, etna_time + 15, &[register_tx]);
+        let block2_id = sha256_bytes(&block2);
+        let block3 = make_banff_std_with_txs_at(block2_id, 3, etna_time + 25, &[increase_tx]);
+        let block3_id = sha256_bytes(&block3);
+        let block4 = make_banff_std_with_txs_at(block3_id, 4, etna_time + 35, &[set_weight_tx]);
+        let block4_id = sha256_bytes(&block4);
+        let block5 = make_banff_std_with_txs_at(block4_id, 5, etna_time + 45, &[disable_tx]);
+
+        node.db.put_cf(CF_BLOCKS, &block1_id, &block1).unwrap();
+        node.db.put_cf(CF_BLOCKS, &block2_id, &block2).unwrap();
+        node.db.put_cf(CF_BLOCKS, &block3_id, &block3).unwrap();
+        node.db.put_cf(CF_BLOCKS, &block4_id, &block4).unwrap();
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block5), &block5)
+            .unwrap();
+
+        let (state, timestamp) = scan_platform_validator_fee_state(&node).unwrap();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.excess, 0);
+        assert_eq!(state.accrued_fees, 45);
+        assert_eq!(timestamp, etna_time + 45);
+
+        let validator_fee_state_response = handle_rpc_request(
+            r#"{"jsonrpc":"2.0","method":"platform.getValidatorFeeState","params":{},"id":31}"#,
+            &node,
+        )
+        .await;
+        let validator_fee_state_json: serde_json::Value =
+            serde_json::from_str(&validator_fee_state_response).unwrap();
+        assert_eq!(validator_fee_state_json["result"]["excess"], 0);
+        assert_eq!(validator_fee_state_json["result"]["price"], 1);
+        assert_eq!(
+            validator_fee_state_json["result"]["timestamp"],
+            unix_timestamp_to_rfc3339_seconds(etna_time + 45)
+        );
+        assert_eq!(converted_active_id.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn test_platform_fee_state_accounts_for_etna_l1_validator_txs() {
+        let node = make_test_node(12345);
+        let subnet_id = [0x81; 32];
+        let owner = [0x61; 20];
+        let etna_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
+
+        let convert_tx =
+            make_platform_convert_subnet_to_l1_tx_bytes(subnet_id, &[([0x11; 20], 1, 10, owner)]);
+        let convert_validation_id = append_platform_id_for_test(subnet_id, 0);
+        let (register_tx, register_validation_id) = make_platform_register_l1_validator_tx_bytes(
+            subnet_id,
+            [0x22; 20],
+            owner,
+            1,
+            5,
+            etna_time + 86_400,
+            2,
+        );
+        let set_weight_tx =
+            make_platform_set_l1_validator_weight_tx_bytes(register_validation_id, 0, 0, 1);
+        let increase_tx =
+            make_platform_increase_l1_validator_balance_tx_bytes(convert_validation_id, 7);
+        let disable_tx = make_platform_disable_l1_validator_tx_bytes(convert_validation_id);
+        let txs = vec![
+            convert_tx,
+            register_tx,
+            set_weight_tx,
+            increase_tx,
+            disable_tx,
+        ];
+
+        let expected_gas = txs
+            .iter()
+            .map(|tx| {
+                avalanche_rs::pchain::platform_tx_dynamic_fee_gas(
+                    tx,
+                    platform_dynamic_fee_config(node.config.network_id).weights,
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .sum::<u64>();
+        let raw_block = make_banff_std_with_txs_at([0x99; 32], 2, etna_time + 30, &txs);
+        let block_id = sha256_bytes(&raw_block);
+        node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+
+        let fee_state_response = handle_rpc_request(
+            r#"{"jsonrpc":"2.0","method":"platform.getFeeState","params":{},"id":32}"#,
+            &node,
+        )
+        .await;
+        let fee_state_json: serde_json::Value = serde_json::from_str(&fee_state_response).unwrap();
+        assert_eq!(
+            fee_state_json["result"]["capacity"],
+            1_000_000u64.saturating_sub(expected_gas)
+        );
+        assert_eq!(fee_state_json["result"]["excess"], expected_gas);
+        assert_eq!(
+            fee_state_json["result"]["price"],
+            platform_gas_price(1, expected_gas, 2_164_043)
+        );
+        assert_eq!(
+            fee_state_json["result"]["timestamp"],
+            unix_timestamp_to_rfc3339_seconds(etna_time + 30)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_l1_validator_replays_committed_state() {
+        let node = make_test_node(12345);
+        let subnet_id = [0x94; 32];
+        let node_id = [0x95; 20];
+        let owner = [0x96; 20];
+        let etna_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
+
+        let (register_tx, validation_id) = make_platform_register_l1_validator_tx_bytes(
+            subnet_id,
+            node_id,
+            owner,
+            7,
+            25,
+            etna_time + 86_400,
+            2,
+        );
+        let set_weight_tx = make_platform_set_l1_validator_weight_tx_bytes(validation_id, 0, 9, 1);
+
+        let block1 = make_banff_std_with_txs_at([0x13; 32], 1, etna_time + 10, &[register_tx]);
+        let block1_id = sha256_bytes(&block1);
+        let block2 = make_banff_std_with_txs_at(block1_id, 2, etna_time + 20, &[set_weight_tx]);
+        node.db.put_cf(CF_BLOCKS, &block1_id, &block1).unwrap();
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block2), &block2)
+            .unwrap();
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getL1Validator","params":{{"validationID":"{}"}},"id":33}}"#,
+            cb58_encode_id(validation_id)
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["result"]["subnetID"], cb58_encode_id(subnet_id));
+        assert_eq!(
+            json["result"]["nodeID"],
+            format!("NodeID-{}", cb58_encode(&node_id))
+        );
+        assert_eq!(json["result"]["weight"], "9");
+        assert_eq!(json["result"]["startTime"], (etna_time + 10).to_string());
+        assert_eq!(
+            json["result"]["validationID"],
+            cb58_encode_id(validation_id)
+        );
+        assert_eq!(
+            json["result"]["publicKey"],
+            format!("0x{}", "11".repeat(48))
+        );
+        assert_eq!(
+            json["result"]["remainingBalanceOwner"],
+            serde_json::json!({
+                "locktime": "0",
+                "threshold": "1",
+                "addresses": [format_platform_address(node.config.network_id, owner)],
+            })
+        );
+        assert_eq!(
+            json["result"]["deactivationOwner"],
+            serde_json::json!({
+                "locktime": "0",
+                "threshold": "1",
+                "addresses": [format_platform_address(node.config.network_id, owner)],
+            })
+        );
+        assert_eq!(json["result"]["minNonce"], "1");
+        assert_eq!(json["result"]["balance"], "15");
+        assert_eq!(json["result"]["height"], "2");
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_l1_validator_not_found() {
+        let node = make_test_node(12345);
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getL1Validator","params":{{"validationID":"{}"}},"id":34}}"#,
+            cb58_encode_id([0x97; 32])
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["error"]["code"], -32000);
+        assert_eq!(
+            json["error"]["message"],
+            format!(
+                "fetching L1 validator \"{}\" failed: not found",
+                cb58_encode_id([0x97; 32])
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn test_platform_tx_lifecycle_uses_local_pending_store() {
         let node = make_test_node(1);
         let tx_bytes = vec![0x00, 0x00, 0x00, 0x09, 0xDE, 0xAD, 0xBE, 0xEF];
@@ -12191,6 +14112,194 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_platform_get_tx_supports_json_encoding_for_committed_etna_txs() {
+        let node = make_test_node(1);
+        let subnet_id = [0x61; 32];
+        let convert_tx = make_platform_convert_subnet_to_l1_tx_bytes(
+            subnet_id,
+            &[([0x11; 20], 10, 20, [0x12; 20])],
+        );
+        let (register_tx, validation_id) = make_platform_register_l1_validator_tx_bytes(
+            subnet_id, [0x13; 20], [0x14; 20], 77, 33, 999, 2,
+        );
+        let set_weight_tx = make_platform_set_l1_validator_weight_tx_bytes(validation_id, 5, 88, 1);
+        let increase_tx = make_platform_increase_l1_validator_balance_tx_bytes(validation_id, 44);
+        let disable_tx = make_platform_disable_l1_validator_tx_bytes(validation_id);
+
+        let raw_block = make_banff_std_with_txs(
+            [0x66; 32],
+            14,
+            &[
+                convert_tx.clone(),
+                register_tx.clone(),
+                set_weight_tx.clone(),
+                increase_tx.clone(),
+                disable_tx.clone(),
+            ],
+        );
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&raw_block), &raw_block)
+            .unwrap();
+
+        let convert_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getTx","params":{{"txID":"{}","encoding":"json"}},"id":40}}"#,
+            cb58_encode_id(sha256_bytes(&convert_tx))
+        );
+        let convert_json: serde_json::Value =
+            serde_json::from_str(&handle_rpc_request(&convert_req, &node).await).unwrap();
+        assert_eq!(convert_json["result"]["encoding"], "json");
+        assert_eq!(
+            convert_json["result"]["tx"]["unsignedTx"]["subnetID"],
+            cb58_encode_id(subnet_id)
+        );
+        assert_eq!(
+            convert_json["result"]["tx"]["unsignedTx"]["chainID"],
+            cb58_encode_id([0x44; 32])
+        );
+        assert_eq!(
+            convert_json["result"]["tx"]["unsignedTx"]["address"],
+            "0x6d6772"
+        );
+        assert_eq!(
+            convert_json["result"]["tx"]["unsignedTx"]["validators"][0]["nodeID"],
+            format!("NodeID-{}", cb58_encode(&[0x11; 20]))
+        );
+        assert_eq!(
+            convert_json["result"]["tx"]["unsignedTx"]["validators"][0]["weight"],
+            10
+        );
+        assert_eq!(
+            convert_json["result"]["tx"]["unsignedTx"]["validators"][0]["balance"],
+            20
+        );
+
+        let register_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getTx","params":{{"txID":"{}","encoding":"json"}},"id":41}}"#,
+            cb58_encode_id(sha256_bytes(&register_tx))
+        );
+        let register_json: serde_json::Value =
+            serde_json::from_str(&handle_rpc_request(&register_req, &node).await).unwrap();
+        assert_eq!(register_json["result"]["tx"]["unsignedTx"]["balance"], 33);
+        assert!(
+            register_json["result"]["tx"]["unsignedTx"]["proofOfPossession"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x")
+        );
+        assert!(register_json["result"]["tx"]["unsignedTx"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+
+        let set_weight_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getTx","params":{{"txID":"{}","encoding":"json"}},"id":42}}"#,
+            cb58_encode_id(sha256_bytes(&set_weight_tx))
+        );
+        let set_weight_json: serde_json::Value =
+            serde_json::from_str(&handle_rpc_request(&set_weight_req, &node).await).unwrap();
+        assert!(set_weight_json["result"]["tx"]["unsignedTx"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+
+        let increase_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getTx","params":{{"txID":"{}","encoding":"json"}},"id":43}}"#,
+            cb58_encode_id(sha256_bytes(&increase_tx))
+        );
+        let increase_json: serde_json::Value =
+            serde_json::from_str(&handle_rpc_request(&increase_req, &node).await).unwrap();
+        assert_eq!(
+            increase_json["result"]["tx"]["unsignedTx"]["validationID"],
+            cb58_encode_id(validation_id)
+        );
+        assert_eq!(increase_json["result"]["tx"]["unsignedTx"]["balance"], 44);
+
+        let disable_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getTx","params":{{"txID":"{}","encoding":"json"}},"id":44}}"#,
+            cb58_encode_id(sha256_bytes(&disable_tx))
+        );
+        let disable_json: serde_json::Value =
+            serde_json::from_str(&handle_rpc_request(&disable_req, &node).await).unwrap();
+        assert_eq!(
+            disable_json["result"]["tx"]["unsignedTx"]["validationID"],
+            cb58_encode_id(validation_id)
+        );
+        assert_eq!(
+            disable_json["result"]["tx"]["unsignedTx"]["disableAuthorization"],
+            serde_json::json!({ "signatureIndices": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_block_json_populates_decoded_etna_txs() {
+        let node = make_test_node(1);
+        let subnet_id = [0x71; 32];
+        let convert_tx = make_platform_convert_subnet_to_l1_tx_bytes(
+            subnet_id,
+            &[([0x21; 20], 11, 22, [0x22; 20])],
+        );
+        let (register_tx, validation_id) = make_platform_register_l1_validator_tx_bytes(
+            subnet_id, [0x23; 20], [0x24; 20], 66, 55, 1_234, 2,
+        );
+        let set_weight_tx = make_platform_set_l1_validator_weight_tx_bytes(validation_id, 9, 99, 2);
+        let increase_tx = make_platform_increase_l1_validator_balance_tx_bytes(validation_id, 77);
+        let disable_tx = make_platform_disable_l1_validator_tx_bytes(validation_id);
+
+        let raw_block = make_banff_std_with_txs(
+            [0x77; 32],
+            15,
+            &[
+                convert_tx.clone(),
+                register_tx.clone(),
+                set_weight_tx.clone(),
+                increase_tx.clone(),
+                disable_tx.clone(),
+            ],
+        );
+        let block_id = sha256_bytes(&raw_block);
+        node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getBlock","params":{{"blockID":"0x{}","encoding":"json"}},"id":45}}"#,
+            hex::encode(block_id)
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let json_value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json_value["result"]["block"]["txCount"], 5);
+        let txs = json_value["result"]["block"]["txs"].as_array().unwrap();
+        assert_eq!(txs.len(), 5);
+
+        let txs_by_id = txs
+            .iter()
+            .map(|tx| (tx["id"].as_str().unwrap().to_string(), tx.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            txs_by_id[&cb58_encode_id(sha256_bytes(&convert_tx))]["unsignedTx"]["subnetID"],
+            cb58_encode_id(subnet_id)
+        );
+        assert_eq!(
+            txs_by_id[&cb58_encode_id(sha256_bytes(&register_tx))]["unsignedTx"]["balance"],
+            55
+        );
+        assert!(
+            txs_by_id[&cb58_encode_id(sha256_bytes(&set_weight_tx))]["unsignedTx"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x")
+        );
+        assert_eq!(
+            txs_by_id[&cb58_encode_id(sha256_bytes(&increase_tx))]["unsignedTx"]["validationID"],
+            cb58_encode_id(validation_id)
+        );
+        assert_eq!(
+            txs_by_id[&cb58_encode_id(sha256_bytes(&disable_tx))]["unsignedTx"]
+                ["disableAuthorization"],
+            serde_json::json!({ "signatureIndices": [] })
+        );
+    }
+
+    #[tokio::test]
     async fn test_avax_atomic_tx_lifecycle_uses_cb58_ids_and_status() {
         let node = make_test_node(1);
         let tx_bytes = vec![0x00, 0x01, 0x02, 0xAB, 0xCD];
@@ -12309,10 +14418,11 @@ mod integration_tests {
         let blockchain_id_response = handle_rpc_request(blockchain_id_req, &node).await;
         let blockchain_id_json: serde_json::Value =
             serde_json::from_str(&blockchain_id_response).unwrap();
-        assert_eq!(
-            blockchain_id_json["result"]["blockchainID"],
-            cb58_encode_id(info_xchain_blockchain_id(node.config.network_id).unwrap())
-        );
+        assert_eq!(blockchain_id_json["error"]["code"], -32602);
+        assert!(blockchain_id_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("there is no chain with alias/ID 'X'"));
 
         let node_ip_req = r#"{"jsonrpc":"2.0","method":"info.getNodeIP","params":{},"id":19}"#;
         let node_ip_response = handle_rpc_request(node_ip_req, &node).await;
@@ -12394,6 +14504,17 @@ mod integration_tests {
         assert_eq!(peers[0]["supportedACPs"][1], 24);
         assert_eq!(peers[0]["objectedACPs"][0], 176);
         assert!(peers[0]["benched"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_avm_methods_are_not_exposed() {
+        let node = make_test_node(1);
+        let request =
+            r#"{"jsonrpc":"2.0","method":"avm.getBalance","params":["X-avax1deadbeef"],"id":91}"#;
+        let response = handle_rpc_request(request, &node).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["error"]["code"], -32601);
+        assert_eq!(json["error"]["message"], "method not found: avm.getBalance");
     }
 
     #[tokio::test]
@@ -13447,7 +15568,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_eth_get_logs_filters_persisted_receipts() {
-        let _guard = FILTER_TEST_GUARD.lock().unwrap();
+        let _guard = FILTER_TEST_GUARD.lock().await;
         FILTERS.write().await.clear();
 
         let node = make_test_node(1);
@@ -13518,7 +15639,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_eth_filter_changes_and_filter_logs() {
-        let _guard = FILTER_TEST_GUARD.lock().unwrap();
+        let _guard = FILTER_TEST_GUARD.lock().await;
         FILTERS.write().await.clear();
 
         let node = make_test_node(1);

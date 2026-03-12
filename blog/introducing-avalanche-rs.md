@@ -182,7 +182,7 @@ the natural next steps:
 
 3. **mainnet validation** — running as an actual validator, participating in consensus beyond just responding to polls.
 
-4. **X-Chain support** — the DAG-based chain is architecturally different from Snowman and would be an interesting challenge.
+4. **P-Chain + C-Chain parity hardening** — the remaining work is on deepening validator, RPC, and protocol compatibility without expanding scope to X-Chain.
 
 ---
 

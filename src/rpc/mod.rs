@@ -181,6 +181,18 @@ pub struct ValidatorInfo {
     /// Delegation fee (in 10000ths)
     #[serde(alias = "delegationFee", default)]
     pub delegation_fee: String,
+    #[serde(rename = "validationID", default)]
+    pub validation_id: Option<String>,
+    #[serde(rename = "publicKey", default)]
+    pub public_key: Option<String>,
+    #[serde(rename = "remainingBalanceOwner", default)]
+    pub remaining_balance_owner: Option<PlatformOwnerResponse>,
+    #[serde(rename = "deactivationOwner", default)]
+    pub deactivation_owner: Option<PlatformOwnerResponse>,
+    #[serde(rename = "minNonce", default)]
+    pub min_nonce: Option<String>,
+    #[serde(default)]
+    pub balance: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +233,37 @@ pub struct HeightResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentSupplyResponse {
     pub supply: String,
+    pub height: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformOwnerResponse {
+    pub locktime: String,
+    pub threshold: String,
+    #[serde(default)]
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L1ValidatorResponse {
+    #[serde(rename = "subnetID")]
+    pub subnet_id: String,
+    #[serde(rename = "nodeID")]
+    pub node_id: String,
+    pub weight: String,
+    #[serde(rename = "startTime")]
+    pub start_time: String,
+    #[serde(rename = "validationID")]
+    pub validation_id: String,
+    #[serde(rename = "publicKey")]
+    pub public_key: String,
+    #[serde(rename = "remainingBalanceOwner")]
+    pub remaining_balance_owner: PlatformOwnerResponse,
+    #[serde(rename = "deactivationOwner")]
+    pub deactivation_owner: PlatformOwnerResponse,
+    #[serde(rename = "minNonce")]
+    pub min_nonce: String,
+    pub balance: String,
     pub height: String,
 }
 
@@ -347,14 +390,9 @@ pub struct ValidatorFeeConfigResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GasStateResponse {
+pub struct FeeStateResponse {
     pub capacity: u64,
     pub excess: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FeeStateResponse {
-    pub state: GasStateResponse,
     pub price: u64,
     pub timestamp: String,
 }
@@ -870,33 +908,6 @@ impl RpcClient {
 }
 
 // ============================================================================
-// X-CHAIN METHODS
-// ============================================================================
-
-impl RpcClient {
-    /// Get balance for an address on X-chain
-    pub async fn x_get_balance(&self, address: &str) -> Result<BalanceResponse> {
-        self.call_parsed("avm.getBalance", vec![json!(address)])
-            .await
-    }
-
-    /// Get UTXOs for an address on X-chain
-    pub async fn x_get_utxos(&self, address: &str, limit: Option<u32>) -> Result<Value> {
-        let mut params = vec![json!(address)];
-        if let Some(l) = limit {
-            params.push(json!(l));
-        }
-
-        self.call("avm.getUTXOs", params).await
-    }
-
-    /// Send transaction on X-chain
-    pub async fn x_send_transaction(&self, tx: &str) -> Result<TransactionResponse> {
-        self.call_parsed("avm.sendTx", vec![json!(tx)]).await
-    }
-}
-
-// ============================================================================
 // C-CHAIN METHODS (Ethereum-Compatible)
 // ============================================================================
 
@@ -1141,8 +1152,17 @@ impl RpcClient {
     }
 
     /// Get info about a specific validator
-    pub async fn p_get_validator_info(&self, node_id: &str) -> Result<ValidatorInfo> {
-        self.call_parsed("platform.getValidator", vec![json!({ "nodeID": node_id })])
+    pub async fn p_get_validator_info(
+        &self,
+        node_id: &str,
+        subnet_id: Option<&str>,
+    ) -> Result<ValidatorInfo> {
+        let mut request = serde_json::Map::new();
+        request.insert("nodeID".into(), json!(node_id));
+        if let Some(subnet_id) = subnet_id {
+            request.insert("subnetID".into(), json!(subnet_id));
+        }
+        self.call_parsed("platform.getValidator", vec![Value::Object(request)])
             .await
     }
 
@@ -1307,6 +1327,15 @@ impl RpcClient {
             .await
     }
 
+    /// Get a committed L1 validator by validation ID.
+    pub async fn p_get_l1_validator(&self, validation_id: &str) -> Result<L1ValidatorResponse> {
+        self.call_parsed(
+            "platform.getL1Validator",
+            vec![json!({ "validationID": validation_id })],
+        )
+        .await
+    }
+
     /// Submit a raw P-chain transaction to the local node.
     pub async fn p_issue_tx(&self, tx: &str, encoding: Option<&str>) -> Result<IssueTxResponse> {
         let mut request = serde_json::Map::new();
@@ -1445,7 +1474,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
-    const AVALANCHE_TESTNET_X: &str = "http://127.0.0.1:9650/ext/bc/X";
     const AVALANCHE_TESTNET_C: &str = "http://127.0.0.1:9650/ext/bc/C/rpc";
     const AVALANCHE_TESTNET_P: &str = "http://127.0.0.1:9650/ext/P";
 
@@ -1496,21 +1524,6 @@ mod tests {
         });
 
         format!("http://{}", addr)
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires local Avalanche node
-    async fn test_x_chain_get_balance() {
-        let client = RpcClient::new(AVALANCHE_TESTNET_X).unwrap();
-        let address = "X-avax1g6yk6ghdqyggsnw5dtk77db5y36e6dg9dpmjt";
-
-        match client.x_get_balance(address).await {
-            Ok(balance) => {
-                println!("Balance: {:?}", balance.balance);
-                assert!(!balance.balance.is_empty());
-            }
-            Err(e) => println!("Expected error (no funds): {}", e),
-        }
     }
 
     #[tokio::test]
@@ -1663,6 +1676,27 @@ mod tests {
                     "supply": "720000000000000000",
                     "height": "42",
                 }),
+                "platform.getL1Validator" => json!({
+                    "subnetID": "2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q",
+                    "nodeID": "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg",
+                    "weight": "9",
+                    "startTime": "1700000010",
+                    "validationID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA",
+                    "publicKey": "0x1111",
+                    "remainingBalanceOwner": {
+                        "locktime": "0",
+                        "threshold": "1",
+                        "addresses": ["P-local1"],
+                    },
+                    "deactivationOwner": {
+                        "locktime": "0",
+                        "threshold": "1",
+                        "addresses": ["P-local1"],
+                    },
+                    "minNonce": "1",
+                    "balance": "15",
+                    "height": "42",
+                }),
                 "platform.issueTx" => json!({
                     "txID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA",
                 }),
@@ -1691,6 +1725,26 @@ mod tests {
                 }
                 "platform.getTxStatus" => json!({
                     "status": "Processing",
+                }),
+                "platform.getValidator" => json!({
+                    "nodeID": "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg",
+                    "weight": "9",
+                    "startTime": "1700000010",
+                    "validationID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA",
+                    "publicKey": "0x1111",
+                    "remainingBalanceOwner": {
+                        "locktime": "0",
+                        "threshold": "1",
+                        "addresses": ["P-local1"],
+                    },
+                    "deactivationOwner": {
+                        "locktime": "0",
+                        "threshold": "1",
+                        "addresses": ["P-local1"],
+                    },
+                    "minNonce": "1",
+                    "balance": "15",
+                    "status": "current",
                 }),
                 "platform.getSubnet" => json!({
                     "isPermissioned": false,
@@ -1724,10 +1778,8 @@ mod tests {
                     "excessConversionConstant": 51937021,
                 }),
                 "platform.getFeeState" => json!({
-                    "state": {
-                        "capacity": 999000,
-                        "excess": 250,
-                    },
+                    "capacity": 999000,
+                    "excess": 250,
                     "price": 3,
                     "timestamp": "2026-03-12T09:15:00Z",
                 }),
@@ -1833,6 +1885,19 @@ mod tests {
         assert_eq!(current_supply.supply, "720000000000000000");
         assert_eq!(current_supply.height, "42");
 
+        let l1_validator = client
+            .p_get_l1_validator("2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA")
+            .await
+            .unwrap();
+        assert_eq!(l1_validator.weight, "9");
+        assert_eq!(l1_validator.min_nonce, "1");
+        assert_eq!(l1_validator.balance, "15");
+        assert_eq!(
+            l1_validator.remaining_balance_owner.addresses,
+            vec!["P-local1"]
+        );
+        assert_eq!(l1_validator.height, "42");
+
         let issued_platform_tx = client.p_issue_tx("0xdeadbeef", Some("hex")).await.unwrap();
         assert!(issued_platform_tx.tx_id.starts_with('2'));
 
@@ -1861,6 +1926,28 @@ mod tests {
         assert_eq!(platform_tx_status.status, "Processing");
         assert!(platform_tx_status.reason.is_none());
 
+        let validator = client
+            .p_get_validator_info(
+                "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg",
+                Some("2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            validator.validation_id.as_deref(),
+            Some("2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA")
+        );
+        assert_eq!(validator.min_nonce.as_deref(), Some("1"));
+        assert_eq!(validator.balance.as_deref(), Some("15"));
+        assert_eq!(
+            validator
+                .remaining_balance_owner
+                .as_ref()
+                .unwrap()
+                .addresses,
+            vec!["P-local1"]
+        );
+
         let subnet = client
             .p_get_subnet("2bRCr6B4MiEfSjidDwxDpdCyviwnfUVqB2HGwhm947w9YYqb7r")
             .await
@@ -1885,8 +1972,8 @@ mod tests {
         assert_eq!(validator_fee_config.excess_conversion_constant, 51_937_021);
 
         let fee_state = client.p_get_fee_state().await.unwrap();
-        assert_eq!(fee_state.state.capacity, 999_000);
-        assert_eq!(fee_state.state.excess, 250);
+        assert_eq!(fee_state.capacity, 999_000);
+        assert_eq!(fee_state.excess, 250);
         assert_eq!(fee_state.price, 3);
         assert_eq!(fee_state.timestamp, "2026-03-12T09:15:00Z");
 
@@ -2021,6 +2108,15 @@ mod tests {
             json!([{ "txID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA" }])
         );
 
+        let get_validator_call = calls
+            .iter()
+            .find(|call| call["method"] == "platform.getValidator")
+            .unwrap();
+        assert_eq!(
+            get_validator_call["params"],
+            json!([{ "nodeID": "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg", "subnetID": "2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q" }])
+        );
+
         let balance_call = calls
             .iter()
             .find(|call| call["method"] == "platform.getBalance")
@@ -2053,6 +2149,15 @@ mod tests {
             .find(|call| call["method"] == "platform.getCurrentSupply")
             .unwrap();
         assert_eq!(current_supply_call["params"], json!([{}]));
+
+        let l1_validator_call = calls
+            .iter()
+            .find(|call| call["method"] == "platform.getL1Validator")
+            .unwrap();
+        assert_eq!(
+            l1_validator_call["params"],
+            json!([{ "validationID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA" }])
+        );
 
         let stake_call = calls
             .iter()
@@ -2160,12 +2265,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_builder() {
-        let request = RequestBuilder::new("avm.getBalance")
-            .param(json!("X-avax1g6yk6ghdqyggsnw5dtk77db5y36e6dg9dpmjt"))
+        let request = RequestBuilder::new("eth_getBalance")
+            .param(json!("0x1111111111111111111111111111111111111111"))
+            .param(json!("latest"))
             .build(1);
 
-        assert_eq!(request.method, "avm.getBalance");
-        assert_eq!(request.params.len(), 1);
+        assert_eq!(request.method, "eth_getBalance");
+        assert_eq!(request.params.len(), 2);
         assert_eq!(request.id, 1);
     }
 

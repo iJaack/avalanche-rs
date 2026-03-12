@@ -76,9 +76,9 @@ pub struct ChainConfig {
     pub chain_id: ChainId,
     /// Subnet this chain belongs to
     pub subnet_id: SubnetId,
-    /// Human-readable name (e.g., "P-Chain", "C-Chain", "X-Chain")
+    /// Human-readable name (e.g., "P-Chain", "C-Chain", "Custom Chain")
     pub name: String,
-    /// VM type (e.g., "platformvm", "evm", "avm")
+    /// VM type (e.g., "platformvm", "evm")
     pub vm_type: String,
 }
 
@@ -502,7 +502,7 @@ mod tests {
         let subnet = SubnetId::primary_network();
         tracker.add_subnet(subnet.clone());
 
-        let chain = make_chain("X-Chain", &subnet);
+        let chain = make_chain("Custom Chain", &subnet);
         let chain_id = chain.chain_id.clone();
         tracker.add_chain(chain);
 

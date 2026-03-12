@@ -105,7 +105,7 @@
 
 This benchmark compares cold-start behavior: both nodes started from scratch with no prior state. The comparison is informative but not strictly apples-to-apples:
 
-- **avalanche-rs** skips subsystem initialization (no X-Chain VM, no full consensus engine, no metrics/health infrastructure) and connects directly to the bootstrap peer. This is a lightweight bootstrap client, not a full consensus participant yet.
+- **avalanche-rs** intentionally excludes X-Chain/AVM support, skips full consensus-engine initialization, and connects directly to the bootstrap peer. This is a lightweight bootstrap client, not a full consensus participant yet.
 - **AvalancheGo** initializes the full node stack (P-Chain VM, C-Chain VM, X-Chain VM, health checks, metrics, throttling, multiple database layers) before beginning bootstrap. This overhead is necessary for a production validator.
 
 The benchmark demonstrates that a focused Rust implementation can achieve significantly faster bootstrap and lower resource usage for the specific task of syncing block data.
