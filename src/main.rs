@@ -6000,10 +6000,21 @@ fn query_tags(query: &str) -> Vec<String> {
 
 #[derive(Debug, Clone)]
 struct PlatformValidatorRecord {
+    tx_id: Option<String>,
     node_id: String,
+    subnet_id: [u8; 32],
     weight: u64,
     start_time: u64,
     end_time: Option<u64>,
+    removed_at: Option<u64>,
+    permissionless: bool,
+    validation_reward_owner: Option<PlatformOutputOwner>,
+    delegation_reward_owner: Option<PlatformOutputOwner>,
+    potential_reward: Option<u64>,
+    accrued_delegatee_reward: Option<u64>,
+    shares: Option<u32>,
+    signer: Option<serde_json::Value>,
+    delegators: Vec<PlatformDelegatorRecord>,
     l1: Option<PlatformL1ValidatorApiRecord>,
 }
 
@@ -6018,10 +6029,41 @@ struct PlatformL1ValidatorApiRecord {
     active: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PlatformDelegatorRecord {
+    tx_id: String,
+    node_id: String,
+    weight: u64,
+    start_time: u64,
+    end_time: u64,
+    reward_owner: PlatformOutputOwner,
+    potential_reward: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlatformSubnetStakingConfig {
+    asset_id: Option<[u8; 32]>,
+    initial_supply: Option<u64>,
+    min_validator_stake: Option<u64>,
+    min_delegator_stake: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct PlatformValidatorScanState {
+    chain_time: u64,
+    validators: Vec<PlatformValidatorRecord>,
+    current_supply_deltas: std::collections::BTreeMap<[u8; 32], u64>,
+    subnet_configs: std::collections::BTreeMap<[u8; 32], PlatformSubnetStakingConfig>,
+}
+
 impl PlatformValidatorRecord {
     fn status(&self, now: u64) -> &'static str {
         if let Some(l1) = &self.l1 {
             return if l1.active { "current" } else { "completed" };
+        }
+
+        if self.removed_at.is_some_and(|removed_at| now >= removed_at) {
+            return "completed";
         }
 
         let end_time = self.end_time.unwrap_or_default();
@@ -6123,13 +6165,25 @@ async fn platform_current_supply_result(
     node: &NodeState,
     subnet_id: &SubnetId,
 ) -> Result<serde_json::Value, String> {
-    let Some(initial_supply) = platform_initial_supply(node.config.network_id, subnet_id) else {
+    let scan = scan_platform_validator_state(node, None);
+    let initial_supply = if *subnet_id == SubnetId::primary_network() {
+        platform_initial_supply(node.config.network_id, subnet_id)
+    } else {
+        scan.subnet_configs
+            .get(&subnet_id.0)
+            .and_then(|config| config.initial_supply)
+    };
+    let Some(initial_supply) = initial_supply else {
         return Err("current supply unavailable for subnet".to_string());
     };
 
-    let scan = scan_platform_chain_state(node);
     let height = current_pchain_height(node).await;
-    let supply = initial_supply.saturating_add(scan.current_supply_delta);
+    let delta = scan
+        .current_supply_deltas
+        .get(&subnet_id.0)
+        .copied()
+        .unwrap_or(0);
+    let supply = initial_supply.saturating_add(delta);
     Ok(serde_json::json!({
         "supply": supply.to_string(),
         "height": height.to_string(),
@@ -6403,8 +6457,12 @@ fn platform_apply_l1_validator_tx(
     Ok(())
 }
 
-fn scan_platform_l1_validator_records(node: &NodeState) -> Result<PlatformL1ValidatorScan, String> {
-    let latest_timestamp = platform_latest_chain_timestamp(node);
+fn scan_platform_l1_validator_records_at(
+    node: &NodeState,
+    max_height: Option<u64>,
+) -> Result<PlatformL1ValidatorScan, String> {
+    let blocks = platform_sorted_pchain_blocks_up_to(&node.db, max_height);
+    let latest_timestamp = blocks.last().map(|(meta, _)| meta.timestamp).unwrap_or(0);
     let etna_time = upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
     if latest_timestamp < etna_time {
         return Ok((
@@ -6419,7 +6477,7 @@ fn scan_platform_l1_validator_records(node: &NodeState) -> Result<PlatformL1Vali
     let mut last_timestamp = etna_time;
     let mut validators = PlatformL1ValidatorMap::new();
 
-    for (meta, raw_block) in platform_sorted_pchain_blocks(&node.db) {
+    for (meta, raw_block) in blocks {
         if meta.timestamp < etna_time {
             continue;
         }
@@ -6451,6 +6509,10 @@ fn scan_platform_l1_validator_records(node: &NodeState) -> Result<PlatformL1Vali
 
     state.active = platform_active_l1_validator_count(&validators);
     Ok((validators, state, latest_timestamp))
+}
+
+fn scan_platform_l1_validator_records(node: &NodeState) -> Result<PlatformL1ValidatorScan, String> {
+    scan_platform_l1_validator_records_at(node, None)
 }
 
 fn scan_platform_validator_fee_state(
@@ -6552,18 +6614,41 @@ async fn platform_proposed_height(node: &NodeState) -> u64 {
         .min(current_height)
 }
 
-fn platform_staking_asset_id(
-    network_id: u32,
-    subnet_id: Option<&SubnetId>,
-) -> Option<&'static str> {
-    if subnet_id.is_some_and(|subnet_id| subnet_id != &SubnetId::primary_network()) {
-        return None;
-    }
-
+fn platform_primary_staking_asset_id(network_id: u32) -> Option<&'static str> {
     match network_id {
         1 => Some(AVAX_ASSET_ID_MAINNET),
         5 => Some(AVAX_ASSET_ID_FUJI),
         _ => None,
+    }
+}
+
+fn platform_staking_asset_id(node: &NodeState, subnet_id: Option<&SubnetId>) -> Option<String> {
+    match subnet_id {
+        None => platform_primary_staking_asset_id(node.config.network_id).map(str::to_string),
+        Some(subnet_id) if *subnet_id == SubnetId::primary_network() => {
+            platform_primary_staking_asset_id(node.config.network_id).map(str::to_string)
+        }
+        Some(subnet_id) => scan_platform_validator_state(node, None)
+            .subnet_configs
+            .get(&subnet_id.0)
+            .and_then(|config| config.asset_id)
+            .map(cb58_encode_id),
+    }
+}
+
+fn platform_min_stake_for_subnet(
+    node: &NodeState,
+    subnet_id: Option<&SubnetId>,
+) -> Option<(u64, u64)> {
+    match subnet_id {
+        None => Some((MIN_VALIDATOR_STAKE, MIN_DELEGATOR_STAKE)),
+        Some(subnet_id) if *subnet_id == SubnetId::primary_network() => {
+            Some((MIN_VALIDATOR_STAKE, MIN_DELEGATOR_STAKE))
+        }
+        Some(subnet_id) => scan_platform_validator_state(node, None)
+            .subnet_configs
+            .get(&subnet_id.0)
+            .and_then(|config| Some((config.min_validator_stake?, config.min_delegator_stake?))),
     }
 }
 
@@ -6940,63 +7025,28 @@ async fn platform_validates_ids(node: &NodeState, subnet_id: &SubnetId) -> Vec<S
 async fn platform_validator_records(
     node: &NodeState,
     params: &serde_json::Value,
-) -> Vec<PlatformValidatorRecord> {
-    let requested_subnet_id = platform_subnet_id_param(params).and_then(SubnetId::from_str_any);
+) -> (u64, Vec<PlatformValidatorRecord>) {
+    let requested_subnet_id = platform_subnet_id_param(params)
+        .and_then(SubnetId::from_str_any)
+        .unwrap_or_else(SubnetId::primary_network);
+    let scan = scan_platform_validator_state(node, None);
+    let mut chain_time = scan.chain_time;
+    let mut records = scan
+        .validators
+        .into_iter()
+        .filter(|validator| validator.subnet_id == requested_subnet_id.0)
+        .collect::<Vec<_>>();
 
-    let mut records = if let Some(subnet_id) = requested_subnet_id.clone() {
-        match Some(subnet_id) {
-            Some(subnet_id) if subnet_id != SubnetId::primary_network() => {
-                let tracker = node.subnet_tracker.read().await;
-                tracker
-                    .subnet_validators_snapshot(&subnet_id)
-                    .map(|snapshot| {
-                        snapshot
-                            .validators
-                            .all_validators()
-                            .into_iter()
-                            .map(|validator| PlatformValidatorRecord {
-                                node_id: validator.node_id.to_string(),
-                                weight: validator.weight,
-                                start_time: validator.start_time,
-                                end_time: Some(validator.end_time),
-                                l1: None,
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            }
-            Some(_) | None => node
-                .validators
-                .values()
-                .map(|validator| PlatformValidatorRecord {
-                    node_id: validator.node_id.clone(),
-                    weight: validator.weight,
-                    start_time: validator.start_time,
-                    end_time: Some(validator.end_time),
-                    l1: None,
-                })
-                .collect::<Vec<_>>(),
-        }
-    } else {
-        node.validators
-            .values()
-            .map(|validator| PlatformValidatorRecord {
-                node_id: validator.node_id.clone(),
-                weight: validator.weight,
-                start_time: validator.start_time,
-                end_time: Some(validator.end_time),
-                l1: None,
-            })
-            .collect::<Vec<_>>()
-    };
-
-    if let Some(subnet_id) = requested_subnet_id.filter(|id| *id != SubnetId::primary_network()) {
-        if let Ok((validators, fee_state, _)) = scan_platform_l1_validator_records(node) {
+    if requested_subnet_id != SubnetId::primary_network() {
+        if let Ok((validators, fee_state, latest_timestamp)) =
+            scan_platform_l1_validator_records(node)
+        {
+            chain_time = chain_time.max(latest_timestamp);
             records.extend(
                 validators
                     .into_iter()
                     .filter_map(|(validation_id, validator)| {
-                        if validator.subnet_id != subnet_id.0 {
+                        if validator.subnet_id != requested_subnet_id.0 {
                             return None;
                         }
                         let remaining_balance_owner = validator.remaining_balance_owner?;
@@ -7010,10 +7060,21 @@ async fn platform_validator_records(
                             0
                         };
                         Some(PlatformValidatorRecord {
+                            tx_id: None,
                             node_id: format!("NodeID-{}", cb58_encode(&validator.node_id)),
+                            subnet_id: validator.subnet_id,
                             weight: validator.weight,
                             start_time: validator.start_time,
                             end_time: None,
+                            removed_at: None,
+                            permissionless: false,
+                            validation_reward_owner: None,
+                            delegation_reward_owner: None,
+                            potential_reward: None,
+                            accrued_delegatee_reward: None,
+                            shares: None,
+                            signer: None,
+                            delegators: Vec::new(),
                             l1: Some(PlatformL1ValidatorApiRecord {
                                 validation_id,
                                 public_key: validator.public_key,
@@ -7029,6 +7090,32 @@ async fn platform_validator_records(
         }
     }
 
+    if records.is_empty() && requested_subnet_id == SubnetId::primary_network() {
+        chain_time = unix_timestamp_secs();
+        records = node
+            .validators
+            .values()
+            .map(|validator| PlatformValidatorRecord {
+                tx_id: None,
+                node_id: validator.node_id.clone(),
+                subnet_id: SubnetId::primary_network().0,
+                weight: validator.weight,
+                start_time: validator.start_time,
+                end_time: Some(validator.end_time),
+                removed_at: None,
+                permissionless: true,
+                validation_reward_owner: None,
+                delegation_reward_owner: None,
+                potential_reward: None,
+                accrued_delegatee_reward: None,
+                shares: Some(0),
+                signer: None,
+                delegators: Vec::new(),
+                l1: None,
+            })
+            .collect();
+    }
+
     let requested_node_ids = platform_node_ids_param(params);
     if !requested_node_ids.is_empty() {
         let requested = requested_node_ids
@@ -7041,55 +7128,473 @@ async fn platform_validator_records(
         a.node_id
             .cmp(&b.node_id)
             .then_with(|| a.start_time.cmp(&b.start_time))
+            .then_with(|| a.tx_id.cmp(&b.tx_id))
     });
-    records
+    (chain_time, records)
+}
+
+fn platform_api_owner_json(network_id: u32, owner: &PlatformOutputOwner) -> serde_json::Value {
+    serde_json::json!({
+        "locktime": owner.locktime.to_string(),
+        "threshold": owner.threshold.to_string(),
+        "addresses": owner
+            .addresses
+            .iter()
+            .copied()
+            .map(|address| format_platform_address(network_id, address))
+            .collect::<Vec<_>>(),
+    })
+}
+
+async fn platform_validator_connection_and_uptime(
+    node: &NodeState,
+    node_id: &str,
+) -> (bool, String) {
+    let connected = node.validators_seen.read().await.contains(node_id);
+    let pm = node.peer_manager.read().await;
+    let uptime = parse_node_id_20(node_id)
+        .and_then(|node_id| pm.get_peer(&NodeId(node_id)))
+        .map(|peer| format_percentage_4dp((peer.reported_uptime as f64) / 100.0))
+        .unwrap_or_else(|| "0.0000".to_string());
+    (connected, uptime)
+}
+
+fn platform_primary_delegator_json(
+    network_id: u32,
+    delegator: &PlatformDelegatorRecord,
+) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert("txID".to_string(), serde_json::json!(delegator.tx_id));
+    value.insert("nodeID".to_string(), serde_json::json!(delegator.node_id));
+    value.insert(
+        "startTime".to_string(),
+        serde_json::json!(delegator.start_time.to_string()),
+    );
+    value.insert(
+        "endTime".to_string(),
+        serde_json::json!(delegator.end_time.to_string()),
+    );
+    value.insert(
+        "weight".to_string(),
+        serde_json::json!(delegator.weight.to_string()),
+    );
+    value.insert(
+        "rewardOwner".to_string(),
+        platform_api_owner_json(network_id, &delegator.reward_owner),
+    );
+    if let Some(potential_reward) = delegator.potential_reward {
+        value.insert(
+            "potentialReward".to_string(),
+            serde_json::json!(potential_reward.to_string()),
+        );
+    }
+    serde_json::Value::Object(value)
 }
 
 async fn platform_validator_response_values(
     node: &NodeState,
+    chain_time: u64,
     records: Vec<PlatformValidatorRecord>,
+    include_delegators: bool,
 ) -> Vec<serde_json::Value> {
-    let now = unix_timestamp_secs();
-    let connected = node.validators_seen.read().await.clone();
-    records
-        .into_iter()
-        .map(|validator| {
-            let status = validator.status(now);
-            if let Some(l1) = validator.l1 {
-                return serde_json::json!({
-                    "nodeID": validator.node_id,
-                    "startTime": validator.start_time.to_string(),
-                    "weight": validator.weight.to_string(),
-                    "validationID": cb58_encode_id(l1.validation_id),
-                    "publicKey": format!("0x{}", hex::encode(l1.public_key)),
-                    "remainingBalanceOwner": platform_l1_owner_json(
-                        node.config.network_id,
-                        &l1.remaining_balance_owner,
-                    ),
-                    "deactivationOwner": platform_l1_owner_json(
-                        node.config.network_id,
-                        &l1.deactivation_owner,
-                    ),
-                    "minNonce": l1.min_nonce.to_string(),
-                    "balance": l1.balance.to_string(),
-                    "status": status,
-                });
-            }
-            let is_connected = connected.contains(&validator.node_id);
-            serde_json::json!({
+    let mut values = Vec::with_capacity(records.len());
+    for validator in records {
+        let status = validator.status(chain_time);
+        if let Some(l1) = validator.l1 {
+            values.push(serde_json::json!({
                 "nodeID": validator.node_id,
                 "startTime": validator.start_time.to_string(),
-                "endTime": validator.end_time.unwrap_or_default().to_string(),
                 "weight": validator.weight.to_string(),
-                "stakeAmount": validator.weight.to_string(),
-                "delegationFee": "0.0000",
-                "connected": is_connected,
-                "uptime": "0.0000",
+                "validationID": cb58_encode_id(l1.validation_id),
+                "publicKey": format!("0x{}", hex::encode(l1.public_key)),
+                "remainingBalanceOwner": platform_l1_owner_json(
+                    node.config.network_id,
+                    &l1.remaining_balance_owner,
+                ),
+                "deactivationOwner": platform_l1_owner_json(
+                    node.config.network_id,
+                    &l1.deactivation_owner,
+                ),
+                "minNonce": l1.min_nonce.to_string(),
+                "balance": l1.balance.to_string(),
                 "status": status,
-                "delegators": serde_json::Value::Null,
+            }));
+            continue;
+        }
+
+        let mut value = serde_json::Map::new();
+        if let Some(tx_id) = validator.tx_id.clone() {
+            value.insert("txID".to_string(), serde_json::json!(tx_id));
+        }
+        value.insert("nodeID".to_string(), serde_json::json!(validator.node_id));
+        value.insert(
+            "startTime".to_string(),
+            serde_json::json!(validator.start_time.to_string()),
+        );
+        if let Some(end_time) = validator.end_time {
+            value.insert(
+                "endTime".to_string(),
+                serde_json::json!(end_time.to_string()),
+            );
+        }
+        value.insert(
+            "weight".to_string(),
+            serde_json::json!(validator.weight.to_string()),
+        );
+
+        if validator.permissionless {
+            value.insert(
+                "stakeAmount".to_string(),
+                serde_json::json!(validator.weight.to_string()),
+            );
+            if let Some(owner) = validator.validation_reward_owner.as_ref() {
+                value.insert(
+                    "validationRewardOwner".to_string(),
+                    platform_api_owner_json(node.config.network_id, owner),
+                );
+            }
+            if let Some(owner) = validator.delegation_reward_owner.as_ref() {
+                value.insert(
+                    "delegationRewardOwner".to_string(),
+                    platform_api_owner_json(node.config.network_id, owner),
+                );
+            }
+            if let Some(potential_reward) = validator.potential_reward {
+                value.insert(
+                    "potentialReward".to_string(),
+                    serde_json::json!(potential_reward.to_string()),
+                );
+            }
+            if let Some(accrued_delegatee_reward) = validator.accrued_delegatee_reward {
+                value.insert(
+                    "accruedDelegateeReward".to_string(),
+                    serde_json::json!(accrued_delegatee_reward.to_string()),
+                );
+            }
+            let exact_fee = validator.shares.unwrap_or_default();
+            value.insert(
+                "delegationFee".to_string(),
+                serde_json::json!(format_percentage_4dp((exact_fee as f64) / 10_000.0)),
+            );
+            value.insert(
+                "exactDelegationFee".to_string(),
+                serde_json::json!(exact_fee),
+            );
+            if let Some(signer) = validator.signer.clone() {
+                value.insert("signer".to_string(), signer);
+            }
+
+            let delegator_weight = validator.delegators.iter().fold(0u64, |total, delegator| {
+                total.saturating_add(delegator.weight)
+            });
+            value.insert(
+                "delegatorCount".to_string(),
+                serde_json::json!(validator.delegators.len().to_string()),
+            );
+            value.insert(
+                "delegatorWeight".to_string(),
+                serde_json::json!(delegator_weight.to_string()),
+            );
+            if include_delegators {
+                value.insert(
+                    "delegators".to_string(),
+                    serde_json::Value::Array(
+                        validator
+                            .delegators
+                            .iter()
+                            .map(|delegator| {
+                                platform_primary_delegator_json(node.config.network_id, delegator)
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+
+            if validator.subnet_id == SubnetId::primary_network().0 && status == "current" {
+                let (connected, uptime) =
+                    platform_validator_connection_and_uptime(node, &validator.node_id).await;
+                value.insert("connected".to_string(), serde_json::json!(connected));
+                value.insert("uptime".to_string(), serde_json::json!(uptime));
+            }
+        }
+
+        value.insert("status".to_string(), serde_json::json!(status));
+        values.push(serde_json::Value::Object(value));
+    }
+    values
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlatformQueryHeight {
+    Accepted(u64),
+    Proposed,
+}
+
+fn platform_query_height_param(
+    params: &serde_json::Value,
+) -> Result<Option<PlatformQueryHeight>, String> {
+    let Some(height_value) = platform_params_object(params)
+        .and_then(|obj| obj.get("height"))
+        .or_else(|| params.get(0))
+    else {
+        return Ok(None);
+    };
+
+    if matches!(height_value, serde_json::Value::Null) {
+        return Ok(None);
+    }
+
+    if let Some(height) = parse_quantity_u64(height_value) {
+        return Ok(Some(PlatformQueryHeight::Accepted(height)));
+    }
+
+    if height_value
+        .as_str()
+        .is_some_and(|value| value.eq_ignore_ascii_case("proposed"))
+    {
+        return Ok(Some(PlatformQueryHeight::Proposed));
+    }
+
+    Err("invalid height".to_string())
+}
+
+async fn platform_resolve_query_height(
+    node: &NodeState,
+    query_height: Option<PlatformQueryHeight>,
+) -> Result<Option<u64>, String> {
+    let latest_height = current_pchain_height(node).await;
+    match query_height {
+        None => Ok(None),
+        Some(PlatformQueryHeight::Accepted(height)) => {
+            if height > latest_height {
+                return Err(format!(
+                    "failed to get validator set at {height}: height unavailable"
+                ));
+            }
+            Ok(Some(height))
+        }
+        Some(PlatformQueryHeight::Proposed) => Ok(Some(platform_proposed_height(node).await)),
+    }
+}
+
+fn platform_validator_public_key(record: &PlatformValidatorRecord) -> Option<String> {
+    if let Some(l1) = &record.l1 {
+        return Some(format!("0x{}", hex::encode(&l1.public_key)));
+    }
+    record
+        .signer
+        .as_ref()
+        .and_then(|signer| signer.get("publicKey"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+async fn platform_get_validators_at_result(
+    node: &NodeState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let subnet_id = platform_subnet_id_param(params)
+        .and_then(SubnetId::from_str_any)
+        .unwrap_or_else(SubnetId::primary_network);
+    let height = platform_resolve_query_height(node, platform_query_height_param(params)?).await?;
+    let scan = scan_platform_validator_state(node, height);
+    let chain_time = scan.chain_time;
+    let mut records = scan
+        .validators
+        .into_iter()
+        .filter(|validator| validator.subnet_id == subnet_id.0)
+        .filter(|validator| validator.status(chain_time) == "current")
+        .collect::<Vec<_>>();
+
+    if subnet_id != SubnetId::primary_network() {
+        let (validators, fee_state, _) = scan_platform_l1_validator_records_at(node, height)?;
+        records.extend(
+            validators
+                .into_iter()
+                .filter_map(|(validation_id, validator)| {
+                    if validator.subnet_id != subnet_id.0 {
+                        return None;
+                    }
+                    let remaining_balance_owner = validator.remaining_balance_owner?;
+                    let deactivation_owner = validator.deactivation_owner?;
+                    let active = validator.weight != 0 && validator.end_accumulated_fee != 0;
+                    if !active {
+                        return None;
+                    }
+                    let balance = validator
+                        .end_accumulated_fee
+                        .saturating_sub(fee_state.accrued_fees);
+                    Some(PlatformValidatorRecord {
+                        tx_id: None,
+                        node_id: format!("NodeID-{}", cb58_encode(&validator.node_id)),
+                        subnet_id: validator.subnet_id,
+                        weight: validator.weight,
+                        start_time: validator.start_time,
+                        end_time: None,
+                        removed_at: None,
+                        permissionless: false,
+                        validation_reward_owner: None,
+                        delegation_reward_owner: None,
+                        potential_reward: None,
+                        accrued_delegatee_reward: None,
+                        shares: None,
+                        signer: None,
+                        delegators: Vec::new(),
+                        l1: Some(PlatformL1ValidatorApiRecord {
+                            validation_id,
+                            public_key: validator.public_key,
+                            remaining_balance_owner,
+                            deactivation_owner,
+                            min_nonce: validator.min_nonce,
+                            balance,
+                            active: true,
+                        }),
+                    })
+                }),
+        );
+    }
+
+    if records.is_empty()
+        && latest_pchain_block_metadata(&node.db).is_none()
+        && subnet_id == SubnetId::primary_network()
+    {
+        let now = unix_timestamp_secs();
+        records = node
+            .validators
+            .values()
+            .filter(|validator| validator.start_time <= now && now < validator.end_time)
+            .map(|validator| PlatformValidatorRecord {
+                tx_id: None,
+                node_id: validator.node_id.clone(),
+                subnet_id: SubnetId::primary_network().0,
+                weight: validator.weight,
+                start_time: validator.start_time,
+                end_time: Some(validator.end_time),
+                removed_at: None,
+                permissionless: true,
+                validation_reward_owner: None,
+                delegation_reward_owner: None,
+                potential_reward: None,
+                accrued_delegatee_reward: None,
+                shares: Some(0),
+                signer: None,
+                delegators: Vec::new(),
+                l1: None,
             })
-        })
-        .collect()
+            .collect();
+    }
+
+    let mut validators = serde_json::Map::new();
+    records.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    for record in records {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "weight".to_string(),
+            serde_json::json!(record.weight.to_string()),
+        );
+        if let Some(public_key) = platform_validator_public_key(&record) {
+            entry.insert("publicKey".to_string(), serde_json::json!(public_key));
+        }
+        validators.insert(record.node_id.clone(), serde_json::Value::Object(entry));
+    }
+    Ok(serde_json::json!({ "validators": validators }))
+}
+
+async fn platform_get_all_validators_at_result(
+    node: &NodeState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let height = platform_resolve_query_height(node, platform_query_height_param(params)?).await?;
+    let scan = scan_platform_validator_state(node, height);
+    let chain_time = scan.chain_time;
+    let mut grouped = std::collections::BTreeMap::<
+        [u8; 32],
+        (u64, std::collections::BTreeMap<String, (u64, Vec<String>)>),
+    >::new();
+
+    for record in scan
+        .validators
+        .into_iter()
+        .filter(|validator| validator.status(chain_time) == "current")
+    {
+        let subnet = grouped
+            .entry(record.subnet_id)
+            .or_insert_with(|| (0, std::collections::BTreeMap::new()));
+        subnet.0 = subnet.0.saturating_add(record.weight);
+        if let Some(public_key) = platform_validator_public_key(&record) {
+            let entry = subnet
+                .1
+                .entry(public_key)
+                .or_insert_with(|| (0, Vec::new()));
+            entry.0 = entry.0.saturating_add(record.weight);
+            entry.1.push(record.node_id.clone());
+        }
+    }
+
+    let (l1_validators, _, _) = scan_platform_l1_validator_records_at(node, height)?;
+    for (_, validator) in l1_validators {
+        if validator.weight == 0 || validator.end_accumulated_fee == 0 {
+            continue;
+        }
+        let subnet = grouped
+            .entry(validator.subnet_id)
+            .or_insert_with(|| (0, std::collections::BTreeMap::new()));
+        subnet.0 = subnet.0.saturating_add(validator.weight);
+        let public_key = format!("0x{}", hex::encode(&validator.public_key));
+        let entry = subnet
+            .1
+            .entry(public_key)
+            .or_insert_with(|| (0, Vec::new()));
+        entry.0 = entry.0.saturating_add(validator.weight);
+        entry
+            .1
+            .push(format!("NodeID-{}", cb58_encode(&validator.node_id)));
+    }
+
+    if grouped.is_empty() && latest_pchain_block_metadata(&node.db).is_none() {
+        let now = unix_timestamp_secs();
+        let mut total_weight = 0u64;
+        for validator in node
+            .validators
+            .values()
+            .filter(|validator| validator.start_time <= now && now < validator.end_time)
+        {
+            total_weight = total_weight.saturating_add(validator.weight);
+        }
+        if total_weight > 0 {
+            grouped.insert(
+                SubnetId::primary_network().0,
+                (total_weight, std::collections::BTreeMap::new()),
+            );
+        }
+    }
+
+    let mut validator_sets = serde_json::Map::new();
+    for (subnet_id, (total_weight, validators)) in grouped {
+        if total_weight == 0 {
+            continue;
+        }
+        let validators = validators
+            .into_iter()
+            .map(|(public_key, (weight, mut node_ids))| {
+                node_ids.sort();
+                serde_json::json!({
+                    "publicKey": public_key,
+                    "weight": weight.to_string(),
+                    "nodeIDs": node_ids,
+                })
+            })
+            .collect::<Vec<_>>();
+        validator_sets.insert(
+            cb58_encode_id(subnet_id),
+            serde_json::json!({
+                "validators": validators,
+                "totalWeight": total_weight.to_string(),
+            }),
+        );
+    }
+
+    Ok(serde_json::json!({ "validatorSets": validator_sets }))
 }
 
 fn parse_platform_id_32(value: &str) -> Option<[u8; 32]> {
@@ -7513,6 +8018,102 @@ fn platform_is_cortina_active(network_id: u32, start_time: u64) -> bool {
     start_time >= upgrade_time_unix(&info_upgrades_result(network_id), "cortinaTime")
 }
 
+fn platform_supply_delta_add(
+    deltas: &mut std::collections::BTreeMap<[u8; 32], u64>,
+    subnet_id: [u8; 32],
+    amount: u64,
+) {
+    deltas
+        .entry(subnet_id)
+        .and_modify(|total| *total = total.saturating_add(amount))
+        .or_insert(amount);
+}
+
+fn platform_supply_delta_sub(
+    deltas: &mut std::collections::BTreeMap<[u8; 32], u64>,
+    subnet_id: [u8; 32],
+    amount: u64,
+) {
+    let total = deltas.entry(subnet_id).or_insert(0);
+    *total = total.saturating_sub(amount);
+}
+
+fn platform_signer_value(unsigned_tx: &serde_json::Value) -> Option<serde_json::Value> {
+    match unsigned_tx.get("signer") {
+        Some(serde_json::Value::Object(map)) if map.is_empty() => None,
+        Some(value) => Some(value.clone()),
+        None => None,
+    }
+}
+
+fn platform_validator_record_from_reward_info(
+    tx_id: &str,
+    reward_info: &PlatformStakerRewardInfo,
+    unsigned_tx: &serde_json::Value,
+) -> PlatformValidatorRecord {
+    PlatformValidatorRecord {
+        tx_id: Some(tx_id.to_string()),
+        node_id: full_node_id_string(&NodeId(reward_info.node_id)),
+        subnet_id: reward_info.subnet_id,
+        weight: reward_info.stake_amount,
+        start_time: reward_info.start_time,
+        end_time: Some(reward_info.end_time),
+        removed_at: None,
+        permissionless: true,
+        validation_reward_owner: Some(reward_info.direct_reward_owner.clone()),
+        delegation_reward_owner: Some(reward_info.delegation_reward_owner.clone()),
+        potential_reward: platform_total_reward_amount(reward_info),
+        accrued_delegatee_reward: None,
+        shares: Some(reward_info.shares),
+        signer: platform_signer_value(unsigned_tx),
+        delegators: Vec::new(),
+        l1: None,
+    }
+}
+
+fn platform_delegator_record_from_reward_info(
+    tx_id: &str,
+    reward_info: &PlatformStakerRewardInfo,
+) -> PlatformDelegatorRecord {
+    PlatformDelegatorRecord {
+        tx_id: tx_id.to_string(),
+        node_id: full_node_id_string(&NodeId(reward_info.node_id)),
+        weight: reward_info.stake_amount,
+        start_time: reward_info.start_time,
+        end_time: reward_info.end_time,
+        reward_owner: reward_info.direct_reward_owner.clone(),
+        potential_reward: platform_total_reward_amount(reward_info),
+    }
+}
+
+fn platform_permissioned_validator_record_from_tx(
+    tx_id: &str,
+    unsigned_tx: &serde_json::Value,
+) -> Option<PlatformValidatorRecord> {
+    let validator = unsigned_tx.get("validator")?;
+    Some(PlatformValidatorRecord {
+        tx_id: Some(tx_id.to_string()),
+        node_id: validator.get("nodeID")?.as_str()?.to_string(),
+        subnet_id: validator
+            .get("subnetID")
+            .and_then(|value| value.as_str())
+            .and_then(parse_platform_id_32)?,
+        weight: platform_json_u64(validator.get("weight")?)?,
+        start_time: platform_json_u64(validator.get("start")?)?,
+        end_time: Some(platform_json_u64(validator.get("end")?)?),
+        removed_at: None,
+        permissionless: false,
+        validation_reward_owner: None,
+        delegation_reward_owner: None,
+        potential_reward: None,
+        accrued_delegatee_reward: None,
+        shares: None,
+        signer: None,
+        delegators: Vec::new(),
+        l1: None,
+    })
+}
+
 fn platform_initial_supply(network_id: u32, subnet_id: &SubnetId) -> Option<u64> {
     if *subnet_id != SubnetId::primary_network() {
         return None;
@@ -7553,6 +8154,262 @@ fn platform_push_reward_utxo(
         .push(reward_utxo);
 }
 
+fn scan_platform_validator_state(
+    node: &NodeState,
+    max_height: Option<u64>,
+) -> PlatformValidatorScanState {
+    let mut blocks = platform_sorted_pchain_blocks(&node.db);
+    if let Some(max_height) = max_height {
+        blocks.retain(|(meta, _)| meta.height <= max_height);
+    }
+    let decisions = platform_proposal_decisions(&blocks);
+    let chain_time = blocks.last().map(|(meta, _)| meta.timestamp).unwrap_or(0);
+
+    let mut state = PlatformValidatorScanState {
+        chain_time,
+        ..Default::default()
+    };
+    let mut validators_by_tx_id =
+        std::collections::BTreeMap::<String, PlatformValidatorRecord>::new();
+    let mut delegators_by_tx_id =
+        std::collections::BTreeMap::<String, PlatformDelegatorRecord>::new();
+    let mut reward_info_by_tx_id =
+        std::collections::HashMap::<String, PlatformStakerRewardInfo>::new();
+    let mut accrued_delegatee_rewards = std::collections::HashMap::<String, u64>::new();
+    let mut permissioned_validator_index =
+        std::collections::HashMap::<([u8; 32], String), String>::new();
+    let mut seen_txs = std::collections::HashSet::new();
+
+    for (meta, raw_block) in blocks {
+        let Ok(txs) = avalanche_rs::pchain::extract_platform_tx_bytes_from_block(&raw_block) else {
+            continue;
+        };
+
+        for tx_bytes in txs {
+            let tx_id = platform_tx_id_from_bytes(&tx_bytes);
+            if !seen_txs.insert(tx_id.clone()) {
+                continue;
+            }
+
+            let tx_json = match avalanche_rs::pchain::parse_platform_tx_json(&tx_bytes) {
+                Ok(tx_json) => tx_json,
+                Err(_) => continue,
+            };
+            let Some(unsigned_tx) = tx_json.get("unsignedTx") else {
+                continue;
+            };
+
+            if let Some(subnet_id) = unsigned_tx
+                .get("subnetID")
+                .and_then(|value| value.as_str())
+                .and_then(parse_platform_id_32)
+            {
+                if let Some(config) = unsigned_tx
+                    .get("assetID")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_platform_id_32)
+                    .map(|asset_id| PlatformSubnetStakingConfig {
+                        asset_id: Some(asset_id),
+                        initial_supply: unsigned_tx
+                            .get("initialSupply")
+                            .and_then(platform_json_u64),
+                        min_validator_stake: unsigned_tx
+                            .get("minValidatorStake")
+                            .and_then(platform_json_u64),
+                        min_delegator_stake: unsigned_tx
+                            .get("minDelegatorStake")
+                            .and_then(platform_json_u64),
+                    })
+                {
+                    state.subnet_configs.insert(subnet_id, config);
+                }
+            }
+
+            if unsigned_tx.get("subnetAuthorization").is_some()
+                && unsigned_tx.get("validator").is_some()
+                && unsigned_tx.get("newOwner").is_none()
+            {
+                if let Some(record) =
+                    platform_permissioned_validator_record_from_tx(&tx_id, unsigned_tx)
+                {
+                    permissioned_validator_index
+                        .insert((record.subnet_id, record.node_id.clone()), tx_id.clone());
+                    validators_by_tx_id.insert(tx_id.clone(), record);
+                }
+                continue;
+            }
+
+            if unsigned_tx.get("nodeID").is_some()
+                && unsigned_tx.get("subnetAuthorization").is_some()
+            {
+                let Some(node_id) = unsigned_tx.get("nodeID").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let Some(subnet_id) = unsigned_tx
+                    .get("subnetID")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_platform_id_32)
+                else {
+                    continue;
+                };
+                if let Some(existing_tx_id) =
+                    permissioned_validator_index.remove(&(subnet_id, node_id.to_string()))
+                {
+                    if let Some(record) = validators_by_tx_id.get_mut(&existing_tx_id) {
+                        record.removed_at = Some(meta.timestamp);
+                    }
+                }
+                continue;
+            }
+
+            if let Ok(ledger) = avalanche_rs::pchain::summarize_platform_tx_ledger(&tx_bytes) {
+                if let Some(kind) = ledger.kind {
+                    if let Some(reward_info) =
+                        platform_staker_reward_info_from_ledger(&tx_bytes, &ledger)
+                    {
+                        if reward_info.start_time <= chain_time {
+                            platform_supply_delta_add(
+                                &mut state.current_supply_deltas,
+                                reward_info.subnet_id,
+                                platform_total_reward_amount(&reward_info).unwrap_or(0),
+                            );
+                        }
+
+                        match kind {
+                            avalanche_rs::pchain::PlatformStakerKind::Validator => {
+                                validators_by_tx_id.insert(
+                                    tx_id.clone(),
+                                    platform_validator_record_from_reward_info(
+                                        &tx_id,
+                                        &reward_info,
+                                        unsigned_tx,
+                                    ),
+                                );
+                            }
+                            avalanche_rs::pchain::PlatformStakerKind::Delegator => {
+                                delegators_by_tx_id.insert(
+                                    tx_id.clone(),
+                                    platform_delegator_record_from_reward_info(
+                                        &tx_id,
+                                        &reward_info,
+                                    ),
+                                );
+                            }
+                        }
+                        reward_info_by_tx_id.insert(tx_id.clone(), reward_info);
+                    }
+                }
+
+                if let Some(reward_target) = ledger.reward_validator_tx_id {
+                    let Some(decision) = decisions.get(&meta.id) else {
+                        continue;
+                    };
+                    let reward_target_id = cb58_encode_id(reward_target);
+                    let Some(reward_info) = reward_info_by_tx_id.get(&reward_target_id).cloned()
+                    else {
+                        continue;
+                    };
+                    if *decision == PlatformProposalDecision::Abort
+                        && reward_info.start_time <= chain_time
+                    {
+                        platform_supply_delta_sub(
+                            &mut state.current_supply_deltas,
+                            reward_info.subnet_id,
+                            platform_total_reward_amount(&reward_info).unwrap_or(0),
+                        );
+                    }
+
+                    match reward_info.kind {
+                        avalanche_rs::pchain::PlatformStakerKind::Validator => {
+                            let delegatee_reward = accrued_delegatee_rewards
+                                .remove(&reward_target_id)
+                                .unwrap_or(0);
+                            if let Some(record) = validators_by_tx_id.get_mut(&reward_target_id) {
+                                record.accrued_delegatee_reward = Some(delegatee_reward);
+                            }
+                        }
+                        avalanche_rs::pchain::PlatformStakerKind::Delegator => {
+                            if *decision != PlatformProposalDecision::Commit {
+                                continue;
+                            }
+                            let Some(total_reward) = platform_total_reward_amount(&reward_info)
+                            else {
+                                continue;
+                            };
+                            let Some((validator_tx_id, validator_info)) =
+                                platform_validator_for_delegator(
+                                    &reward_info_by_tx_id,
+                                    &reward_info,
+                                )
+                            else {
+                                continue;
+                            };
+                            let (delegatee_reward, _) =
+                                platform_reward_split(total_reward, validator_info.shares);
+                            if platform_is_cortina_active(
+                                node.config.network_id,
+                                validator_info.start_time,
+                            ) {
+                                let accrued = accrued_delegatee_rewards
+                                    .entry(validator_tx_id.to_string())
+                                    .or_insert(0);
+                                *accrued = accrued.saturating_add(delegatee_reward);
+                            } else if let Some(record) =
+                                validators_by_tx_id.get_mut(validator_tx_id)
+                            {
+                                let current = record.accrued_delegatee_reward.unwrap_or(0);
+                                record.accrued_delegatee_reward =
+                                    Some(current.saturating_add(delegatee_reward));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (validator_tx_id, accrued_reward) in accrued_delegatee_rewards {
+        if let Some(record) = validators_by_tx_id.get_mut(&validator_tx_id) {
+            let current = record.accrued_delegatee_reward.unwrap_or(0);
+            record.accrued_delegatee_reward = Some(current.saturating_add(accrued_reward));
+        }
+    }
+
+    for (delegator_tx_id, reward_info) in &reward_info_by_tx_id {
+        if reward_info.kind != avalanche_rs::pchain::PlatformStakerKind::Delegator {
+            continue;
+        }
+        let Some((validator_tx_id, _)) =
+            platform_validator_for_delegator(&reward_info_by_tx_id, reward_info)
+        else {
+            continue;
+        };
+        let Some(delegator) = delegators_by_tx_id.get(delegator_tx_id).cloned() else {
+            continue;
+        };
+        if let Some(validator) = validators_by_tx_id.get_mut(validator_tx_id) {
+            validator.delegators.push(delegator);
+        }
+    }
+
+    state.validators = validators_by_tx_id.into_values().collect();
+    state.validators.sort_by(|a, b| {
+        a.node_id
+            .cmp(&b.node_id)
+            .then_with(|| a.start_time.cmp(&b.start_time))
+            .then_with(|| a.tx_id.cmp(&b.tx_id))
+    });
+    for validator in &mut state.validators {
+        validator.delegators.sort_by(|a, b| {
+            a.start_time
+                .cmp(&b.start_time)
+                .then_with(|| a.tx_id.cmp(&b.tx_id))
+        });
+    }
+    state
+}
+
 fn platform_sorted_pchain_blocks(db: &Database) -> Vec<(BlockMetadata, Vec<u8>)> {
     let mut blocks = db
         .iter_cf_owned(CF_BLOCKS)
@@ -7569,6 +8426,17 @@ fn platform_sorted_pchain_blocks(db: &Database) -> Vec<(BlockMetadata, Vec<u8>)>
             .cmp(&b.0.height)
             .then_with(|| a.0.id.cmp(&b.0.id))
     });
+    blocks
+}
+
+fn platform_sorted_pchain_blocks_up_to(
+    db: &Database,
+    max_height: Option<u64>,
+) -> Vec<(BlockMetadata, Vec<u8>)> {
+    let mut blocks = platform_sorted_pchain_blocks(db);
+    if let Some(max_height) = max_height {
+        blocks.retain(|(meta, _)| meta.height <= max_height);
+    }
     blocks
 }
 
@@ -7975,9 +8843,9 @@ fn platform_stake_response(
         stakeds.insert(asset_id, serde_json::Value::String(amount.to_string()));
     }
 
-    let primary_asset_id =
-        platform_staking_asset_id(node.config.network_id, Some(&SubnetId::primary_network()));
+    let primary_asset_id = platform_staking_asset_id(node, Some(&SubnetId::primary_network()));
     let staked = primary_asset_id
+        .as_ref()
         .and_then(|asset_id| stakeds.get(asset_id))
         .and_then(|value| value.as_str())
         .unwrap_or("0")
@@ -8075,21 +8943,24 @@ fn platform_balance_response(
         }
     }
 
-    let primary_asset =
-        platform_staking_asset_id(node.config.network_id, Some(&SubnetId::primary_network()));
+    let primary_asset = platform_staking_asset_id(node, Some(&SubnetId::primary_network()));
     let balance = primary_asset
+        .as_ref()
         .and_then(|asset| balances.get(asset))
         .copied()
         .unwrap_or(0);
     let unlocked = primary_asset
+        .as_ref()
         .and_then(|asset| unlockeds.get(asset))
         .copied()
         .unwrap_or(0);
     let locked_stakeable = primary_asset
+        .as_ref()
         .and_then(|asset| locked_stakeables.get(asset))
         .copied()
         .unwrap_or(0);
     let locked_not_stakeable = primary_asset
+        .as_ref()
         .and_then(|asset| locked_not_stakeables.get(asset))
         .copied()
         .unwrap_or(0);
@@ -10074,23 +10945,16 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         // Platform RPC methods (routed via /ext/bc/P in AvalancheGo)
         // -----------------------------------------------------------------
         "platform.getCurrentValidators" => {
-            let now = unix_timestamp_secs();
-            let records = platform_validator_records(node, params).await;
+            let (chain_time, records) = platform_validator_records(node, params).await;
             let records = records
                 .into_iter()
-                .filter(|validator| validator.status(now) == "current")
+                .filter(|validator| validator.status(chain_time) == "current")
                 .collect::<Vec<_>>();
-            let validators = platform_validator_response_values(node, records).await;
-            rpc_ok(
-                &serde_json::json!({ "validators": validators }).to_string(),
-                id,
-            )
-        }
-
-        "platform.getValidators" => {
             let validators = platform_validator_response_values(
                 node,
-                platform_validator_records(node, params).await,
+                chain_time,
+                records,
+                platform_node_ids_param(params).len() == 1,
             )
             .await;
             rpc_ok(
@@ -10099,14 +10963,24 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             )
         }
 
+        "platform.getValidators" => {
+            let (chain_time, records) = platform_validator_records(node, params).await;
+            let validators =
+                platform_validator_response_values(node, chain_time, records, false).await;
+            rpc_ok(
+                &serde_json::json!({ "validators": validators }).to_string(),
+                id,
+            )
+        }
+
         "platform.getPendingValidators" => {
-            let now = unix_timestamp_secs();
-            let records = platform_validator_records(node, params).await;
+            let (chain_time, records) = platform_validator_records(node, params).await;
             let records = records
                 .into_iter()
-                .filter(|validator| validator.status(now) == "pending")
+                .filter(|validator| validator.status(chain_time) == "pending")
                 .collect::<Vec<_>>();
-            let validators = platform_validator_response_values(node, records).await;
+            let validators =
+                platform_validator_response_values(node, chain_time, records, false).await;
             rpc_ok(
                 &serde_json::json!({
                     "validators": validators,
@@ -10121,16 +10995,26 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             let Some(node_id) = platform_node_id_param(params) else {
                 return rpc_error(-32602, "missing nodeID", id);
             };
-            let validators = platform_validator_response_values(
-                node,
-                platform_validator_records(node, params).await,
-            )
-            .await;
+            let (chain_time, records) = platform_validator_records(node, params).await;
+            let validators =
+                platform_validator_response_values(node, chain_time, records, true).await;
             match validators.into_iter().find(|validator| {
                 validator.get("nodeID").and_then(|value| value.as_str()) == Some(node_id)
             }) {
                 Some(validator) => rpc_ok(&validator.to_string(), id),
                 None => rpc_error(-32000, "validator not found", id),
+            }
+        }
+
+        "platform.getValidatorsAt" => match platform_get_validators_at_result(node, params).await {
+            Ok(result) => rpc_ok(&result.to_string(), id),
+            Err(err) => rpc_error(-32000, &err, id),
+        },
+
+        "platform.getAllValidatorsAt" => {
+            match platform_get_all_validators_at_result(node, params).await {
+                Ok(result) => rpc_ok(&result.to_string(), id),
+                Err(err) => rpc_error(-32000, &err, id),
             }
         }
 
@@ -10424,11 +11308,10 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             let Some(size) = platform_size_param(params) else {
                 return rpc_error(-32602, "missing size", id);
             };
-            let now = unix_timestamp_secs();
-            let mut validators = platform_validator_records(node, params)
-                .await
+            let (chain_time, records) = platform_validator_records(node, params).await;
+            let mut validators = records
                 .into_iter()
-                .filter(|validator| validator.status(now) == "current")
+                .filter(|validator| validator.status(chain_time) == "current")
                 .map(|validator| validator.node_id)
                 .collect::<Vec<_>>();
             validators.shuffle(&mut rand::thread_rng());
@@ -10614,11 +11497,10 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
         }
 
         "platform.getTotalStake" => {
-            let now = unix_timestamp_secs();
-            let total = platform_validator_records(node, params)
-                .await
+            let (chain_time, records) = platform_validator_records(node, params).await;
+            let total = records
                 .into_iter()
-                .filter(|validator| validator.status(now) == "current")
+                .filter(|validator| validator.status(chain_time) == "current")
                 .map(|validator| validator.weight as u128)
                 .sum::<u128>();
             rpc_ok(
@@ -10631,18 +11513,24 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             )
         }
 
-        "platform.getMinStake" => rpc_ok(
-            &serde_json::json!({
-                "minValidatorStake": MIN_VALIDATOR_STAKE.to_string(),
-                "minDelegatorStake": MIN_DELEGATOR_STAKE.to_string(),
-            })
-            .to_string(),
-            id,
-        ),
+        "platform.getMinStake" => {
+            let subnet_id = platform_subnet_id_param(params).and_then(SubnetId::from_str_any);
+            match platform_min_stake_for_subnet(node, subnet_id.as_ref()) {
+                Some((min_validator_stake, min_delegator_stake)) => rpc_ok(
+                    &serde_json::json!({
+                        "minValidatorStake": min_validator_stake.to_string(),
+                        "minDelegatorStake": min_delegator_stake.to_string(),
+                    })
+                    .to_string(),
+                    id,
+                ),
+                None => rpc_error(-32000, "minimum stake unavailable for subnet", id),
+            }
+        }
 
         "platform.getStakingAssetID" => {
             let subnet_id = platform_subnet_id_param(params).and_then(SubnetId::from_str_any);
-            match platform_staking_asset_id(node.config.network_id, subnet_id.as_ref()) {
+            match platform_staking_asset_id(node, subnet_id.as_ref()) {
                 Some(asset_id) => rpc_ok(
                     &serde_json::json!({
                         "assetID": asset_id,
@@ -13174,6 +14062,225 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_platform_current_validators_use_committed_primary_validator_details() {
+        let node = make_test_node(1);
+        let validator_owner = [0x71; 20];
+        let validator_tx = make_platform_add_validator_tx_bytes_with_window(
+            validator_owner,
+            2_000 * avalanche_rs::staking::NANO_AVAX,
+            1_699_999_000,
+            1_700_100_000,
+            12_345,
+        );
+        let delegator_tx = make_platform_add_delegator_tx_bytes_with_window(
+            [0x72; 20],
+            25 * avalanche_rs::staking::NANO_AVAX,
+            [0x11; 20],
+            1_699_999_100,
+            1_700_050_000,
+        );
+        let raw_block = make_banff_std_with_txs_at(
+            [0x70; 32],
+            60,
+            1_700_000_000,
+            &[validator_tx.clone(), delegator_tx.clone()],
+        );
+        let block_id = sha256_bytes(&raw_block);
+        node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+
+        let peer_id = NodeId([0x11; 20]);
+        let mut peer = Peer::new(peer_id.clone(), "10.0.0.1:9651".parse().unwrap());
+        peer.reported_uptime = 9_500;
+        node.peer_manager.write().await.add_peer(peer).unwrap();
+        node.validators_seen
+            .write()
+            .await
+            .insert(full_node_id_string(&peer_id));
+
+        let node_id = full_node_id_string(&peer_id);
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getCurrentValidators","params":{{"nodeIDs":["{}"]}},"id":61}}"#,
+            node_id
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let validators = json["result"]["validators"].as_array().unwrap();
+        assert_eq!(validators.len(), 1);
+
+        let validator = &validators[0];
+        assert_eq!(
+            validator["txID"],
+            cb58_encode_id(sha256_bytes(&validator_tx))
+        );
+        assert_eq!(validator["nodeID"], node_id);
+        assert_eq!(
+            validator["validationRewardOwner"]["addresses"],
+            serde_json::json!([format_platform_address(
+                node.config.network_id,
+                validator_owner
+            )])
+        );
+        assert_eq!(
+            validator["delegationRewardOwner"]["addresses"],
+            serde_json::json!([format_platform_address(
+                node.config.network_id,
+                validator_owner
+            )])
+        );
+        assert_eq!(validator["delegationFee"], "1.2345");
+        assert_eq!(validator["exactDelegationFee"], 12_345);
+        assert_eq!(validator["connected"], true);
+        assert_eq!(validator["uptime"], "95.0000");
+        assert_eq!(validator["delegatorCount"], "1");
+        assert_eq!(
+            validator["delegatorWeight"],
+            (25 * avalanche_rs::staking::NANO_AVAX).to_string()
+        );
+        assert_eq!(validator["delegators"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            validator["delegators"][0]["rewardOwner"]["addresses"],
+            serde_json::json!([format_platform_address(node.config.network_id, [0x72; 20])])
+        );
+        assert_eq!(
+            validator["potentialReward"],
+            avalanche_rs::staking::expected_reward(
+                2_000 * avalanche_rs::staking::NANO_AVAX,
+                1_700_100_000u64.saturating_sub(1_699_999_000),
+                1.0,
+            )
+            .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_platform_subnet_stake_and_supply_endpoints_use_transform_config() {
+        let node = make_test_node(1);
+        let subnet_id = [0x81; 32];
+        let asset_id = [0x82; 32];
+        let transform_tx = make_platform_transform_subnet_tx_bytes(subnet_id, asset_id);
+        let raw_block = make_banff_std_with_txs_at([0x80; 32], 70, 1_700_000_000, &[transform_tx]);
+        let block_id = sha256_bytes(&raw_block);
+        node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+
+        let min_stake_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getMinStake","params":{{"subnetID":"{}"}},"id":71}}"#,
+            cb58_encode_id(subnet_id)
+        );
+        let min_stake_response = handle_rpc_request(&min_stake_req, &node).await;
+        let min_stake_json: serde_json::Value = serde_json::from_str(&min_stake_response).unwrap();
+        assert_eq!(min_stake_json["result"]["minValidatorStake"], "100");
+        assert_eq!(min_stake_json["result"]["minDelegatorStake"], "25");
+
+        let asset_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getStakingAssetID","params":{{"subnetID":"{}"}},"id":72}}"#,
+            cb58_encode_id(subnet_id)
+        );
+        let asset_response = handle_rpc_request(&asset_req, &node).await;
+        let asset_json: serde_json::Value = serde_json::from_str(&asset_response).unwrap();
+        assert_eq!(asset_json["result"]["assetID"], cb58_encode_id(asset_id));
+
+        let supply_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getCurrentSupply","params":{{"subnetID":"{}"}},"id":73}}"#,
+            cb58_encode_id(subnet_id)
+        );
+        let supply_response = handle_rpc_request(&supply_req, &node).await;
+        let supply_json: serde_json::Value = serde_json::from_str(&supply_response).unwrap();
+        assert_eq!(supply_json["result"]["supply"], "1000");
+        assert_eq!(supply_json["result"]["height"], "70");
+    }
+
+    #[tokio::test]
+    async fn test_platform_validator_set_endpoints_support_height_queries() {
+        let node = make_test_node(12345);
+        let etna_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "etnaTime");
+        let primary_validator_tx = make_platform_add_validator_tx_bytes_with_window(
+            [0x91; 20],
+            2_500,
+            etna_time,
+            etna_time + 10_000,
+            0,
+        );
+        let subnet_id = [0x92; 32];
+        let owner = [0x93; 20];
+        let convert_tx =
+            make_platform_convert_subnet_to_l1_tx_bytes(subnet_id, &[([0x94; 20], 7, 20, owner)]);
+        let (register_tx, register_validation_id) = make_platform_register_l1_validator_tx_bytes(
+            subnet_id,
+            [0x95; 20],
+            owner,
+            5,
+            15,
+            etna_time + 86_400,
+            2,
+        );
+        let set_weight_tx =
+            make_platform_set_l1_validator_weight_tx_bytes(register_validation_id, 0, 9, 1);
+
+        let block1 = make_banff_std_with_txs_at(
+            [0x90; 32],
+            1,
+            etna_time + 10,
+            &[primary_validator_tx, convert_tx],
+        );
+        let block1_id = sha256_bytes(&block1);
+        let block2 = make_banff_std_with_txs_at(block1_id, 2, etna_time + 20, &[register_tx]);
+        let block2_id = sha256_bytes(&block2);
+        let block3 = make_banff_std_with_txs_at(block2_id, 3, etna_time + 30, &[set_weight_tx]);
+        node.db.put_cf(CF_BLOCKS, &block1_id, &block1).unwrap();
+        node.db.put_cf(CF_BLOCKS, &block2_id, &block2).unwrap();
+        node.db
+            .put_cf(CF_BLOCKS, &sha256_bytes(&block3), &block3)
+            .unwrap();
+
+        let primary_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getValidatorsAt","params":{{"height":"3","subnetID":"{}"}},"id":81}}"#,
+            cb58_encode_id(SubnetId::primary_network().0)
+        );
+        let primary_response = handle_rpc_request(&primary_req, &node).await;
+        let primary_json: serde_json::Value = serde_json::from_str(&primary_response).unwrap();
+        let primary_validators = primary_json["result"]["validators"].as_object().unwrap();
+        assert_eq!(primary_validators.len(), 1);
+        assert_eq!(
+            primary_validators[&full_node_id_string(&NodeId([0x11; 20]))]["weight"],
+            "2500"
+        );
+
+        let subnet_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"platform.getValidatorsAt","params":{{"height":"3","subnetID":"{}"}},"id":82}}"#,
+            cb58_encode_id(subnet_id)
+        );
+        let subnet_response = handle_rpc_request(&subnet_req, &node).await;
+        let subnet_json: serde_json::Value = serde_json::from_str(&subnet_response).unwrap();
+        let subnet_validators = subnet_json["result"]["validators"].as_object().unwrap();
+        let l1_node_id = full_node_id_string(&NodeId([0x95; 20]));
+        assert_eq!(subnet_validators[&l1_node_id]["weight"], "9");
+        assert!(subnet_validators[&l1_node_id]["publicKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+
+        let all_req = r#"{"jsonrpc":"2.0","method":"platform.getAllValidatorsAt","params":{"height":"3"},"id":83}"#;
+        let all_response = handle_rpc_request(all_req, &node).await;
+        let all_json: serde_json::Value = serde_json::from_str(&all_response).unwrap();
+        let validator_sets = all_json["result"]["validatorSets"].as_object().unwrap();
+        assert_eq!(
+            validator_sets[&cb58_encode_id(SubnetId::primary_network().0)]["totalWeight"],
+            "2500"
+        );
+        assert_eq!(
+            validator_sets[&cb58_encode_id(subnet_id)]["totalWeight"],
+            "9"
+        );
+        assert!(
+            validator_sets[&cb58_encode_id(subnet_id)]["validators"][0]["publicKey"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x")
+        );
+    }
+
+    #[tokio::test]
     async fn test_platform_get_height_and_min_stake_shapes() {
         let node = make_test_node(1);
         let raw_block = make_banff_std([0x11; 32], 42);
@@ -14830,9 +15937,7 @@ mod integration_tests {
         let tx_a = make_platform_base_tx_with_io(&[], std::slice::from_ref(&shared_input));
         let tx_b = make_platform_base_tx_with_io(
             std::slice::from_ref(&make_platform_transferable_output_bytes(
-                [0x11; 32],
-                500,
-                [0xBB; 20],
+                [0x11; 32], 500, [0xBB; 20],
             )),
             std::slice::from_ref(&shared_input),
         );
@@ -14884,9 +15989,7 @@ mod integration_tests {
 
         let committed_spend = make_platform_base_tx_with_io(
             std::slice::from_ref(&make_platform_transferable_output_bytes(
-                [0x22; 32],
-                700,
-                [0xDD; 20],
+                [0x22; 32], 700, [0xDD; 20],
             )),
             std::slice::from_ref(&shared_input),
         );

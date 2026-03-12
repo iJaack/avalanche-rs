@@ -157,12 +157,15 @@ pub struct PlatformBalanceResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorInfo {
+    #[serde(rename = "txID", default)]
+    pub tx_id: Option<String>,
     /// Avalanche API returns `nodeID`, not `node_id`
     #[serde(alias = "nodeID", alias = "node_id")]
     pub node_id: String,
-    /// Stake weight (nAVAX as string)
-    #[serde(alias = "stakeAmount", default)]
-    pub stake: String,
+    #[serde(default)]
+    pub weight: String,
+    #[serde(rename = "stakeAmount", default)]
+    pub stake_amount: String,
     /// Validator status
     #[serde(default)]
     pub status: String,
@@ -181,10 +184,20 @@ pub struct ValidatorInfo {
     /// Delegation fee (in 10000ths)
     #[serde(alias = "delegationFee", default)]
     pub delegation_fee: String,
+    #[serde(rename = "exactDelegationFee", default)]
+    pub exact_delegation_fee: Option<u32>,
     #[serde(rename = "validationID", default)]
     pub validation_id: Option<String>,
     #[serde(rename = "publicKey", default)]
     pub public_key: Option<String>,
+    #[serde(rename = "validationRewardOwner", default)]
+    pub validation_reward_owner: Option<PlatformOwnerResponse>,
+    #[serde(rename = "delegationRewardOwner", default)]
+    pub delegation_reward_owner: Option<PlatformOwnerResponse>,
+    #[serde(rename = "potentialReward", default)]
+    pub potential_reward: Option<String>,
+    #[serde(rename = "accruedDelegateeReward", default)]
+    pub accrued_delegatee_reward: Option<String>,
     #[serde(rename = "remainingBalanceOwner", default)]
     pub remaining_balance_owner: Option<PlatformOwnerResponse>,
     #[serde(rename = "deactivationOwner", default)]
@@ -193,6 +206,14 @@ pub struct ValidatorInfo {
     pub min_nonce: Option<String>,
     #[serde(default)]
     pub balance: Option<String>,
+    #[serde(rename = "delegatorCount", default)]
+    pub delegator_count: Option<String>,
+    #[serde(rename = "delegatorWeight", default)]
+    pub delegator_weight: Option<String>,
+    #[serde(default)]
+    pub delegators: Option<Vec<PrimaryDelegatorInfo>>,
+    #[serde(default)]
+    pub signer: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +263,58 @@ pub struct PlatformOwnerResponse {
     pub threshold: String,
     #[serde(default)]
     pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimaryDelegatorInfo {
+    #[serde(rename = "txID", default)]
+    pub tx_id: Option<String>,
+    #[serde(rename = "nodeID")]
+    pub node_id: String,
+    #[serde(rename = "startTime")]
+    pub start_time: String,
+    #[serde(rename = "endTime")]
+    pub end_time: String,
+    pub weight: String,
+    #[serde(rename = "rewardOwner", default)]
+    pub reward_owner: Option<PlatformOwnerResponse>,
+    #[serde(rename = "potentialReward", default)]
+    pub potential_reward: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorsAtEntry {
+    pub weight: String,
+    #[serde(rename = "publicKey", default)]
+    pub public_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorsAtResponse {
+    pub validators: std::collections::BTreeMap<String, ValidatorsAtEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarpValidatorEntry {
+    #[serde(rename = "publicKey")]
+    pub public_key: String,
+    pub weight: String,
+    #[serde(rename = "nodeIDs", default)]
+    pub node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarpValidatorSetResponse {
+    #[serde(default)]
+    pub validators: Vec<WarpValidatorEntry>,
+    #[serde(rename = "totalWeight")]
+    pub total_weight: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllValidatorsAtResponse {
+    #[serde(rename = "validatorSets")]
+    pub validator_sets: std::collections::BTreeMap<String, WarpValidatorSetResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1160,6 +1233,28 @@ impl RpcClient {
             .await
     }
 
+    /// Get the validator set at a specific accepted or proposed height.
+    pub async fn p_get_validators_at(
+        &self,
+        height: &str,
+        subnet_id: &str,
+    ) -> Result<ValidatorsAtResponse> {
+        self.call_parsed(
+            "platform.getValidatorsAt",
+            vec![json!({ "height": height, "subnetID": subnet_id })],
+        )
+        .await
+    }
+
+    /// Get all subnet validator sets at a specific accepted or proposed height.
+    pub async fn p_get_all_validators_at(&self, height: &str) -> Result<AllValidatorsAtResponse> {
+        self.call_parsed(
+            "platform.getAllValidatorsAt",
+            vec![json!({ "height": height })],
+        )
+        .await
+    }
+
     /// Get pending validators on P-chain
     pub async fn p_get_pending_validators(
         &self,
@@ -1448,7 +1543,19 @@ impl RpcClient {
 
     /// Get minimum validator and delegator stakes.
     pub async fn p_get_min_stake(&self) -> Result<MinStakeResponse> {
-        self.call_parsed("platform.getMinStake", vec![json!({})])
+        self.p_get_min_stake_for_subnet(None).await
+    }
+
+    /// Get minimum validator and delegator stakes for a subnet.
+    pub async fn p_get_min_stake_for_subnet(
+        &self,
+        subnet_id: Option<&str>,
+    ) -> Result<MinStakeResponse> {
+        let mut request = serde_json::Map::new();
+        if let Some(subnet_id) = subnet_id {
+            request.insert("subnetID".into(), json!(subnet_id));
+        }
+        self.call_parsed("platform.getMinStake", vec![Value::Object(request)])
             .await
     }
 
@@ -1751,7 +1858,49 @@ mod tests {
                 "platform.getTxStatus" => json!({
                     "status": "Processing",
                 }),
+                "platform.getCurrentValidators" => json!({
+                    "validators": [{
+                        "txID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA",
+                        "nodeID": "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg",
+                        "weight": "9",
+                        "stakeAmount": "9",
+                        "startTime": "1700000010",
+                        "endTime": "1700001010",
+                        "status": "current",
+                        "validationRewardOwner": {
+                            "locktime": "0",
+                            "threshold": "1",
+                            "addresses": ["P-local1"],
+                        },
+                        "delegationRewardOwner": {
+                            "locktime": "0",
+                            "threshold": "1",
+                            "addresses": ["P-local1"],
+                        },
+                        "potentialReward": "123",
+                        "delegationFee": "2.5000",
+                        "exactDelegationFee": 25000,
+                        "connected": true,
+                        "uptime": "95.0000",
+                        "delegatorCount": "1",
+                        "delegatorWeight": "4",
+                        "delegators": [{
+                            "txID": "2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q",
+                            "nodeID": "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg",
+                            "startTime": "1700000020",
+                            "endTime": "1700001020",
+                            "weight": "4",
+                            "rewardOwner": {
+                                "locktime": "0",
+                                "threshold": "1",
+                                "addresses": ["P-local2"],
+                            },
+                            "potentialReward": "5",
+                        }],
+                    }],
+                }),
                 "platform.getValidator" => json!({
+                    "txID": "2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA",
                     "nodeID": "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg",
                     "weight": "9",
                     "startTime": "1700000010",
@@ -1770,6 +1919,30 @@ mod tests {
                     "minNonce": "1",
                     "balance": "15",
                     "status": "current",
+                }),
+                "platform.getValidatorsAt" => json!({
+                    "validators": {
+                        "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg": {
+                            "weight": "9",
+                            "publicKey": "0x1111",
+                        }
+                    }
+                }),
+                "platform.getAllValidatorsAt" => json!({
+                    "validatorSets": {
+                        "11111111111111111111111111111111LpoYY": {
+                            "validators": [],
+                            "totalWeight": "9",
+                        },
+                        "2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q": {
+                            "validators": [{
+                                "publicKey": "0x1111",
+                                "weight": "9",
+                                "nodeIDs": ["NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg"],
+                            }],
+                            "totalWeight": "9",
+                        }
+                    }
                 }),
                 "platform.getSubnet" => json!({
                     "isPermissioned": false,
@@ -1813,6 +1986,21 @@ mod tests {
                     "price": 777,
                     "timestamp": "2026-03-12T09:15:00Z",
                 }),
+                "platform.getMinStake" => {
+                    if request["params"][0]["subnetID"]
+                        == json!("2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q")
+                    {
+                        json!({
+                            "minValidatorStake": "100",
+                            "minDelegatorStake": "25",
+                        })
+                    } else {
+                        json!({
+                            "minValidatorStake": "2000000000000",
+                            "minDelegatorStake": "25000000000",
+                        })
+                    }
+                }
                 "platform.getStake" => json!({
                     "staked": "0",
                     "stakeds": {
@@ -1919,6 +2107,42 @@ mod tests {
         assert_eq!(current_supply.supply, "720000000000000000");
         assert_eq!(current_supply.height, "42");
 
+        let current_validators = client
+            .p_get_current_validators(Some("11111111111111111111111111111111LpoYY"))
+            .await
+            .unwrap();
+        assert_eq!(current_validators.validators.len(), 1);
+        assert_eq!(
+            current_validators.validators[0].tx_id.as_deref(),
+            Some("2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA")
+        );
+        assert_eq!(current_validators.validators[0].weight, "9");
+        assert_eq!(current_validators.validators[0].stake_amount, "9");
+        assert_eq!(current_validators.validators[0].delegation_fee, "2.5000");
+        assert_eq!(
+            current_validators.validators[0].exact_delegation_fee,
+            Some(25_000)
+        );
+        assert_eq!(
+            current_validators.validators[0].potential_reward.as_deref(),
+            Some("123")
+        );
+        assert_eq!(
+            current_validators.validators[0].delegator_count.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            current_validators.validators[0]
+                .delegators
+                .as_ref()
+                .unwrap()[0]
+                .reward_owner
+                .as_ref()
+                .unwrap()
+                .addresses,
+            vec!["P-local2"]
+        );
+
         let l1_validator = client
             .p_get_l1_validator("2r2x62v3WxP6xs7rZhoakaTK3hxpf1L6q8bqs6FZ83dTcKFwRA")
             .await
@@ -1982,6 +2206,36 @@ mod tests {
             vec!["P-local1"]
         );
 
+        let validators_at = client
+            .p_get_validators_at(
+                "proposed",
+                "2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            validators_at.validators["NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg"].weight,
+            "9"
+        );
+        assert_eq!(
+            validators_at.validators["NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg"]
+                .public_key
+                .as_deref(),
+            Some("0x1111")
+        );
+
+        let all_validators_at = client.p_get_all_validators_at("42").await.unwrap();
+        assert_eq!(
+            all_validators_at.validator_sets["11111111111111111111111111111111LpoYY"].total_weight,
+            "9"
+        );
+        assert_eq!(
+            all_validators_at.validator_sets["2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q"]
+                .validators[0]
+                .node_ids,
+            vec!["NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg"]
+        );
+
         let subnet = client
             .p_get_subnet("2bRCr6B4MiEfSjidDwxDpdCyviwnfUVqB2HGwhm947w9YYqb7r")
             .await
@@ -2015,6 +2269,13 @@ mod tests {
         assert_eq!(validator_fee_state.excess, 75);
         assert_eq!(validator_fee_state.price, 777);
         assert_eq!(validator_fee_state.timestamp, "2026-03-12T09:15:00Z");
+
+        let min_stake = client
+            .p_get_min_stake_for_subnet(Some("2SE8BntErKrdVGs76bhQQDaEc8V8cprrmsnBQGcM3jUmczka6Q"))
+            .await
+            .unwrap();
+        assert_eq!(min_stake.min_validator_stake, "100");
+        assert_eq!(min_stake.min_delegator_stake, "25");
 
         let stake = client
             .p_get_stake(&["P-local1", "P-local2"], Some(true), Some("hex"))
