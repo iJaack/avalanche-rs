@@ -20,6 +20,8 @@ pub enum SubscriptionType {
     Logs(LogFilter),
     /// New pending transaction hashes
     NewPendingTransactions,
+    /// New accepted transaction hashes or full transaction objects
+    NewAcceptedTransactions { full_tx: bool },
 }
 
 impl SubscriptionType {
@@ -37,6 +39,14 @@ impl SubscriptionType {
                 Some(Self::Logs(filter))
             }
             "newPendingTransactions" => Some(Self::NewPendingTransactions),
+            "newAcceptedTransactions" => {
+                let full_tx = params
+                    .get(1)
+                    .and_then(|value| value.get("fullTx"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                Some(Self::NewAcceptedTransactions { full_tx })
+            }
             _ => None,
         }
     }
@@ -205,6 +215,9 @@ impl SubscriptionManager {
                 (SubscriptionType::NewHeads, "newHeads") => true,
                 (SubscriptionType::Logs(_), "logs") => true,
                 (SubscriptionType::NewPendingTransactions, "newPendingTransactions") => true,
+                (SubscriptionType::NewAcceptedTransactions { .. }, "newAcceptedTransactions") => {
+                    true
+                }
                 _ => false,
             })
             .collect()
@@ -265,6 +278,19 @@ pub fn new_pending_tx_notification(sub_id: &str, tx_hash: &[u8; 32]) -> String {
         "params": {
             "subscription": sub_id,
             "result": format!("0x{}", hex::encode(tx_hash)),
+        }
+    })
+    .to_string()
+}
+
+/// Build a newAcceptedTransactions notification.
+pub fn new_accepted_tx_notification(sub_id: &str, result: serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_subscription",
+        "params": {
+            "subscription": sub_id,
+            "result": result,
         }
     })
     .to_string()
@@ -426,7 +452,11 @@ mod tests {
         let conn = mgr.connect().unwrap();
         mgr.subscribe(conn, SubscriptionType::NewHeads);
         mgr.subscribe(conn, SubscriptionType::NewPendingTransactions);
-        assert_eq!(mgr.subscription_count(), 2);
+        mgr.subscribe(
+            conn,
+            SubscriptionType::NewAcceptedTransactions { full_tx: false },
+        );
+        assert_eq!(mgr.subscription_count(), 3);
 
         mgr.disconnect(conn);
         assert_eq!(mgr.subscription_count(), 0);
@@ -441,12 +471,19 @@ mod tests {
         mgr.subscribe(conn1, SubscriptionType::NewHeads);
         mgr.subscribe(conn2, SubscriptionType::NewHeads);
         mgr.subscribe(conn1, SubscriptionType::NewPendingTransactions);
+        mgr.subscribe(
+            conn2,
+            SubscriptionType::NewAcceptedTransactions { full_tx: true },
+        );
 
         let heads = mgr.get_subscriptions_by_type("newHeads");
         assert_eq!(heads.len(), 2);
 
         let pending = mgr.get_subscriptions_by_type("newPendingTransactions");
         assert_eq!(pending.len(), 1);
+
+        let accepted = mgr.get_subscriptions_by_type("newAcceptedTransactions");
+        assert_eq!(accepted.len(), 1);
     }
 
     #[test]
@@ -463,6 +500,15 @@ mod tests {
         assert_eq!(
             SubscriptionType::from_params(&params),
             Some(SubscriptionType::NewPendingTransactions)
+        );
+
+        let params = vec![
+            serde_json::Value::String("newAcceptedTransactions".to_string()),
+            serde_json::json!({ "fullTx": true }),
+        ];
+        assert_eq!(
+            SubscriptionType::from_params(&params),
+            Some(SubscriptionType::NewAcceptedTransactions { full_tx: true })
         );
 
         let params = vec![serde_json::Value::String("unknown".to_string())];
@@ -514,6 +560,19 @@ mod tests {
     }
 
     #[test]
+    fn test_accepted_tx_notification() {
+        let msg = new_accepted_tx_notification(
+            "0x3",
+            serde_json::json!({
+                "hash": "0xabc",
+            }),
+        );
+        assert!(msg.contains("eth_subscription"));
+        assert!(msg.contains("0x3"));
+        assert!(msg.contains("0xabc"));
+    }
+
+    #[test]
     fn test_logs_notification() {
         let log = LogEntry {
             address: [0x01; 20],
@@ -527,9 +586,9 @@ mod tests {
             removed: false,
         };
 
-        let msg = logs_notification("0x3", &log);
+        let msg = logs_notification("0x4", &log);
         assert!(msg.contains("eth_subscription"));
-        assert!(msg.contains("0x3"));
+        assert!(msg.contains("0x4"));
     }
 
     #[test]

@@ -132,6 +132,8 @@ impl NetworkMessage {
                 my_version_time: _,
                 sig,
                 tracked_subnets,
+                supported_acps,
+                objected_acps,
             } => {
                 let (major, minor, patch) = parse_version(my_version);
 
@@ -167,8 +169,8 @@ impl NetworkMessage {
                         minor,
                         patch,
                     }),
-                    supported_acps: vec![],
-                    objected_acps: vec![],
+                    supported_acps: supported_acps.clone(),
+                    objected_acps: objected_acps.clone(),
                     known_peers: known_peers_bloom,
                     // BLS signature is provided via the sig field which now carries
                     // the TLS sig. We'll need a separate field for BLS...
@@ -435,6 +437,8 @@ impl NetworkMessage {
                             ChainId(arr)
                         })
                         .collect(),
+                    supported_acps: h.supported_acps,
+                    objected_acps: h.objected_acps,
                 })
             }
 
@@ -666,6 +670,8 @@ mod tests {
             my_version_time: 1234567890,
             sig: vec![0xAA; 64],
             tracked_subnets: vec![],
+            supported_acps: vec![176],
+            objected_acps: vec![23],
         };
         let encoded = msg.encode_proto().unwrap();
         let decoded = NetworkMessage::decode_proto(&encoded).unwrap();
@@ -674,11 +680,15 @@ mod tests {
                 network_id,
                 ip_port,
                 my_version,
+                supported_acps,
+                objected_acps,
                 ..
             } => {
                 assert_eq!(network_id, 1);
                 assert_eq!(ip_port, 9651);
                 assert!(my_version.contains("1.11.3"));
+                assert_eq!(supported_acps, vec![176]);
+                assert_eq!(objected_acps, vec![23]);
             }
             other => panic!("expected Version, got {:?}", other),
         }
@@ -862,6 +872,8 @@ mod tests {
                 my_version_time: 0,
                 sig: vec![],
                 tracked_subnets: vec![],
+                supported_acps: vec![],
+                objected_acps: vec![],
             },
             NetworkMessage::PeerList { peers: vec![] },
             NetworkMessage::PeerListAck { peer_ids: vec![] },

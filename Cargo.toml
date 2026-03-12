@@ -33,6 +33,7 @@ hex = "0.4"
 base64 = "0.22"
 faster-hex = "0.10"
 bs58 = "0.5"
+bech32 = "0.9"
 k256 = { version = "0.13", features = ["ecdsa"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"

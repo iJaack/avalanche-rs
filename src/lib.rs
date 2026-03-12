@@ -49,6 +49,7 @@ pub mod identity;
 pub mod light;
 pub mod metrics;
 pub mod observability;
+pub mod pchain;
 pub mod proto;
 pub mod snap;
 pub mod staking;

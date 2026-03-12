@@ -109,6 +109,8 @@ pub enum NetworkMessage {
         my_version_time: u64,
         sig: Vec<u8>,
         tracked_subnets: Vec<ChainId>,
+        supported_acps: Vec<u32>,
+        objected_acps: Vec<u32>,
     },
     PeerList {
         peers: Vec<PeerInfo>,
@@ -378,6 +380,7 @@ impl Default for NetworkConfig {
 pub struct Peer {
     pub node_id: NodeId,
     pub address: SocketAddr,
+    pub public_ip: Option<SocketAddr>,
     pub version: Option<String>,
     pub reputation: i32,
     pub connected_at: Instant,
@@ -389,6 +392,8 @@ pub struct Peer {
     pub messages_sent: u64,
     pub messages_received: u64,
     pub tracked_subnets: Vec<ChainId>,
+    pub supported_acps: Vec<u32>,
+    pub objected_acps: Vec<u32>,
     pub is_validator: bool,
     pub reported_uptime: u32,
     pub state: PeerState,
@@ -410,6 +415,7 @@ impl Peer {
         Self {
             node_id,
             address,
+            public_ip: None,
             version: None,
             reputation: 0,
             connected_at: now,
@@ -421,6 +427,8 @@ impl Peer {
             messages_sent: 0,
             messages_received: 0,
             tracked_subnets: Vec::new(),
+            supported_acps: Vec::new(),
+            objected_acps: Vec::new(),
             is_validator: false,
             reported_uptime: 0,
             state: PeerState::Connecting,
@@ -935,19 +943,29 @@ impl NetworkManager {
         self.stats.connections_established += 1;
 
         // Queue handshake Version message
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut supported_acps = Vec::new();
+        if crate::fortuna::is_fortuna_active(self.config.network_id, now) {
+            supported_acps.push(176);
+        }
+        if crate::granite::is_granite_active(self.config.network_id, now) {
+            supported_acps.extend([181, 204, 226]);
+        }
         let version_msg = NetworkMessage::Version {
             network_id: self.config.network_id,
             node_id: self.local_node_id.clone(),
-            my_time: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            my_time: now,
             ip_addr: vec![127, 0, 0, 1],
             ip_port: 9651,
             my_version: "avalanche-rs/0.1.0".to_string(),
             my_version_time: 0,
             sig: Vec::new(),
             tracked_subnets: Vec::new(),
+            supported_acps,
+            objected_acps: Vec::new(),
         };
         self.connection_pool
             .enqueue_message(&node_id, version_msg)?;
@@ -1036,6 +1054,8 @@ impl NetworkManager {
             node_id: _,
             my_version,
             tracked_subnets,
+            supported_acps,
+            objected_acps,
             ..
         } = version_msg
         {
@@ -1050,6 +1070,8 @@ impl NetworkManager {
             if let Some(peer) = self.peer_manager.get_peer_mut(from) {
                 peer.version = Some(my_version.clone());
                 peer.tracked_subnets = tracked_subnets.clone();
+                peer.supported_acps = supported_acps.clone();
+                peer.objected_acps = objected_acps.clone();
                 peer.state = PeerState::Connected;
                 peer.adjust_reputation(10); // reward successful handshake
             }
@@ -2112,6 +2134,8 @@ mod tests {
             my_version_time: 0,
             sig: vec![1, 2, 3],
             tracked_subnets: vec![],
+            supported_acps: vec![176],
+            objected_acps: vec![],
         };
         let encoded = msg.encode().unwrap();
         let decoded = NetworkMessage::decode(&encoded).unwrap();
@@ -2407,6 +2431,8 @@ mod tests {
             my_version_time: 0,
             sig: vec![],
             tracked_subnets: vec![],
+            supported_acps: vec![],
+            objected_acps: vec![],
         };
 
         nm.handle_version(&make_node_id(1), &version).unwrap();
@@ -2436,6 +2462,8 @@ mod tests {
             my_version_time: 0,
             sig: vec![],
             tracked_subnets: vec![],
+            supported_acps: vec![],
+            objected_acps: vec![],
         };
 
         let result = nm.handle_version(&make_node_id(1), &version);
@@ -2487,6 +2515,8 @@ mod tests {
                 my_version_time: 0,
                 sig: vec![],
                 tracked_subnets: vec![],
+                supported_acps: vec![],
+                objected_acps: vec![],
             };
             nm.handle_version(&make_node_id(i), &version).unwrap();
         }
@@ -2977,6 +3007,8 @@ mod tests {
             my_version_time: 0,
             sig: vec![],
             tracked_subnets: vec![],
+            supported_acps: vec![],
+            objected_acps: vec![],
         };
         nm.handle_version(&make_node_id(1), &version).unwrap();
         nm.peer_manager
@@ -3073,6 +3105,8 @@ mod tests {
                 my_version_time: 0,
                 sig: vec![],
                 tracked_subnets: vec![],
+                supported_acps: vec![],
+                objected_acps: vec![],
             };
             nm.handle_version(&make_node_id(i), &version).unwrap();
         }
