@@ -303,7 +303,11 @@ impl SubnetTracker {
         let mut set = ValidatorSet::new();
         for validator in response.validators {
             if let Some(node_bytes) = parse_node_id_bytes(&validator.node_id) {
-                let weight = validator.stake.parse::<u64>().unwrap_or(0);
+                let weight = if validator.stake_amount.is_empty() {
+                    validator.weight.parse::<u64>().unwrap_or(0)
+                } else {
+                    validator.stake_amount.parse::<u64>().unwrap_or(0)
+                };
                 let start_time = validator.start_time.parse::<u64>().unwrap_or(0);
                 let end_time = validator.end_time.parse::<u64>().unwrap_or(u64::MAX);
                 set.add_validator(crate::validator::ValidatorInfo {
