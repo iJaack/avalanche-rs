@@ -1030,6 +1030,11 @@ impl RpcClient {
             .await
     }
 
+    /// Get managed RPC accounts on the C-chain.
+    pub async fn c_accounts(&self) -> Result<Vec<String>> {
+        self.call_parsed("eth_accounts", vec![]).await
+    }
+
     /// Get block by number on C-chain
     pub async fn c_get_block(&self, block_number: &str) -> Result<BlockResponse> {
         self.c_get_block_by_number(block_number, true).await
@@ -1061,10 +1066,203 @@ impl RpcClient {
         .await
     }
 
-    /// Send transaction on C-chain
+    /// Hash the provided bytes with Keccak-256.
+    pub async fn c_web3_sha3(&self, data: &str) -> Result<String> {
+        self.call_parsed("web3_sha3", vec![json!(data)]).await
+    }
+
+    /// Return whether the node is listening for network connections.
+    pub async fn c_net_listening(&self) -> Result<bool> {
+        self.call_parsed("net_listening", vec![]).await
+    }
+
+    /// Return the connected peer count as a hex quantity.
+    pub async fn c_net_peer_count(&self) -> Result<String> {
+        self.call_parsed("net_peerCount", vec![]).await
+    }
+
+    /// Get the transaction count for a block by number.
+    pub async fn c_get_block_transaction_count_by_number(
+        &self,
+        block_number: &str,
+    ) -> Result<Option<String>> {
+        let result = self
+            .call(
+                "eth_getBlockTransactionCountByNumber",
+                vec![json!(block_number)],
+            )
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            parse_result(result).map(Some)
+        }
+    }
+
+    /// Get the transaction count for a block by hash.
+    pub async fn c_get_block_transaction_count_by_hash(
+        &self,
+        block_hash: &str,
+    ) -> Result<Option<String>> {
+        let result = self
+            .call(
+                "eth_getBlockTransactionCountByHash",
+                vec![json!(block_hash)],
+            )
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            parse_result(result).map(Some)
+        }
+    }
+
+    /// Get a transaction by block number and index.
+    pub async fn c_get_transaction_by_block_number_and_index(
+        &self,
+        block_number: &str,
+        tx_index: &str,
+    ) -> Result<Option<Value>> {
+        let result = self
+            .call(
+                "eth_getTransactionByBlockNumberAndIndex",
+                vec![json!(block_number), json!(tx_index)],
+            )
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+
+    /// Get a transaction by block hash and index.
+    pub async fn c_get_transaction_by_block_hash_and_index(
+        &self,
+        block_hash: &str,
+        tx_index: &str,
+    ) -> Result<Option<Value>> {
+        let result = self
+            .call(
+                "eth_getTransactionByBlockHashAndIndex",
+                vec![json!(block_hash), json!(tx_index)],
+            )
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+
+    /// Get a raw transaction by hash.
+    pub async fn c_get_raw_transaction_by_hash(&self, tx_hash: &str) -> Result<Option<String>> {
+        let result = self
+            .call("eth_getRawTransactionByHash", vec![json!(tx_hash)])
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            parse_result(result).map(Some)
+        }
+    }
+
+    /// Get a raw transaction by block number and index.
+    pub async fn c_get_raw_transaction_by_block_number_and_index(
+        &self,
+        block_number: &str,
+        tx_index: &str,
+    ) -> Result<Option<String>> {
+        let result = self
+            .call(
+                "eth_getRawTransactionByBlockNumberAndIndex",
+                vec![json!(block_number), json!(tx_index)],
+            )
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            parse_result(result).map(Some)
+        }
+    }
+
+    /// Get a raw transaction by block hash and index.
+    pub async fn c_get_raw_transaction_by_block_hash_and_index(
+        &self,
+        block_hash: &str,
+        tx_index: &str,
+    ) -> Result<Option<String>> {
+        let result = self
+            .call(
+                "eth_getRawTransactionByBlockHashAndIndex",
+                vec![json!(block_hash), json!(tx_index)],
+            )
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            parse_result(result).map(Some)
+        }
+    }
+
+    /// Get the account/storage proof for the latest or pending state.
+    pub async fn c_get_proof(
+        &self,
+        address: &str,
+        storage_keys: &[&str],
+        block: Option<&str>,
+    ) -> Result<Value> {
+        let mut params = vec![json!(address), json!(storage_keys)];
+        if let Some(block) = block {
+            params.push(json!(block));
+        }
+        self.call("eth_getProof", params).await
+    }
+
+    /// Send a raw signed transaction on C-chain.
     pub async fn c_send_transaction(&self, tx: &str) -> Result<String> {
         self.call_parsed("eth_sendRawTransaction", vec![json!(tx)])
             .await
+    }
+
+    /// Send a managed-account transaction object on C-chain.
+    pub async fn c_send_transaction_object(&self, tx: Value) -> Result<String> {
+        self.call_parsed("eth_sendTransaction", vec![tx]).await
+    }
+
+    /// Fill missing transaction defaults without signing or broadcasting.
+    pub async fn c_fill_transaction(&self, tx: Value) -> Result<Value> {
+        self.call("eth_fillTransaction", vec![tx]).await
+    }
+
+    /// Sign an arbitrary message with a managed account.
+    pub async fn c_sign(&self, address: &str, data: &str) -> Result<String> {
+        self.call_parsed("eth_sign", vec![json!(address), json!(data)])
+            .await
+    }
+
+    /// Sign a transaction with a managed account.
+    pub async fn c_sign_transaction(&self, tx: Value) -> Result<Value> {
+        self.call("eth_signTransaction", vec![tx]).await
+    }
+
+    /// Replace a pending managed-account transaction with updated fee or gas limit.
+    pub async fn c_resend(
+        &self,
+        tx: Value,
+        gas_price: Option<&str>,
+        gas_limit: Option<&str>,
+    ) -> Result<String> {
+        let mut params = vec![tx];
+        if let Some(gas_price) = gas_price {
+            params.push(json!(gas_price));
+        } else if gas_limit.is_some() {
+            params.push(Value::Null);
+        }
+        if let Some(gas_limit) = gas_limit {
+            params.push(json!(gas_limit));
+        }
+        self.call_parsed("eth_resend", params).await
     }
 
     /// Get transaction receipt on C-chain
@@ -1134,9 +1332,47 @@ impl RpcClient {
         self.call("txpool_inspect", vec![]).await
     }
 
+    /// Inspect txpool state for a single sender address.
+    pub async fn c_txpool_content_from(&self, address: &str) -> Result<Value> {
+        self.call("txpool_contentFrom", vec![json!(address)]).await
+    }
+
     /// Get pending transaction hashes
     pub async fn c_pending_transactions(&self) -> Result<Value> {
         self.call("eth_pendingTransactions", vec![]).await
+    }
+
+    /// Create a pending transaction filter.
+    pub async fn c_new_pending_transaction_filter(&self) -> Result<String> {
+        self.call_parsed("eth_newPendingTransactionFilter", vec![])
+            .await
+    }
+
+    /// Create a block filter.
+    pub async fn c_new_block_filter(&self) -> Result<String> {
+        self.call_parsed("eth_newBlockFilter", vec![]).await
+    }
+
+    /// Create an accepted transaction filter.
+    pub async fn c_new_accepted_transactions_filter(&self, full_tx: bool) -> Result<String> {
+        let params = if full_tx {
+            vec![json!({ "fullTx": true })]
+        } else {
+            vec![]
+        };
+        self.call_parsed("eth_newAcceptedTransactions", params)
+            .await
+    }
+
+    /// Poll a filter for incremental changes.
+    pub async fn c_get_filter_changes(&self, filter_id: &str) -> Result<Value> {
+        self.call("eth_getFilterChanges", vec![json!(filter_id)])
+            .await
+    }
+
+    /// Fetch all logs for a log filter.
+    pub async fn c_get_filter_logs(&self, filter_id: &str) -> Result<Value> {
+        self.call("eth_getFilterLogs", vec![json!(filter_id)]).await
     }
 
     /// Get predicted next-block base fee.
@@ -1783,6 +2019,219 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls[0]["params"], json!(["0x1", true]));
         assert_eq!(calls[2]["params"], json!([{ "to": "0x1" }]));
+    }
+
+    #[tokio::test]
+    async fn test_c_chain_wrappers_cover_network_lookup_and_filter_methods() {
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded = calls.clone();
+        let endpoint = spawn_mock_rpc_server(move |request| {
+            recorded.lock().unwrap().push(request.clone());
+            match request["method"].as_str().unwrap() {
+                "web3_sha3" => {
+                    assert_eq!(request["params"], json!(["0x68656c6c6f"]));
+                    json!("0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8")
+                }
+                "net_listening" => json!(true),
+                "net_peerCount" => json!("0x2"),
+                "eth_getBlockTransactionCountByNumber" => json!("0x1"),
+                "eth_getBlockTransactionCountByHash" => json!("0x1"),
+                "eth_getTransactionByBlockNumberAndIndex" => json!({ "hash": "0xtx1" }),
+                "eth_getTransactionByBlockHashAndIndex" => json!({ "hash": "0xtx1" }),
+                "eth_getRawTransactionByHash" => json!("0xdeadbeef"),
+                "eth_getRawTransactionByBlockNumberAndIndex" => json!("0xdeadbeef"),
+                "eth_getRawTransactionByBlockHashAndIndex" => json!("0xdeadbeef"),
+                "txpool_contentFrom" => json!({
+                    "pending": { "0x0": { "hash": "0xtx1" } },
+                    "queued": {}
+                }),
+                "eth_newPendingTransactionFilter" => json!("0x1"),
+                "eth_newBlockFilter" => json!("0x2"),
+                "eth_newAcceptedTransactions" => json!("0x3"),
+                "eth_getFilterChanges" => json!(["0xtx1"]),
+                "eth_getFilterLogs" => json!([]),
+                _ => panic!("unexpected method: {}", request["method"]),
+            }
+        })
+        .await;
+
+        let client = RpcClient::new(endpoint).unwrap();
+
+        assert_eq!(
+            client.c_web3_sha3("0x68656c6c6f").await.unwrap(),
+            "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
+        );
+        assert!(client.c_net_listening().await.unwrap());
+        assert_eq!(client.c_net_peer_count().await.unwrap(), "0x2");
+        assert_eq!(
+            client
+                .c_get_block_transaction_count_by_number("0x1")
+                .await
+                .unwrap(),
+            Some("0x1".to_string())
+        );
+        assert_eq!(
+            client
+                .c_get_block_transaction_count_by_hash("0xabc")
+                .await
+                .unwrap(),
+            Some("0x1".to_string())
+        );
+        assert_eq!(
+            client
+                .c_get_transaction_by_block_number_and_index("0x1", "0x0")
+                .await
+                .unwrap()
+                .unwrap()["hash"],
+            "0xtx1"
+        );
+        assert_eq!(
+            client
+                .c_get_transaction_by_block_hash_and_index("0xabc", "0x0")
+                .await
+                .unwrap()
+                .unwrap()["hash"],
+            "0xtx1"
+        );
+        assert_eq!(
+            client.c_get_raw_transaction_by_hash("0xtx1").await.unwrap(),
+            Some("0xdeadbeef".to_string())
+        );
+        assert_eq!(
+            client
+                .c_get_raw_transaction_by_block_number_and_index("0x1", "0x0")
+                .await
+                .unwrap(),
+            Some("0xdeadbeef".to_string())
+        );
+        assert_eq!(
+            client
+                .c_get_raw_transaction_by_block_hash_and_index("0xabc", "0x0")
+                .await
+                .unwrap(),
+            Some("0xdeadbeef".to_string())
+        );
+        assert_eq!(
+            client.c_txpool_content_from("0x1111").await.unwrap()["pending"]["0x0"]["hash"],
+            "0xtx1"
+        );
+        assert_eq!(
+            client.c_new_pending_transaction_filter().await.unwrap(),
+            "0x1"
+        );
+        assert_eq!(client.c_new_block_filter().await.unwrap(), "0x2");
+        assert_eq!(
+            client
+                .c_new_accepted_transactions_filter(true)
+                .await
+                .unwrap(),
+            "0x3"
+        );
+        assert_eq!(
+            client.c_get_filter_changes("0x3").await.unwrap(),
+            json!(["0xtx1"])
+        );
+        assert_eq!(client.c_get_filter_logs("0x4").await.unwrap(), json!([]));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[3]["params"], json!(["0x1"]));
+        assert_eq!(calls[4]["params"], json!(["0xabc"]));
+        assert_eq!(calls[10]["params"], json!(["0x1111"]));
+        assert_eq!(calls[13]["params"], json!([{ "fullTx": true }]));
+    }
+
+    #[tokio::test]
+    async fn test_c_chain_wrappers_cover_managed_account_and_proof_methods() {
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded = calls.clone();
+        let endpoint = spawn_mock_rpc_server(move |request| {
+            recorded.lock().unwrap().push(request.clone());
+            match request["method"].as_str().unwrap() {
+                "eth_accounts" => json!(["0x1111"]),
+                "eth_getProof" => json!({
+                    "address": "0x1111",
+                    "accountProof": ["0x80"],
+                    "balance": "0x1",
+                    "codeHash": "0x1234",
+                    "nonce": "0x0",
+                    "storageHash": "0x5678",
+                    "storageProof": [{
+                        "key": "0x01",
+                        "value": "0x2",
+                        "proof": ["0xabcd"]
+                    }]
+                }),
+                "eth_sendTransaction" => json!("0xtx1"),
+                "eth_fillTransaction" => json!({
+                    "raw": "0x02deadbeef",
+                    "tx": { "type": "0x2" }
+                }),
+                "eth_sign" => json!("0xsigned"),
+                "eth_signTransaction" => json!({
+                    "raw": "0xdeadbeef",
+                    "tx": { "type": "0x0" }
+                }),
+                "eth_resend" => json!("0xtx2"),
+                _ => panic!("unexpected method: {}", request["method"]),
+            }
+        })
+        .await;
+
+        let client = RpcClient::new(endpoint).unwrap();
+
+        assert_eq!(
+            client.c_accounts().await.unwrap(),
+            vec!["0x1111".to_string()]
+        );
+        let proof = client
+            .c_get_proof("0x1111", &["0x01"], Some("latest"))
+            .await
+            .unwrap();
+        assert_eq!(proof["storageProof"][0]["value"], "0x2");
+        assert_eq!(
+            client
+                .c_send_transaction_object(json!({ "from": "0x1111" }))
+                .await
+                .unwrap(),
+            "0xtx1"
+        );
+        assert_eq!(
+            client
+                .c_fill_transaction(json!({ "from": "0x1111" }))
+                .await
+                .unwrap()["tx"]["type"],
+            "0x2"
+        );
+        assert_eq!(
+            client.c_sign("0x1111", "0x68656c6c6f").await.unwrap(),
+            "0xsigned"
+        );
+        assert_eq!(
+            client
+                .c_sign_transaction(json!({ "from": "0x1111" }))
+                .await
+                .unwrap()["tx"]["type"],
+            "0x0"
+        );
+        assert_eq!(
+            client
+                .c_resend(
+                    json!({ "from": "0x1111", "nonce": "0x0" }),
+                    Some("0x1"),
+                    Some("0x2")
+                )
+                .await
+                .unwrap(),
+            "0xtx2"
+        );
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[1]["params"], json!(["0x1111", ["0x01"], "latest"]));
+        assert_eq!(calls[2]["params"], json!([{ "from": "0x1111" }]));
+        assert_eq!(
+            calls[6]["params"],
+            json!([{ "from": "0x1111", "nonce": "0x0" }, "0x1", "0x2"])
+        );
     }
 
     #[tokio::test]
