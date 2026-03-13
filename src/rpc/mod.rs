@@ -1,7 +1,7 @@
 //! Avalanche JSON-RPC Client
 //!
 //! Production-grade async HTTP client for Avalanche node communication.
-//! Supports X-chain, C-chain, and P-chain methods with connection pooling,
+//! Supports C-chain and P-chain methods with connection pooling,
 //! timeout handling, and automatic retry logic.
 
 use bytes::Bytes;
@@ -249,6 +249,15 @@ pub struct SuggestPriceOptionsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeightResponse {
     pub height: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentEpochResponse {
+    pub epoch: String,
+    #[serde(rename = "startTime")]
+    pub start_time: String,
+    #[serde(rename = "pChainHeight")]
+    pub p_chain_height: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1298,6 +1307,18 @@ impl RpcClient {
             .await
     }
 
+    /// Get the proposer VM proposed height for the chain bound to this endpoint.
+    pub async fn proposervm_get_proposed_height(&self) -> Result<HeightResponse> {
+        self.call_parsed("proposervm.getProposedHeight", vec![json!({})])
+            .await
+    }
+
+    /// Get the current Granite epoch for the chain bound to this endpoint.
+    pub async fn proposervm_get_current_epoch(&self) -> Result<CurrentEpochResponse> {
+        self.call_parsed("proposervm.getCurrentEpoch", vec![json!({})])
+            .await
+    }
+
     /// Get the balance breakdown for a set of P-chain addresses.
     pub async fn p_get_balance(&self, addresses: &[&str]) -> Result<PlatformBalanceResponse> {
         self.call_parsed(
@@ -1773,6 +1794,12 @@ mod tests {
             match request["method"].as_str().unwrap() {
                 "platform.getHeight" => json!({ "height": "42" }),
                 "platform.getProposedHeight" => json!({ "height": "41" }),
+                "proposervm.getProposedHeight" => json!({ "height": "44" }),
+                "proposervm.getCurrentEpoch" => json!({
+                    "epoch": "7",
+                    "startTime": "1761750000",
+                    "pChainHeight": "91",
+                }),
                 "platform.getBalance" => json!({
                     "balance": "1500",
                     "unlocked": "1200",
@@ -2077,6 +2104,14 @@ mod tests {
 
         let proposed_height = client.p_get_proposed_height().await.unwrap();
         assert_eq!(proposed_height.height, "41");
+
+        let proposer_vm_height = client.proposervm_get_proposed_height().await.unwrap();
+        assert_eq!(proposer_vm_height.height, "44");
+
+        let current_epoch = client.proposervm_get_current_epoch().await.unwrap();
+        assert_eq!(current_epoch.epoch, "7");
+        assert_eq!(current_epoch.start_time, "1761750000");
+        assert_eq!(current_epoch.p_chain_height, "91");
 
         let balance = client
             .p_get_balance(&["P-local1", "P-local2"])
