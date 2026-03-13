@@ -3922,7 +3922,7 @@ async fn handle_ws_rpc_request(json_str: &str, node: &NodeState, connection_id: 
             };
             rpc_ok(if removed { "true" } else { "false" }, id)
         }
-        _ => handle_rpc_request(json_str, node).await,
+        _ => handle_rpc_request_for_path(json_str, node, "/ws").await,
     }
 }
 
@@ -4338,7 +4338,7 @@ async fn handle_rpc_connection(
             (
                 "HTTP/1.1 200 OK",
                 "application/json",
-                handle_rpc_request(body, &node).await,
+                handle_rpc_request_for_path(body, &node, &resolved_path).await,
             )
         }
     };
@@ -4976,6 +4976,43 @@ async fn resolve_request_path(node: &NodeState, path: &str) -> String {
     }
 
     resolved
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProposerVmTarget {
+    PChain,
+    CChain,
+    Custom([u8; 32]),
+}
+
+enum ProposerVmRoute {
+    NotProposerVm,
+    UnknownChain(String),
+    Target(ProposerVmTarget),
+}
+
+async fn resolve_proposervm_route(node: &NodeState, path: &str) -> ProposerVmRoute {
+    let Some(rest) = path.strip_prefix("/ext/bc/") else {
+        return ProposerVmRoute::NotProposerVm;
+    };
+    let Some(chain_alias) = rest.strip_suffix("/proposervm") else {
+        return ProposerVmRoute::NotProposerVm;
+    };
+    if chain_alias.is_empty() || chain_alias.contains('/') {
+        return ProposerVmRoute::NotProposerVm;
+    }
+
+    let Some(chain_id) = resolve_blockchain_alias_id(node, chain_alias).await else {
+        return ProposerVmRoute::UnknownChain(chain_alias.to_string());
+    };
+
+    if chain_id == platform_pchain_blockchain_id() {
+        ProposerVmRoute::Target(ProposerVmTarget::PChain)
+    } else if chain_id == platform_cchain_blockchain_id(node.config.network_id) {
+        ProposerVmRoute::Target(ProposerVmTarget::CChain)
+    } else {
+        ProposerVmRoute::Target(ProposerVmTarget::Custom(chain_id))
+    }
 }
 
 fn info_node_ids_param(params: &serde_json::Value) -> Vec<[u8; 20]> {
@@ -6612,6 +6649,73 @@ async fn platform_proposed_height(node: &NodeState) -> u64 {
         .map(|entry| entry.height.saturating_sub(1))
         .unwrap_or(current_height)
         .min(current_height)
+}
+
+async fn proposervm_proposed_height(node: &NodeState, target: ProposerVmTarget) -> u64 {
+    match target {
+        ProposerVmTarget::PChain => platform_proposed_height(node).await,
+        ProposerVmTarget::CChain => {
+            current_cchain_height(node).max(node.c_chain_metrics.read().await.tip_height)
+        }
+        ProposerVmTarget::Custom(chain_id) => node
+            .subnet_tracker
+            .read()
+            .await
+            .chain_state(&ChainId(chain_id))
+            .map(|state| state.height)
+            .unwrap_or(0),
+    }
+}
+
+fn proposervm_granite_activation_height(node: &NodeState, granite_time: u64) -> Option<u64> {
+    platform_sorted_pchain_blocks(&node.db)
+        .into_iter()
+        .find(|(meta, _)| meta.timestamp >= granite_time)
+        .map(|(meta, _)| meta.height)
+}
+
+fn calculate_granite_epoch(
+    network_id: u32,
+    now: u64,
+    granite_time: u64,
+    activation_height: u64,
+) -> Option<avalanche_rs::granite::EpochInfo> {
+    avalanche_rs::granite::calculate_epoch(network_id, now, granite_time, activation_height)
+        .or_else(|| {
+            if now < granite_time {
+                return None;
+            }
+            let epoch_number =
+                now.saturating_sub(granite_time) / avalanche_rs::granite::EPOCH_DURATION_SECS;
+            Some(avalanche_rs::granite::EpochInfo {
+                epoch_number,
+                epoch_p_chain_height: activation_height.saturating_add(epoch_number),
+                epoch_start_time: granite_time.saturating_add(
+                    epoch_number.saturating_mul(avalanche_rs::granite::EPOCH_DURATION_SECS),
+                ),
+            })
+        })
+}
+
+fn proposervm_current_epoch_result(node: &NodeState) -> Result<serde_json::Value, String> {
+    let granite_time =
+        upgrade_time_unix(&info_upgrades_result(node.config.network_id), "graniteTime");
+    let now = unix_timestamp_secs();
+    let Some(activation_height) = proposervm_granite_activation_height(node, granite_time) else {
+        return Err("current epoch unavailable before Granite activation".to_string());
+    };
+
+    let Some(epoch) =
+        calculate_granite_epoch(node.config.network_id, now, granite_time, activation_height)
+    else {
+        return Err("current epoch unavailable before Granite activation".to_string());
+    };
+
+    Ok(serde_json::json!({
+        "epoch": epoch.epoch_number.to_string(),
+        "startTime": epoch.epoch_start_time.to_string(),
+        "pChainHeight": epoch.epoch_p_chain_height.to_string(),
+    }))
 }
 
 fn platform_primary_staking_asset_id(network_id: u32) -> Option<&'static str> {
@@ -10363,7 +10467,12 @@ use std::collections::HashMap as StdHashMap;
 static FILTERS: Lazy<RwLock<StdHashMap<u64, LogFilter>>> =
     Lazy::new(|| RwLock::new(StdHashMap::new()));
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
+    handle_rpc_request_for_path(json_str, node, "/").await
+}
+
+async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &str) -> String {
     let req: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => {
@@ -10940,6 +11049,34 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
             });
             rpc_ok(&result.to_string(), id)
         }
+
+        // -----------------------------------------------------------------
+        // ProposerVM RPC methods (routed via /ext/bc/<chain>/proposervm)
+        // -----------------------------------------------------------------
+        "proposervm.getProposedHeight" => match resolve_proposervm_route(node, path).await {
+            ProposerVmRoute::NotProposerVm => rpc_error(-32601, "method not found", id),
+            ProposerVmRoute::UnknownChain(chain) => {
+                rpc_error(-32000, &format!("unknown chain '{}'", chain), id)
+            }
+            ProposerVmRoute::Target(target) => {
+                let height = proposervm_proposed_height(node, target).await;
+                rpc_ok(
+                    &serde_json::json!({ "height": height.to_string() }).to_string(),
+                    id,
+                )
+            }
+        },
+
+        "proposervm.getCurrentEpoch" => match resolve_proposervm_route(node, path).await {
+            ProposerVmRoute::NotProposerVm => rpc_error(-32601, "method not found", id),
+            ProposerVmRoute::UnknownChain(chain) => {
+                rpc_error(-32000, &format!("unknown chain '{}'", chain), id)
+            }
+            ProposerVmRoute::Target(_) => match proposervm_current_epoch_result(node) {
+                Ok(result) => rpc_ok(&result.to_string(), id),
+                Err(err) => rpc_error(-32000, &err, id),
+            },
+        },
 
         // -----------------------------------------------------------------
         // Platform RPC methods (routed via /ext/bc/P in AvalancheGo)
@@ -13484,6 +13621,20 @@ mod integration_tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    async fn http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            path,
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
     async fn write_masked_ws_text_frame(stream: &mut TcpStream, text: &str) {
         let payload = text.as_bytes();
         let mask = [0x11u8, 0x22, 0x33, 0x44];
@@ -14329,6 +14480,99 @@ mod integration_tests {
         let response = handle_rpc_request(req, &node).await;
         let json: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(json["result"]["height"], "42");
+    }
+
+    #[tokio::test]
+    async fn test_proposervm_get_proposed_height_is_path_scoped() {
+        let node = make_test_node(999);
+        let granite_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "graniteTime");
+        for (height, timestamp) in [(40, granite_time), (41, granite_time + 60)] {
+            let raw_block = make_banff_std_with_timestamp([height as u8; 32], height, timestamp);
+            let block_id = sha256_bytes(&raw_block);
+            node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+        }
+
+        let now = unix_timestamp_secs();
+        record_recently_accepted_pchain_block_at(&node, 41, now.saturating_sub(5)).await;
+        node.db.set_last_accepted_height(34).unwrap();
+        node.c_chain_metrics.write().await.tip_height = 34;
+
+        let req =
+            r#"{"jsonrpc":"2.0","method":"proposervm.getProposedHeight","params":{},"id":11}"#;
+
+        let missing_response = handle_rpc_request(req, &node).await;
+        let missing_json: serde_json::Value = serde_json::from_str(&missing_response).unwrap();
+        assert_eq!(missing_json["error"]["code"], -32601);
+
+        let p_response = handle_rpc_request_for_path(req, &node, "/ext/bc/P/proposervm").await;
+        let p_json: serde_json::Value = serde_json::from_str(&p_response).unwrap();
+        assert_eq!(p_json["result"]["height"], "40");
+
+        let c_response = handle_rpc_request_for_path(req, &node, "/ext/bc/evm/proposervm").await;
+        let c_json: serde_json::Value = serde_json::from_str(&c_response).unwrap();
+        assert_eq!(c_json["result"]["height"], "34");
+    }
+
+    #[tokio::test]
+    async fn test_proposervm_get_current_epoch_uses_granite_epoch_view() {
+        let node = make_test_node(999);
+        let granite_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "graniteTime");
+        for (height, timestamp) in [
+            (9, granite_time - 1),
+            (10, granite_time),
+            (11, granite_time + 60),
+        ] {
+            let raw_block = make_banff_std_with_timestamp([height as u8; 32], height, timestamp);
+            let block_id = sha256_bytes(&raw_block);
+            node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+        }
+
+        let req = r#"{"jsonrpc":"2.0","method":"proposervm.getCurrentEpoch","params":{},"id":12}"#;
+        let response = handle_rpc_request_for_path(req, &node, "/ext/bc/P/proposervm").await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        let expected = calculate_granite_epoch(
+            node.config.network_id,
+            unix_timestamp_secs(),
+            granite_time,
+            10,
+        )
+        .expect("granite epoch should be active");
+
+        assert_eq!(json["result"]["epoch"], expected.epoch_number.to_string());
+        assert_eq!(
+            json["result"]["startTime"],
+            expected.epoch_start_time.to_string()
+        );
+        assert_eq!(
+            json["result"]["pChainHeight"],
+            expected.epoch_p_chain_height.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_proposervm_path_routes_through_rpc_server() {
+        let node = make_test_node(999);
+        let granite_time =
+            upgrade_time_unix(&info_upgrades_result(node.config.network_id), "graniteTime");
+        let raw_block = make_banff_std_with_timestamp([0x22; 32], 15, granite_time);
+        let block_id = sha256_bytes(&raw_block);
+        node.db.put_cf(CF_BLOCKS, &block_id, &raw_block).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_node = node.clone();
+        tokio::spawn(async move {
+            run_rpc_server_with_listener(listener, server_node).await;
+        });
+
+        let req = r#"{"jsonrpc":"2.0","method":"proposervm.getCurrentEpoch","params":{},"id":13}"#;
+        let response = http_post(addr, "/ext/bc/platform/proposervm", req).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"jsonrpc\":\"2.0\""));
+        assert!(response.contains("\"pChainHeight\""));
     }
 
     #[tokio::test]
