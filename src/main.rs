@@ -63,6 +63,7 @@ use avalanche_rs::proto::{self, ProtoMessage, ProtoOneOf};
 use avalanche_rs::staking::{MIN_DELEGATOR_STAKE, MIN_VALIDATOR_STAKE};
 use avalanche_rs::subnet::{SubnetId, SubnetTracker};
 use avalanche_rs::sync::{BlockFetchMode, SyncConfig, SyncEngine, SyncPhase};
+use avalanche_rs::tx::{Eip1559Tx, LegacyTx, SignedTransaction, Wallet};
 use avalanche_rs::txpool::{PoolTransaction, TransactionPool};
 use avalanche_rs::websocket::{
     logs_notification, new_accepted_tx_notification, new_heads_notification,
@@ -85,6 +86,7 @@ const EVM_VM_ID: &str = "mgj786NP7uDwBCcq6YwThhaN8FLyybkCa4zBWTQbNgmK6k9A6";
 const AVAX_ASSET_ID_MAINNET: &str = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDGCgxN5Z";
 const AVAX_ASSET_ID_FUJI: &str = "U8iRqJoiJm8xZHAacmvYyZVwqQx6uDNtQeP3CQ6fcgQk3JqnK";
 const BAD_BLOCK_LIMIT: usize = 10;
+const PENDING_FILTER_EVENT_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformDynamicFeeConfig {
@@ -265,6 +267,14 @@ struct Cli {
     /// Hex reward address where staking rewards should be sent.
     #[arg(long, env = "AVAX_REWARD_ADDRESS")]
     reward_address: Option<String>,
+
+    /// Managed private keys for account-backed C-Chain RPC methods.
+    #[arg(
+        long = "rpc-private-key",
+        value_delimiter = ',',
+        env = "AVAX_RPC_PRIVATE_KEYS"
+    )]
+    rpc_private_keys: Vec<String>,
 
     /// Enable PostgreSQL indexer for explorer backends.
     #[cfg(feature = "indexer")]
@@ -790,6 +800,8 @@ struct NodeState {
     mev_engine: Arc<MevEngine>,
     /// Shared transaction pool for RPC submission and block building.
     txpool: Arc<RwLock<TransactionPool>>,
+    /// Managed wallets exposed through account-backed C-Chain RPC methods.
+    rpc_wallets: Arc<StdHashMap<[u8; 20], Wallet>>,
     /// P-Chain mempool and recently dropped tx cache for Platform RPC lifecycle.
     platform_tx_pool: Arc<RwLock<PlatformTxPool>>,
     /// Light client for headers-only mode
@@ -926,6 +938,15 @@ async fn wait_for_shutdown_signal() -> &'static str {
     "SIGINT"
 }
 
+fn load_rpc_wallets(cli: &Cli) -> Result<StdHashMap<[u8; 20], Wallet>, String> {
+    let mut wallets = StdHashMap::new();
+    for key in &cli.rpc_private_keys {
+        let wallet = Wallet::from_hex(key, cli.chain_id).map_err(|e| e.to_string())?;
+        wallets.insert(*wallet.address(), wallet);
+    }
+    Ok(wallets)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -933,6 +954,10 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let rpc_wallets = load_rpc_wallets(&cli).unwrap_or_else(|e| {
+        error!("Failed to load RPC wallet(s): {}", e);
+        std::process::exit(1);
+    });
 
     // Initialize structured logging
     init_logging(&cli.log_level, &cli.log_format);
@@ -1140,6 +1165,11 @@ async fn main() {
     let ws_connections = Arc::new(RwLock::new(StdHashMap::new()));
     let resolved_public_ip = Arc::new(RwLock::new(discover_public_ip(cli.staking_port)));
     let logger_levels = Arc::new(RwLock::new(initial_logger_levels(&cli.log_level)));
+    let rpc_wallets = Arc::new(rpc_wallets);
+
+    if !rpc_wallets.is_empty() {
+        info!("Loaded {} managed RPC wallet(s)", rpc_wallets.len());
+    }
 
     let node = Arc::new(NodeState {
         identity,
@@ -1156,6 +1186,7 @@ async fn main() {
         c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
         mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
         txpool,
+        rpc_wallets,
         platform_tx_pool,
         light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
         archive_store,
@@ -4592,6 +4623,398 @@ fn parse_rpc_simulation_tx(
             nonce,
         },
         access_list: parse_rpc_access_list(tx_obj),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RpcManagedTxRequest {
+    from: [u8; 20],
+    to: Option<[u8; 20]>,
+    value: u128,
+    data: Vec<u8>,
+    gas: Option<u64>,
+    gas_price: Option<u128>,
+    max_fee_per_gas: Option<u128>,
+    max_priority_fee_per_gas: Option<u128>,
+    nonce: Option<u64>,
+    access_list: Vec<avalanche_rs::tx::AccessListEntry>,
+}
+
+#[derive(Debug, Clone)]
+enum RpcManagedTxEnvelope {
+    Legacy(LegacyTx),
+    Eip1559(Eip1559Tx),
+}
+
+impl RpcManagedTxEnvelope {
+    fn sign(&self, wallet: &Wallet) -> Result<SignedTransaction, String> {
+        match self {
+            Self::Legacy(tx) => wallet.sign_legacy(tx).map_err(|e| e.to_string()),
+            Self::Eip1559(tx) => wallet.sign_eip1559(tx).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn signing_payload(&self, chain_id: u64) -> Vec<u8> {
+        match self {
+            Self::Legacy(tx) => tx.signing_payload(chain_id),
+            Self::Eip1559(tx) => tx.signing_payload(chain_id),
+        }
+    }
+
+    fn to_rpc_value(&self, from: [u8; 20], chain_id: u64) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "from".to_string(),
+            serde_json::Value::String(format!("0x{}", hex::encode(from))),
+        );
+        obj.insert(
+            "chainId".to_string(),
+            serde_json::Value::String(format!("0x{:x}", chain_id)),
+        );
+        match self {
+            Self::Legacy(tx) => {
+                obj.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("0x0".to_string()),
+                );
+                obj.insert(
+                    "to".to_string(),
+                    tx.to
+                        .map(|to| serde_json::Value::String(format!("0x{}", hex::encode(to))))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "nonce".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.nonce)),
+                );
+                obj.insert(
+                    "gas".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.gas_limit)),
+                );
+                obj.insert(
+                    "gasPrice".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.gas_price)),
+                );
+                obj.insert(
+                    "value".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.value)),
+                );
+                obj.insert(
+                    "input".to_string(),
+                    serde_json::Value::String(format!("0x{}", hex::encode(&tx.data))),
+                );
+            }
+            Self::Eip1559(tx) => {
+                obj.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("0x2".to_string()),
+                );
+                obj.insert(
+                    "to".to_string(),
+                    tx.to
+                        .map(|to| serde_json::Value::String(format!("0x{}", hex::encode(to))))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "nonce".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.nonce)),
+                );
+                obj.insert(
+                    "gas".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.gas_limit)),
+                );
+                obj.insert(
+                    "maxFeePerGas".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.max_fee_per_gas)),
+                );
+                obj.insert(
+                    "maxPriorityFeePerGas".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.max_priority_fee_per_gas)),
+                );
+                obj.insert(
+                    "value".to_string(),
+                    serde_json::Value::String(format!("0x{:x}", tx.value)),
+                );
+                obj.insert(
+                    "input".to_string(),
+                    serde_json::Value::String(format!("0x{}", hex::encode(&tx.data))),
+                );
+                obj.insert(
+                    "accessList".to_string(),
+                    serde_json::to_value(&tx.access_list)
+                        .unwrap_or(serde_json::Value::Array(vec![])),
+                );
+            }
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
+fn managed_wallet(node: &NodeState, address: [u8; 20]) -> Result<&Wallet, String> {
+    node.rpc_wallets
+        .get(&address)
+        .ok_or_else(|| "unknown account".to_string())
+}
+
+fn parse_rpc_managed_tx_request(
+    tx_obj: &serde_json::Value,
+    require_from: bool,
+) -> Result<RpcManagedTxRequest, String> {
+    let from = match tx_obj
+        .get("from")
+        .and_then(|value| value.as_str())
+        .and_then(parse_hex_address)
+    {
+        Some(from) => from,
+        None if require_from => return Err("sender not specified".to_string()),
+        None => [0u8; 20],
+    };
+
+    if tx_obj.get("gasPrice").is_some()
+        && (tx_obj.get("maxFeePerGas").is_some() || tx_obj.get("maxPriorityFeePerGas").is_some())
+    {
+        return Err(
+            "gasPrice cannot be combined with maxFeePerGas/maxPriorityFeePerGas".to_string(),
+        );
+    }
+
+    Ok(RpcManagedTxRequest {
+        from,
+        to: tx_obj
+            .get("to")
+            .and_then(|value| value.as_str())
+            .and_then(parse_hex_address),
+        value: tx_obj
+            .get("value")
+            .and_then(parse_quantity_u128)
+            .unwrap_or(0),
+        data: tx_obj
+            .get("data")
+            .and_then(|value| value.as_str())
+            .or_else(|| tx_obj.get("input").and_then(|value| value.as_str()))
+            .and_then(parse_hex_bytes)
+            .unwrap_or_default(),
+        gas: tx_obj.get("gas").and_then(parse_quantity_u64),
+        gas_price: tx_obj.get("gasPrice").and_then(parse_quantity_u128),
+        max_fee_per_gas: tx_obj.get("maxFeePerGas").and_then(parse_quantity_u128),
+        max_priority_fee_per_gas: tx_obj
+            .get("maxPriorityFeePerGas")
+            .and_then(parse_quantity_u128),
+        nonce: tx_obj.get("nonce").and_then(parse_quantity_u64),
+        access_list: parse_rpc_access_list(tx_obj),
+    })
+}
+
+async fn prepare_rpc_managed_tx(
+    node: &NodeState,
+    request: &RpcManagedTxRequest,
+    strict_sign: bool,
+) -> Result<RpcManagedTxEnvelope, String> {
+    if strict_sign {
+        if request.gas.is_none() {
+            return Err("gas not specified".to_string());
+        }
+        if request.gas_price.is_none()
+            && (request.max_fee_per_gas.is_none() || request.max_priority_fee_per_gas.is_none())
+        {
+            return Err("missing gasPrice or maxFeePerGas/maxPriorityFeePerGas".to_string());
+        }
+        if request.nonce.is_none() {
+            return Err("nonce not specified".to_string());
+        }
+    }
+
+    let block_ctx = rpc_simulation_block_context(node);
+    let base_fee = predicted_next_base_fee_from_db(&node.db, node.config.network_id);
+    let suggested_tip = recent_priority_fee_suggestion(&node.db, current_cchain_height(node))
+        .max(PRIORITY_FEE_FLOOR);
+    let evm = node.evm.read().await;
+
+    let nonce = request.nonce.unwrap_or_else(|| evm.get_nonce(request.from));
+    let simulation_fee_cap = request
+        .gas_price
+        .or(request.max_fee_per_gas)
+        .unwrap_or_else(|| base_fee.saturating_add(suggested_tip));
+    let simulation_tx = EvmTransaction {
+        from: request.from,
+        to: request.to,
+        value: request.value,
+        data: request.data.clone(),
+        gas_limit: request.gas.unwrap_or(block_ctx.gas_limit),
+        gas_price: simulation_fee_cap,
+        nonce,
+    };
+    let gas_limit = match request.gas {
+        Some(gas) => gas,
+        None => evm
+            .estimate_gas(&simulation_tx, &block_ctx)
+            .map_err(|e| e.to_string())?,
+    };
+    drop(evm);
+
+    if let Some(gas_price) = request.gas_price {
+        return Ok(RpcManagedTxEnvelope::Legacy(LegacyTx {
+            nonce,
+            gas_price,
+            gas_limit,
+            to: request.to,
+            value: request.value,
+            data: request.data.clone(),
+        }));
+    }
+
+    let max_priority_fee_per_gas = request.max_priority_fee_per_gas.unwrap_or(suggested_tip);
+    let max_fee_per_gas = request
+        .max_fee_per_gas
+        .unwrap_or_else(|| base_fee.saturating_add(max_priority_fee_per_gas));
+
+    if max_priority_fee_per_gas > max_fee_per_gas {
+        return Err("maxPriorityFeePerGas exceeds maxFeePerGas".to_string());
+    }
+
+    Ok(RpcManagedTxEnvelope::Eip1559(Eip1559Tx {
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        to: request.to,
+        value: request.value,
+        data: request.data.clone(),
+        access_list: request.access_list.clone(),
+    }))
+}
+
+fn signed_transaction_result(
+    signed: &SignedTransaction,
+    envelope: &RpcManagedTxEnvelope,
+    chain_id: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "raw": format!("0x{}", hex::encode(&signed.raw)),
+        "tx": envelope.to_rpc_value(signed.from, chain_id),
+    })
+}
+
+fn filled_transaction_result(
+    request: &RpcManagedTxRequest,
+    envelope: &RpcManagedTxEnvelope,
+    chain_id: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "raw": format!("0x{}", hex::encode(envelope.signing_payload(chain_id))),
+        "tx": envelope.to_rpc_value(request.from, chain_id),
+    })
+}
+
+fn ethereum_signed_message_hash(message: &[u8]) -> [u8; 32] {
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+    let mut payload = prefix.into_bytes();
+    payload.extend_from_slice(message);
+    let hash = revm::primitives::keccak256(payload);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hash.as_slice());
+    out
+}
+
+fn rpc_transaction_matches_pool_request(
+    request: &RpcManagedTxRequest,
+    pool_tx: &PoolTransaction,
+) -> bool {
+    request.from == pool_tx.from
+        && request.nonce == Some(pool_tx.nonce)
+        && request.to == pool_tx.to
+        && request.value == pool_tx.value
+        && request.data == pool_tx.data
+}
+
+async fn rpc_resend_transaction(
+    node: &NodeState,
+    tx_obj: &serde_json::Value,
+    gas_price_override: Option<u128>,
+    gas_limit_override: Option<u64>,
+) -> Result<[u8; 32], String> {
+    let request = parse_rpc_managed_tx_request(tx_obj, true)?;
+    let nonce = request
+        .nonce
+        .ok_or_else(|| "missing transaction nonce in transaction spec".to_string())?;
+    let wallet = managed_wallet(node, request.from)?.clone();
+
+    let existing = {
+        let txpool = node.txpool.read().await;
+        txpool
+            .get_by_sender_nonce(&request.from, nonce)
+            .cloned()
+            .ok_or_else(|| "transaction not found".to_string())?
+    };
+
+    if !rpc_transaction_matches_pool_request(&request, &existing) {
+        return Err("transaction not found".to_string());
+    }
+
+    let parsed_existing = existing
+        .raw
+        .as_deref()
+        .and_then(parse_raw_cchain_transaction)
+        .ok_or_else(|| "transaction not found".to_string())?;
+
+    let replacement = match parsed_existing.tx_type {
+        0 => RpcManagedTxEnvelope::Legacy(LegacyTx {
+            nonce,
+            gas_price: gas_price_override.unwrap_or(existing.max_fee_per_gas),
+            gas_limit: gas_limit_override.unwrap_or(existing.gas_limit),
+            to: existing.to,
+            value: existing.value,
+            data: existing.data.clone(),
+        }),
+        _ => {
+            let replacement_fee = gas_price_override.unwrap_or(existing.max_fee_per_gas);
+            RpcManagedTxEnvelope::Eip1559(Eip1559Tx {
+                nonce,
+                max_priority_fee_per_gas: replacement_fee.min(existing.max_priority_fee_per_gas),
+                max_fee_per_gas: replacement_fee,
+                gas_limit: gas_limit_override.unwrap_or(existing.gas_limit),
+                to: existing.to,
+                value: existing.value,
+                data: existing.data.clone(),
+                access_list: vec![],
+            })
+        }
+    };
+
+    let signed = replacement.sign(&wallet)?;
+    let account_nonce = {
+        let evm = node.evm.read().await;
+        evm.get_nonce(request.from)
+    };
+
+    {
+        let mut txpool = node.txpool.write().await;
+        let removed = txpool.remove(&existing.hash);
+        if removed.is_none() {
+            return Err("transaction not found".to_string());
+        }
+    }
+
+    match submit_raw_cchain_transaction(node, &signed.raw).await {
+        Ok(hash) => Ok(hash),
+        Err(error) => {
+            let restored = PoolTransaction {
+                hash: existing.hash,
+                raw: existing.raw.clone(),
+                from: existing.from,
+                to: existing.to,
+                nonce: existing.nonce,
+                gas_limit: existing.gas_limit,
+                max_fee_per_gas: existing.max_fee_per_gas,
+                max_priority_fee_per_gas: existing.max_priority_fee_per_gas,
+                value: existing.value,
+                data: existing.data.clone(),
+                size: existing.size,
+                timestamp: existing.timestamp,
+            };
+            let _ = node.txpool.write().await.add(restored, account_nonce);
+            Err(error)
+        }
     }
 }
 
@@ -9387,6 +9810,123 @@ fn parse_filter_id(value: &serde_json::Value) -> u64 {
         .unwrap_or(0)
 }
 
+fn load_cchain_block_by_hash(db: &Database, block_hash: &[u8; 32]) -> Option<Vec<u8>> {
+    let mut key = Vec::with_capacity(34);
+    key.extend_from_slice(b"c:");
+    key.extend_from_slice(block_hash);
+    db.get_cf(avalanche_rs::db::CF_BLOCKS, &key).ok().flatten()
+}
+
+fn cchain_transaction_count(block_data: &[u8]) -> u64 {
+    extract_cchain_transactions(block_data).len() as u64
+}
+
+fn rpc_transaction_from_cchain_block_index(
+    block_data: &[u8],
+    tx_index: u64,
+) -> Option<serde_json::Value> {
+    let fields = extract_cchain_block_fields(block_data)?;
+    let block_hash = cchain_block_hash(block_data);
+    let tx = extract_cchain_transactions(block_data)
+        .into_iter()
+        .nth(tx_index as usize)?;
+    let pool_tx = pool_tx_from_cchain_raw(&tx);
+    Some(rpc_transaction_from_pool(
+        &pool_tx.hash,
+        &pool_tx,
+        Some(block_hash),
+        Some(fields.number),
+        Some(tx_index as u32),
+    ))
+}
+
+fn raw_transaction_hex_from_cchain_block_index(block_data: &[u8], tx_index: u64) -> Option<String> {
+    extract_cchain_transactions(block_data)
+        .into_iter()
+        .nth(tx_index as usize)
+        .map(|tx| format!("0x{}", hex::encode(tx.raw)))
+}
+
+fn accepted_transaction_changes(
+    db: &Database,
+    start_block: u64,
+    end_block: u64,
+    full_tx: bool,
+) -> Vec<serde_json::Value> {
+    if start_block > end_block {
+        return vec![];
+    }
+
+    let mut changes = Vec::new();
+    for block_height in start_block..=end_block {
+        let Some(block_data) = db.get_block(block_height).ok().flatten() else {
+            continue;
+        };
+        let Some(fields) = extract_cchain_block_fields(&block_data) else {
+            continue;
+        };
+        let block_hash = cchain_block_hash(&block_data);
+        for (idx, tx) in extract_cchain_transactions(&block_data)
+            .into_iter()
+            .enumerate()
+        {
+            let pool_tx = pool_tx_from_cchain_raw(&tx);
+            changes.push(if full_tx {
+                rpc_transaction_from_pool(
+                    &pool_tx.hash,
+                    &pool_tx,
+                    Some(block_hash),
+                    Some(fields.number),
+                    Some(idx as u32),
+                )
+            } else {
+                serde_json::Value::String(format!("0x{}", hex::encode(pool_tx.hash)))
+            });
+        }
+    }
+    changes
+}
+
+fn block_hash_changes(db: &Database, start_block: u64, end_block: u64) -> Vec<serde_json::Value> {
+    if start_block > end_block {
+        return vec![];
+    }
+
+    let mut changes = Vec::new();
+    for block_height in start_block..=end_block {
+        let Some(block_data) = db.get_block(block_height).ok().flatten() else {
+            continue;
+        };
+        changes.push(serde_json::Value::String(format!(
+            "0x{}",
+            hex::encode(cchain_block_hash(&block_data))
+        )));
+    }
+    changes
+}
+
+async fn pending_transaction_filter_changes(
+    filter: &mut PendingTransactionFilter,
+) -> Vec<serde_json::Value> {
+    let events = PENDING_FILTER_EVENTS.read().await;
+    let mut changes = Vec::new();
+    let mut latest_event_id = filter.last_event_id;
+
+    for (event_id, tx_hash) in events.iter() {
+        if *event_id <= filter.last_event_id {
+            continue;
+        }
+        latest_event_id = latest_event_id.max(*event_id);
+        changes.push(serde_json::Value::String(format!(
+            "0x{}",
+            hex::encode(tx_hash)
+        )));
+    }
+
+    filter.last_event_id = latest_event_id;
+    changes
+}
+
 fn load_block_receipts_json(db: &Database, block_height: u64) -> Vec<serde_json::Value> {
     db.get_block_receipts(block_height)
         .ok()
@@ -10027,6 +10567,33 @@ fn txpool_group_inspect(txs: Vec<PoolTransaction>) -> serde_json::Value {
     serde_json::Value::Object(grouped)
 }
 
+fn txpool_content_from(pool: &TransactionPool, address: [u8; 20]) -> serde_json::Value {
+    let pending = pool
+        .pending_transactions()
+        .into_iter()
+        .filter(|tx| tx.from == address)
+        .collect::<Vec<_>>();
+    let queued = pool
+        .queued_transactions()
+        .into_iter()
+        .filter(|tx| tx.from == address)
+        .collect::<Vec<_>>();
+
+    let strip_sender_scope = |grouped: serde_json::Value| -> serde_json::Value {
+        let key = format!("0x{}", hex::encode(address));
+        grouped
+            .as_object()
+            .and_then(|obj| obj.get(&key))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+    };
+
+    serde_json::json!({
+        "pending": strip_sender_scope(txpool_group_transactions(pending)),
+        "queued": strip_sender_scope(txpool_group_transactions(queued)),
+    })
+}
+
 fn raw_tx_hash(raw: &[u8]) -> [u8; 32] {
     let hash = revm::primitives::keccak256(raw);
     let mut out = [0u8; 32];
@@ -10443,6 +11010,7 @@ async fn submit_raw_cchain_transaction(
         .map_err(|e| format!("transaction rejected: {}", e))?;
     drop(txpool);
 
+    record_pending_filter_event(tx_hash).await;
     websocket_broadcast_pending_tx(node, &tx_hash).await;
 
     Ok(tx_hash)
@@ -10458,14 +11026,53 @@ struct LogFilter {
     last_polled_block: u64,
 }
 
+#[allow(dead_code)]
+struct PendingTransactionFilter {
+    last_event_id: u64,
+}
+
+#[allow(dead_code)]
+struct BlockHashFilter {
+    last_polled_block: u64,
+}
+
+#[allow(dead_code)]
+struct AcceptedTransactionFilter {
+    last_polled_block: u64,
+    full_tx: bool,
+}
+
+#[allow(dead_code)]
+enum RpcFilter {
+    Logs(LogFilter),
+    PendingTransactions(PendingTransactionFilter),
+    Blocks(BlockHashFilter),
+    AcceptedTransactions(AcceptedTransactionFilter),
+}
+
 /// Global filter state — use a simple counter + HashMap behind RwLock.
 static NEXT_FILTER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_PENDING_FILTER_EVENT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 use once_cell::sync::Lazy;
-use std::collections::HashMap as StdHashMap;
+use std::collections::{HashMap as StdHashMap, VecDeque};
 
-static FILTERS: Lazy<RwLock<StdHashMap<u64, LogFilter>>> =
+type PendingFilterEvents = RwLock<VecDeque<(u64, [u8; 32])>>;
+
+static FILTERS: Lazy<RwLock<StdHashMap<u64, RpcFilter>>> =
     Lazy::new(|| RwLock::new(StdHashMap::new()));
+static PENDING_FILTER_EVENTS: Lazy<PendingFilterEvents> =
+    Lazy::new(|| RwLock::new(VecDeque::new()));
+
+async fn record_pending_filter_event(tx_hash: [u8; 32]) {
+    let event_id = NEXT_PENDING_FILTER_EVENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut events = PENDING_FILTER_EVENTS.write().await;
+    events.push_back((event_id, tx_hash));
+    while events.len() > PENDING_FILTER_EVENT_LIMIT {
+        events.pop_front();
+    }
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
@@ -10495,7 +11102,31 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             rpc_ok(&format!("\"0x{:x}\"", height), id)
         }
         "net_version" => rpc_ok(&format!("\"{}\"", node.config.network_id), id),
+        "net_listening" => rpc_ok("true", id),
+        "net_peerCount" => {
+            let peer_count = node.peer_manager.read().await.connected_count() as u64;
+            rpc_ok(&format!("\"0x{:x}\"", peer_count), id)
+        }
         "web3_clientVersion" => rpc_ok("\"avalanche-rs/0.1.0\"", id),
+        "web3_sha3" => {
+            let Some(data) = params.get(0).and_then(|value| value.as_str()) else {
+                return rpc_error(-32602, "missing data", id);
+            };
+            let Some(bytes) = parse_hex_bytes(data) else {
+                return rpc_error(-32602, "invalid data", id);
+            };
+            let hash = revm::primitives::keccak256(bytes);
+            rpc_ok(&format!("\"0x{}\"", hex::encode(hash)), id)
+        }
+        "eth_accounts" => {
+            let mut accounts = node
+                .rpc_wallets
+                .keys()
+                .map(|address| serde_json::Value::String(format!("0x{}", hex::encode(address))))
+                .collect::<Vec<_>>();
+            accounts.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            rpc_ok(&serde_json::Value::Array(accounts).to_string(), id)
+        }
         "eth_syncing" => {
             let phase = node.sync_engine.phase().await;
             if phase == SyncPhase::Synced || phase == SyncPhase::Following {
@@ -10585,6 +11216,48 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 }
                 _ => rpc_error(-32602, "invalid params", id),
             }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getProof
+        // -----------------------------------------------------------------
+        "eth_getProof" => {
+            let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let storage_keys = params
+                .get(1)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let current_height = current_cchain_height(node);
+            let allow_current = match params.get(2) {
+                None => true,
+                Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::String(tag)) if tag == "latest" || tag == "pending" => true,
+                Some(value) => parse_block_number(value, node) == current_height,
+            };
+            if !allow_current {
+                return rpc_error(-32000, "historical proof query not allowed", id);
+            }
+            let Some(address) = parse_hex_address(addr_str) else {
+                return rpc_error(-32602, "invalid address", id);
+            };
+            let mut parsed_keys = Vec::with_capacity(storage_keys.len());
+            for key in storage_keys {
+                let Some(key_str) = key.as_str() else {
+                    return rpc_error(-32602, "invalid storage key", id);
+                };
+                let Some(slot) = parse_hex_hash(key_str) else {
+                    return rpc_error(-32602, "invalid storage key", id);
+                };
+                parsed_keys.push((slot, key_str.to_string()));
+            }
+            let proof = node.evm.read().await.get_proof(address, &parsed_keys);
+            rpc_ok(
+                &serde_json::to_value(proof)
+                    .unwrap_or(serde_json::Value::Null)
+                    .to_string(),
+                id,
+            )
         }
 
         // -----------------------------------------------------------------
@@ -10694,6 +11367,126 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         }
 
         // -----------------------------------------------------------------
+        // eth_sendTransaction
+        // -----------------------------------------------------------------
+        "eth_sendTransaction" => {
+            let Some(tx_obj) = params.get(0) else {
+                return rpc_error(-32602, "missing transaction object", id);
+            };
+            let request = match parse_rpc_managed_tx_request(tx_obj, true) {
+                Ok(request) => request,
+                Err(message) => return rpc_error(-32602, &message, id),
+            };
+            let wallet = match managed_wallet(node, request.from) {
+                Ok(wallet) => wallet.clone(),
+                Err(message) => return rpc_error(-32000, &message, id),
+            };
+            match prepare_rpc_managed_tx(node, &request, false).await {
+                Ok(envelope) => match envelope.sign(&wallet) {
+                    Ok(signed) => match submit_raw_cchain_transaction(node, &signed.raw).await {
+                        Ok(hash) => rpc_ok(&format!("\"0x{}\"", hex::encode(hash)), id),
+                        Err(message) => rpc_error(-32000, &message, id),
+                    },
+                    Err(message) => rpc_error(-32000, &message, id),
+                },
+                Err(message) => rpc_error(-32000, &message, id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_fillTransaction
+        // -----------------------------------------------------------------
+        "eth_fillTransaction" => {
+            let Some(tx_obj) = params.get(0) else {
+                return rpc_error(-32602, "missing transaction object", id);
+            };
+            let request = match parse_rpc_managed_tx_request(tx_obj, true) {
+                Ok(request) => request,
+                Err(message) => return rpc_error(-32602, &message, id),
+            };
+            match prepare_rpc_managed_tx(node, &request, false).await {
+                Ok(envelope) => {
+                    let result =
+                        filled_transaction_result(&request, &envelope, node.config.chain_id);
+                    rpc_ok(&result.to_string(), id)
+                }
+                Err(message) => rpc_error(-32000, &message, id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_sign
+        // -----------------------------------------------------------------
+        "eth_sign" => {
+            let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let data = params.get(1).and_then(|v| v.as_str()).unwrap_or("0x");
+            let Some(address) = parse_hex_address(addr_str) else {
+                return rpc_error(-32602, "invalid address", id);
+            };
+            let Some(message) = parse_hex_bytes(data) else {
+                return rpc_error(-32602, "invalid data", id);
+            };
+            let wallet = match managed_wallet(node, address) {
+                Ok(wallet) => wallet,
+                Err(message) => return rpc_error(-32000, &message, id),
+            };
+            let hash = ethereum_signed_message_hash(&message);
+            match wallet.sign_hash(&hash) {
+                Ok(signature) => {
+                    let mut encoded = Vec::with_capacity(65);
+                    encoded.extend_from_slice(&signature.r);
+                    encoded.extend_from_slice(&signature.s);
+                    encoded.push(signature.v.saturating_add(27));
+                    rpc_ok(&format!("\"0x{}\"", hex::encode(encoded)), id)
+                }
+                Err(message) => rpc_error(-32000, &message.to_string(), id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_signTransaction
+        // -----------------------------------------------------------------
+        "eth_signTransaction" => {
+            let Some(tx_obj) = params.get(0) else {
+                return rpc_error(-32602, "missing transaction object", id);
+            };
+            let request = match parse_rpc_managed_tx_request(tx_obj, true) {
+                Ok(request) => request,
+                Err(message) => return rpc_error(-32602, &message, id),
+            };
+            let wallet = match managed_wallet(node, request.from) {
+                Ok(wallet) => wallet.clone(),
+                Err(message) => return rpc_error(-32000, &message, id),
+            };
+            match prepare_rpc_managed_tx(node, &request, true).await {
+                Ok(envelope) => match envelope.sign(&wallet) {
+                    Ok(signed) => {
+                        let result =
+                            signed_transaction_result(&signed, &envelope, node.config.chain_id);
+                        rpc_ok(&result.to_string(), id)
+                    }
+                    Err(message) => rpc_error(-32000, &message, id),
+                },
+                Err(message) => rpc_error(-32000, &message, id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_resend
+        // -----------------------------------------------------------------
+        "eth_resend" => {
+            let Some(tx_obj) = params.get(0) else {
+                return rpc_error(-32602, "missing transaction object", id);
+            };
+            let gas_price = params.get(1).and_then(parse_quantity_u128);
+            let gas_limit = params.get(2).and_then(parse_quantity_u64);
+            match rpc_resend_transaction(node, tx_obj, gas_price, gas_limit).await {
+                Ok(hash) => rpc_ok(&format!("\"0x{}\"", hex::encode(hash)), id),
+                Err(message) => rpc_error(-32000, &message, id),
+            }
+        }
+
+        // -----------------------------------------------------------------
         // eth_getTransactionByHash
         // -----------------------------------------------------------------
         "eth_getTransactionByHash" => {
@@ -10731,6 +11524,114 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                     }
                 }
                 None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getTransactionByBlockHashAndIndex / eth_getTransactionByBlockNumberAndIndex
+        // -----------------------------------------------------------------
+        "eth_getTransactionByBlockHashAndIndex" => {
+            let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
+                return rpc_error(-32602, "invalid transaction index", id);
+            };
+            match parse_hex_hash(hash_str) {
+                Some(block_hash) => match load_cchain_block_by_hash(&node.db, &block_hash) {
+                    Some(block_data) => {
+                        match rpc_transaction_from_cchain_block_index(&block_data, tx_index) {
+                            Some(result) => rpc_ok(&result.to_string(), id),
+                            None => rpc_ok("null", id),
+                        }
+                    }
+                    None => rpc_ok("null", id),
+                },
+                None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        "eth_getTransactionByBlockNumberAndIndex" => {
+            let block_num =
+                parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
+                return rpc_error(-32602, "invalid transaction index", id);
+            };
+            match node.db.get_block(block_num) {
+                Ok(Some(block_data)) => {
+                    match rpc_transaction_from_cchain_block_index(&block_data, tx_index) {
+                        Some(result) => rpc_ok(&result.to_string(), id),
+                        None => rpc_ok("null", id),
+                    }
+                }
+                _ => rpc_ok("null", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // eth_getRawTransactionByHash / eth_getRawTransactionByBlock*AndIndex
+        // -----------------------------------------------------------------
+        "eth_getRawTransactionByHash" => {
+            let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_hash(tx_hash_str) {
+                Some(tx_hash) => {
+                    if let Some(tx) = node.txpool.read().await.get(&tx_hash).cloned() {
+                        if let Some(raw) = tx.raw {
+                            return rpc_ok(&format!("\"0x{}\"", hex::encode(raw)), id);
+                        }
+                    }
+                    match node.db.get_tx_index(&tx_hash) {
+                        Ok(Some((block_height, tx_index))) => match node.db.get_block(block_height)
+                        {
+                            Ok(Some(block_data)) => {
+                                match raw_transaction_hex_from_cchain_block_index(
+                                    &block_data,
+                                    tx_index as u64,
+                                ) {
+                                    Some(result) => rpc_ok(&format!("\"{}\"", result), id),
+                                    None => rpc_ok("null", id),
+                                }
+                            }
+                            _ => rpc_ok("null", id),
+                        },
+                        _ => rpc_ok("null", id),
+                    }
+                }
+                None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        "eth_getRawTransactionByBlockHashAndIndex" => {
+            let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
+                return rpc_error(-32602, "invalid transaction index", id);
+            };
+            match parse_hex_hash(hash_str) {
+                Some(block_hash) => match load_cchain_block_by_hash(&node.db, &block_hash) {
+                    Some(block_data) => {
+                        match raw_transaction_hex_from_cchain_block_index(&block_data, tx_index) {
+                            Some(result) => rpc_ok(&format!("\"{}\"", result), id),
+                            None => rpc_ok("null", id),
+                        }
+                    }
+                    None => rpc_ok("null", id),
+                },
+                None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        "eth_getRawTransactionByBlockNumberAndIndex" => {
+            let block_num =
+                parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
+                return rpc_error(-32602, "invalid transaction index", id);
+            };
+            match node.db.get_block(block_num) {
+                Ok(Some(block_data)) => {
+                    match raw_transaction_hex_from_cchain_block_index(&block_data, tx_index) {
+                        Some(result) => rpc_ok(&format!("\"{}\"", result), id),
+                        None => rpc_ok("null", id),
+                    }
+                }
+                _ => rpc_ok("null", id),
             }
         }
 
@@ -10812,6 +11713,35 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         }
 
         // -----------------------------------------------------------------
+        // eth_getBlockTransactionCountByNumber / eth_getBlockTransactionCountByHash
+        // -----------------------------------------------------------------
+        "eth_getBlockTransactionCountByNumber" => {
+            let block_num =
+                parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
+            match node.db.get_block(block_num) {
+                Ok(Some(block_data)) => rpc_ok(
+                    &format!("\"0x{:x}\"", cchain_transaction_count(&block_data)),
+                    id,
+                ),
+                _ => rpc_ok("null", id),
+            }
+        }
+
+        "eth_getBlockTransactionCountByHash" => {
+            let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
+            match parse_hex_hash(hash_str) {
+                Some(block_hash) => match load_cchain_block_by_hash(&node.db, &block_hash) {
+                    Some(block_data) => rpc_ok(
+                        &format!("\"0x{:x}\"", cchain_transaction_count(&block_data)),
+                        id,
+                    ),
+                    None => rpc_ok("null", id),
+                },
+                None => rpc_error(-32602, "invalid hash", id),
+            }
+        }
+
+        // -----------------------------------------------------------------
         // eth_getLogs
         // -----------------------------------------------------------------
         "eth_getLogs" => {
@@ -10832,7 +11762,56 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let filter_obj = params.get(0).unwrap_or(&serde_json::Value::Null);
             let filter_id = NEXT_FILTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let filter = parse_log_filter(filter_obj, node);
-            FILTERS.write().await.insert(filter_id, filter);
+            FILTERS
+                .write()
+                .await
+                .insert(filter_id, RpcFilter::Logs(filter));
+            rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
+        }
+
+        // -----------------------------------------------------------------
+        // eth_newPendingTransactionFilter / eth_newAcceptedTransactions / eth_newBlockFilter
+        // -----------------------------------------------------------------
+        "eth_newPendingTransactionFilter" => {
+            let filter_id = NEXT_FILTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let last_event_id = NEXT_PENDING_FILTER_EVENT_ID
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(1);
+            FILTERS.write().await.insert(
+                filter_id,
+                RpcFilter::PendingTransactions(PendingTransactionFilter { last_event_id }),
+            );
+            rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
+        }
+
+        "eth_newAcceptedTransactions" => {
+            let full_tx = params
+                .get(0)
+                .and_then(|value| match value {
+                    serde_json::Value::Bool(flag) => Some(*flag),
+                    serde_json::Value::Object(_) => value.get("fullTx").and_then(|v| v.as_bool()),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            let filter_id = NEXT_FILTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FILTERS.write().await.insert(
+                filter_id,
+                RpcFilter::AcceptedTransactions(AcceptedTransactionFilter {
+                    last_polled_block: current_cchain_height(node),
+                    full_tx,
+                }),
+            );
+            rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
+        }
+
+        "eth_newBlockFilter" => {
+            let filter_id = NEXT_FILTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FILTERS.write().await.insert(
+                filter_id,
+                RpcFilter::Blocks(BlockHashFilter {
+                    last_polled_block: current_cchain_height(node),
+                }),
+            );
             rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
         }
 
@@ -10843,7 +11822,7 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let filter_id = parse_filter_id(params.get(0).unwrap_or(&serde_json::Value::Null));
             let mut filters = FILTERS.write().await;
             match filters.get_mut(&filter_id) {
-                Some(filter) => {
+                Some(RpcFilter::Logs(filter)) => {
                     let current_height = current_cchain_height(node);
                     let end_block = filter
                         .to_block
@@ -10857,6 +11836,29 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                     filter.last_polled_block = current_height;
                     rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
                 }
+                Some(RpcFilter::PendingTransactions(filter)) => {
+                    let changes = pending_transaction_filter_changes(filter).await;
+                    rpc_ok(&serde_json::Value::Array(changes).to_string(), id)
+                }
+                Some(RpcFilter::Blocks(filter)) => {
+                    let current_height = current_cchain_height(node);
+                    let start_block = filter.last_polled_block.saturating_add(1);
+                    let changes = block_hash_changes(&node.db, start_block, current_height);
+                    filter.last_polled_block = current_height;
+                    rpc_ok(&serde_json::Value::Array(changes).to_string(), id)
+                }
+                Some(RpcFilter::AcceptedTransactions(filter)) => {
+                    let current_height = current_cchain_height(node);
+                    let start_block = filter.last_polled_block.saturating_add(1);
+                    let changes = accepted_transaction_changes(
+                        &node.db,
+                        start_block,
+                        current_height,
+                        filter.full_tx,
+                    );
+                    filter.last_polled_block = current_height;
+                    rpc_ok(&serde_json::Value::Array(changes).to_string(), id)
+                }
                 None => rpc_error(-32000, "filter not found", id),
             }
         }
@@ -10868,7 +11870,7 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let filter_id = parse_filter_id(params.get(0).unwrap_or(&serde_json::Value::Null));
             let filters = FILTERS.read().await;
             match filters.get(&filter_id) {
-                Some(filter) => {
+                Some(RpcFilter::Logs(filter)) => {
                     let current_height = current_cchain_height(node);
                     let end_block = filter
                         .to_block
@@ -10878,6 +11880,7 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         collect_logs_for_range(&node.db, filter, filter.from_block, end_block);
                     rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
                 }
+                Some(_) => rpc_error(-32000, "filter is not a log filter", id),
                 None => rpc_error(-32000, "filter not found", id),
             }
         }
@@ -11839,6 +12842,18 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             rpc_ok(&result.to_string(), id)
         }
 
+        "eth_txpool_contentFrom" | "txpool_contentFrom" => {
+            let Some(address_str) = params.get(0).and_then(|value| value.as_str()) else {
+                return rpc_error(-32602, "missing address", id);
+            };
+            let Some(address) = parse_hex_address(address_str) else {
+                return rpc_error(-32602, "invalid address", id);
+            };
+            let pool = node.txpool.read().await;
+            let result = txpool_content_from(&pool, address);
+            rpc_ok(&result.to_string(), id)
+        }
+
         // -----------------------------------------------------------------
         // WebSocket subscription (HTTP fallback)
         // -----------------------------------------------------------------
@@ -12650,6 +13665,7 @@ mod integration_tests {
                 stake_duration: None,
                 delegation_fee: None,
                 reward_address: None,
+                rpc_private_keys: vec![],
                 #[cfg(feature = "indexer")]
                 indexer_enabled: false,
                 #[cfg(feature = "indexer")]
@@ -12663,6 +13679,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            rpc_wallets: Arc::new(StdHashMap::new()),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
@@ -12677,6 +13694,21 @@ mod integration_tests {
             p_chain_recently_accepted: new_recently_accepted_pchain_blocks(),
             #[cfg(feature = "indexer")]
             indexer: None,
+        })
+    }
+
+    fn make_test_node_with_rpc_wallets(network_id: u32, wallets: Vec<Wallet>) -> Arc<NodeState> {
+        let node = make_test_node(network_id);
+        let wallets = Arc::new(
+            wallets
+                .into_iter()
+                .map(|wallet| (*wallet.address(), wallet))
+                .collect::<StdHashMap<_, _>>(),
+        );
+        let base = Arc::into_inner(node).expect("single test node ref");
+        Arc::new(NodeState {
+            rpc_wallets: wallets,
+            ..base
         })
     }
 
@@ -12740,6 +13772,7 @@ mod integration_tests {
                 stake_duration: None,
                 delegation_fee: None,
                 reward_address: None,
+                rpc_private_keys: vec![],
                 #[cfg(feature = "indexer")]
                 indexer_enabled: false,
                 #[cfg(feature = "indexer")]
@@ -12753,6 +13786,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            rpc_wallets: Arc::new(StdHashMap::new()),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
@@ -17366,6 +18400,40 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_rpc_txpool_content_from_scopes_sender() {
+        let node = make_test_node(1);
+        let sender = [0x24; 20];
+        let sender_key = format!("0x{}", hex::encode(sender));
+
+        node.txpool
+            .write()
+            .await
+            .add(make_pool_tx(0x24, 0), 0)
+            .expect("pending tx should be accepted");
+        node.txpool
+            .write()
+            .await
+            .add(make_pool_tx(0x24, 2), 0)
+            .expect("queued tx should be accepted");
+        node.txpool
+            .write()
+            .await
+            .add(make_pool_tx(0x25, 0), 0)
+            .expect("other sender tx should be accepted");
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"txpool_contentFrom","params":["{}"],"id":9}}"#,
+            sender_key
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed["result"]["pending"]["0x0"]["from"], sender_key);
+        assert_eq!(parsed["result"]["queued"]["0x2"]["from"], sender_key);
+        assert!(parsed["result"]["pending"].get("0x1").is_none());
+    }
+
+    #[tokio::test]
     async fn test_eth_pending_transactions_returns_live_pending_objects() {
         let node = make_test_node(1);
         let pending = make_pool_tx(0x33, 0);
@@ -17395,6 +18463,31 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_web3_sha3_and_net_methods() {
+        let node = make_test_node(1);
+
+        let sha3_req =
+            r#"{"jsonrpc":"2.0","method":"web3_sha3","params":["0x68656c6c6f"],"id":10}"#;
+        let sha3_response = handle_rpc_request(sha3_req, &node).await;
+        let sha3_json: serde_json::Value = serde_json::from_str(&sha3_response).unwrap();
+        assert_eq!(
+            sha3_json["result"],
+            "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
+        );
+
+        let listening_req = r#"{"jsonrpc":"2.0","method":"net_listening","params":[],"id":11}"#;
+        let listening_response = handle_rpc_request(listening_req, &node).await;
+        let listening_json: serde_json::Value = serde_json::from_str(&listening_response).unwrap();
+        assert_eq!(listening_json["result"], true);
+
+        let peer_count_req = r#"{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":12}"#;
+        let peer_count_response = handle_rpc_request(peer_count_req, &node).await;
+        let peer_count_json: serde_json::Value =
+            serde_json::from_str(&peer_count_response).unwrap();
+        assert_eq!(peer_count_json["result"], "0x0");
+    }
+
+    #[tokio::test]
     async fn test_eth_send_raw_transaction_accepts_legacy_tx() {
         let node = make_test_node(1);
         let wallet = avalanche_rs::tx::Wallet::random(43114);
@@ -17402,7 +18495,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 25_000_000_000,
             gas_limit: 21_000,
-            to: [0x33; 20],
+            to: Some([0x33; 20]),
             value: 7,
             data: vec![0xAB, 0xCD],
         };
@@ -17439,7 +18532,7 @@ mod integration_tests {
             max_priority_fee_per_gas: 1_500_000_000,
             max_fee_per_gas: 30_000_000_000,
             gas_limit: 25_000,
-            to: [0x44; 20],
+            to: Some([0x44; 20]),
             value: 9,
             data: vec![0x01, 0x02, 0x03],
             access_list: vec![],
@@ -17477,7 +18570,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 25_000_000_000,
             gas_limit: 21_000,
-            to: [0x55; 20],
+            to: Some([0x55; 20]),
             value: 1,
             data: vec![],
         };
@@ -17485,7 +18578,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 30_000_000_000,
             gas_limit: 21_000,
-            to: [0x55; 20],
+            to: Some([0x55; 20]),
             value: 2,
             data: vec![],
         };
@@ -17525,7 +18618,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 25_000_000_000,
             gas_limit: 21_000,
-            to: [0x77; 20],
+            to: Some([0x77; 20]),
             value: 5,
             data: vec![0xAA],
         };
@@ -17574,7 +18667,7 @@ mod integration_tests {
             max_priority_fee_per_gas: 1_500_000_000,
             max_fee_per_gas: 30_000_000_000,
             gas_limit: 21_000,
-            to: [0x66; 20],
+            to: Some([0x66; 20]),
             value: 1,
             data: vec![],
             access_list: vec![],
@@ -17619,7 +18712,7 @@ mod integration_tests {
             max_priority_fee_per_gas: 1_000_000_000,
             max_fee_per_gas: 25_000_000_000,
             gas_limit: 50_000,
-            to: [0x88; 20],
+            to: Some([0x88; 20]),
             value: 3,
             data: vec![0x01, 0x02],
             access_list: vec![],
@@ -17722,6 +18815,113 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_eth_block_transaction_count_and_raw_index_lookups() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 50_000,
+            to: Some([0x8A; 20]),
+            value: 2,
+            data: vec![0xAB, 0xCD],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":21}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs.clone())
+            .await
+            .expect("block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &block.raw).unwrap();
+        node.db.put_block(block.number, &block.raw).unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs).unwrap();
+        node.db.set_last_accepted_height(block.number).unwrap();
+        reconcile_mined_pool_transactions(&node, &pool_txs).await;
+
+        let count_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getBlockTransactionCountByNumber","params":["0x1"],"id":22}"#;
+        let count_by_number_response = handle_rpc_request(count_by_number_req, &node).await;
+        let count_by_number_json: serde_json::Value =
+            serde_json::from_str(&count_by_number_response).unwrap();
+        assert_eq!(count_by_number_json["result"], "0x1");
+
+        let count_by_hash_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBlockTransactionCountByHash","params":["0x{}"],"id":23}}"#,
+            hex::encode(block.id)
+        );
+        let count_by_hash_response = handle_rpc_request(&count_by_hash_req, &node).await;
+        let count_by_hash_json: serde_json::Value =
+            serde_json::from_str(&count_by_hash_response).unwrap();
+        assert_eq!(count_by_hash_json["result"], "0x1");
+
+        let tx_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getTransactionByBlockNumberAndIndex","params":["0x1","0x0"],"id":24}"#;
+        let tx_by_number_response = handle_rpc_request(tx_by_number_req, &node).await;
+        let tx_by_number_json: serde_json::Value =
+            serde_json::from_str(&tx_by_number_response).unwrap();
+        assert_eq!(
+            tx_by_number_json["result"]["hash"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+        assert_eq!(tx_by_number_json["result"]["transactionIndex"], "0x0");
+
+        let tx_by_hash_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByBlockHashAndIndex","params":["0x{}","0x0"],"id":25}}"#,
+            hex::encode(block.id)
+        );
+        let tx_by_hash_response = handle_rpc_request(&tx_by_hash_req, &node).await;
+        let tx_by_hash_json: serde_json::Value =
+            serde_json::from_str(&tx_by_hash_response).unwrap();
+        assert_eq!(
+            tx_by_hash_json["result"]["hash"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+
+        let raw_by_hash_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getRawTransactionByHash","params":["0x{}"],"id":26}}"#,
+            hex::encode(tx_hash)
+        );
+        let raw_by_hash_response = handle_rpc_request(&raw_by_hash_req, &node).await;
+        let raw_by_hash_json: serde_json::Value =
+            serde_json::from_str(&raw_by_hash_response).unwrap();
+        assert_eq!(raw_by_hash_json["result"], signed.raw_hex());
+
+        let raw_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getRawTransactionByBlockNumberAndIndex","params":["0x1","0x0"],"id":27}"#;
+        let raw_by_number_response = handle_rpc_request(raw_by_number_req, &node).await;
+        let raw_by_number_json: serde_json::Value =
+            serde_json::from_str(&raw_by_number_response).unwrap();
+        assert_eq!(raw_by_number_json["result"], signed.raw_hex());
+
+        let raw_by_block_hash_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getRawTransactionByBlockHashAndIndex","params":["0x{}","0x0"],"id":28}}"#,
+            hex::encode(block.id)
+        );
+        let raw_by_block_hash_response = handle_rpc_request(&raw_by_block_hash_req, &node).await;
+        let raw_by_block_hash_json: serde_json::Value =
+            serde_json::from_str(&raw_by_block_hash_response).unwrap();
+        assert_eq!(raw_by_block_hash_json["result"], signed.raw_hex());
+    }
+
+    #[tokio::test]
     async fn test_imported_cchain_block_persists_lookup_artifacts() {
         let builder_node = make_test_node(1);
         let wallet = avalanche_rs::tx::Wallet::random(43114);
@@ -17730,7 +18930,7 @@ mod integration_tests {
             max_priority_fee_per_gas: 1_000_000_000,
             max_fee_per_gas: 25_000_000_000,
             gas_limit: 50_000,
-            to: [0x99; 20],
+            to: Some([0x99; 20]),
             value: 4,
             data: vec![0xAA, 0xBB],
             access_list: vec![],
@@ -17867,7 +19067,7 @@ mod integration_tests {
             max_priority_fee_per_gas: 1_000_000_000,
             max_fee_per_gas: 25_000_000_000,
             gas_limit: 50_000,
-            to: [0x33; 20],
+            to: Some([0x33; 20]),
             value: 7,
             data: vec![0xAB, 0xCD],
             access_list: vec![],
@@ -18117,6 +19317,291 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_pending_block_and_accepted_transaction_filters() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        FILTERS.write().await.clear();
+        PENDING_FILTER_EVENTS.write().await.clear();
+        NEXT_PENDING_FILTER_EVENT_ID.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0xAD; 20]),
+            value: 1,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let new_pending_req =
+            r#"{"jsonrpc":"2.0","method":"eth_newPendingTransactionFilter","params":[],"id":29}"#;
+        let new_pending_response = handle_rpc_request(new_pending_req, &node).await;
+        let new_pending_json: serde_json::Value =
+            serde_json::from_str(&new_pending_response).unwrap();
+        let pending_filter_id = new_pending_json["result"].as_str().unwrap().to_string();
+
+        let new_block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_newBlockFilter","params":[],"id":30}"#;
+        let new_block_response = handle_rpc_request(new_block_req, &node).await;
+        let new_block_json: serde_json::Value = serde_json::from_str(&new_block_response).unwrap();
+        let block_filter_id = new_block_json["result"].as_str().unwrap().to_string();
+
+        let new_accepted_req = r#"{"jsonrpc":"2.0","method":"eth_newAcceptedTransactions","params":[{"fullTx":true}],"id":31}"#;
+        let new_accepted_response = handle_rpc_request(new_accepted_req, &node).await;
+        let new_accepted_json: serde_json::Value =
+            serde_json::from_str(&new_accepted_response).unwrap();
+        let accepted_filter_id = new_accepted_json["result"].as_str().unwrap().to_string();
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":32}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let pending_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":33}}"#,
+            pending_filter_id
+        );
+        let pending_changes_response = handle_rpc_request(&pending_changes_req, &node).await;
+        let pending_changes_json: serde_json::Value =
+            serde_json::from_str(&pending_changes_response).unwrap();
+        assert_eq!(
+            pending_changes_json["result"][0],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs.clone())
+            .await
+            .expect("block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &block.raw).unwrap();
+        node.db.put_block(block.number, &block.raw).unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs).unwrap();
+        node.db.set_last_accepted_height(block.number).unwrap();
+        reconcile_mined_pool_transactions(&node, &pool_txs).await;
+
+        let block_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":34}}"#,
+            block_filter_id
+        );
+        let block_changes_response = handle_rpc_request(&block_changes_req, &node).await;
+        let block_changes_json: serde_json::Value =
+            serde_json::from_str(&block_changes_response).unwrap();
+        assert_eq!(
+            block_changes_json["result"][0],
+            format!("0x{}", hex::encode(block.id))
+        );
+
+        let accepted_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":35}}"#,
+            accepted_filter_id
+        );
+        let accepted_changes_response = handle_rpc_request(&accepted_changes_req, &node).await;
+        let accepted_changes_json: serde_json::Value =
+            serde_json::from_str(&accepted_changes_response).unwrap();
+        assert_eq!(
+            accepted_changes_json["result"][0]["hash"],
+            format!("0x{}", hex::encode(tx_hash))
+        );
+        assert_eq!(
+            accepted_changes_json["result"][0]["blockHash"],
+            format!("0x{}", hex::encode(block.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eth_accounts_sign_and_send_transaction_use_managed_wallets() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        PENDING_FILTER_EVENTS.write().await.clear();
+        NEXT_PENDING_FILTER_EVENT_ID.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let wallet = Wallet::from_hex(
+            "0x4c0883a69102937d6231471b5dbb6204fe5129617082795a3d4b8b7d2c4f5f6a",
+            43114,
+        )
+        .unwrap();
+        let node = make_test_node_with_rpc_wallets(1, vec![wallet.clone()]);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let accounts_req = r#"{"jsonrpc":"2.0","method":"eth_accounts","params":[],"id":36}"#;
+        let accounts_response = handle_rpc_request(accounts_req, &node).await;
+        let accounts_json: serde_json::Value = serde_json::from_str(&accounts_response).unwrap();
+        let expected_address = wallet.address_hex();
+        assert_eq!(
+            accounts_json["result"],
+            serde_json::json!([expected_address])
+        );
+
+        let sign_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sign","params":["{}","0x68656c6c6f"],"id":37}}"#,
+            wallet.address_hex()
+        );
+        let sign_response = handle_rpc_request(&sign_req, &node).await;
+        let sign_json: serde_json::Value = serde_json::from_str(&sign_response).unwrap();
+        let signature = sign_json["result"].as_str().unwrap();
+        assert_eq!(signature.len(), 132);
+        assert!(signature.ends_with("1b") || signature.ends_with("1c"));
+
+        let send_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendTransaction","params":[{{"from":"{}","to":"0x{}","value":"0x7"}}],"id":38}}"#,
+            wallet.address_hex(),
+            hex::encode([0x51; 20])
+        );
+        let send_response = handle_rpc_request(&send_req, &node).await;
+        let send_json: serde_json::Value = serde_json::from_str(&send_response).unwrap();
+        let tx_hash = parse_hex_hash(send_json["result"].as_str().unwrap()).unwrap();
+        let pending = node.txpool.read().await.get(&tx_hash).cloned().unwrap();
+        assert_eq!(pending.from, *wallet.address());
+        assert_eq!(pending.to, Some([0x51; 20]));
+        assert_eq!(pending.value, 7);
+    }
+
+    #[tokio::test]
+    async fn test_eth_fill_sign_transaction_and_resend_with_managed_wallet() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        PENDING_FILTER_EVENTS.write().await.clear();
+        NEXT_PENDING_FILTER_EVENT_ID.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let wallet = Wallet::from_hex(
+            "0x8f2a5594906d42f2b7d3b913f5cf2c1e0ed6f3d1063f4042afe7f18413cf5df2",
+            43114,
+        )
+        .unwrap();
+        let node = make_test_node_with_rpc_wallets(1, vec![wallet.clone()]);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let fill_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_fillTransaction","params":[{{"from":"{}","to":"0x{}","value":"0x1"}}],"id":39}}"#,
+            wallet.address_hex(),
+            hex::encode([0x52; 20])
+        );
+        let fill_response = handle_rpc_request(&fill_req, &node).await;
+        let fill_json: serde_json::Value = serde_json::from_str(&fill_response).unwrap();
+        assert!(fill_json["result"]["raw"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x02"));
+        assert_eq!(fill_json["result"]["tx"]["type"], "0x2");
+        assert_eq!(fill_json["result"]["tx"]["nonce"], "0x0");
+
+        let sign_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_signTransaction","params":[{{"from":"{}","to":"0x{}","value":"0x2","gas":"0x5208","gasPrice":"0x5d21dba00","nonce":"0x0"}}],"id":40}}"#,
+            wallet.address_hex(),
+            hex::encode([0x53; 20])
+        );
+        let sign_response = handle_rpc_request(&sign_req, &node).await;
+        let sign_json: serde_json::Value = serde_json::from_str(&sign_response).unwrap();
+        assert!(sign_json["result"]["raw"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+        assert_eq!(sign_json["result"]["tx"]["type"], "0x0");
+        assert_eq!(sign_json["result"]["tx"]["gasPrice"], "0x5d21dba00");
+
+        let send_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendTransaction","params":[{{"from":"{}","to":"0x{}","value":"0x3","gas":"0x5208","gasPrice":"0x5d21dba00","nonce":"0x0"}}],"id":41}}"#,
+            wallet.address_hex(),
+            hex::encode([0x54; 20])
+        );
+        let send_response = handle_rpc_request(&send_req, &node).await;
+        let send_json: serde_json::Value = serde_json::from_str(&send_response).unwrap();
+        let first_hash = parse_hex_hash(send_json["result"].as_str().unwrap()).unwrap();
+
+        let resend_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_resend","params":[{{"from":"{}","to":"0x{}","value":"0x3","data":"0x","nonce":"0x0"}},"0x77359400","0x7530"],"id":42}}"#,
+            wallet.address_hex(),
+            hex::encode([0x54; 20])
+        );
+        let resend_response = handle_rpc_request(&resend_req, &node).await;
+        let resend_json: serde_json::Value = serde_json::from_str(&resend_response).unwrap();
+        let replacement_hash = parse_hex_hash(resend_json["result"].as_str().unwrap()).unwrap();
+
+        assert_ne!(replacement_hash, first_hash);
+        let pool = node.txpool.read().await;
+        assert!(pool.get(&first_hash).is_none());
+        let replacement = pool.get(&replacement_hash).unwrap();
+        assert_eq!(replacement.gas_limit, 30_000);
+        assert_eq!(replacement.max_fee_per_gas, 2_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_eth_get_proof_returns_current_account_and_storage_values() {
+        let node = make_test_node(1);
+        let account = [0x61; 20];
+        let slot = [0x11; 32];
+        let mut value = [0u8; 32];
+        value[31] = 5;
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 500, 7, vec![0x60, 0x00, 0x55]);
+            evm.set_storage(account, slot, value);
+        }
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"latest"],"id":43}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let response = handle_rpc_request(&req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed["result"]["address"],
+            format!("0x{}", hex::encode(account))
+        );
+        assert_eq!(parsed["result"]["balance"], "0x1f4");
+        assert_eq!(parsed["result"]["nonce"], "0x7");
+        assert!(!parsed["result"]["accountProof"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            parsed["result"]["storageProof"][0]["key"],
+            format!("0x{}", hex::encode(slot))
+        );
+        assert_eq!(parsed["result"]["storageProof"][0]["value"], "0x5");
+
+        node.db.set_last_accepted_height(1).unwrap();
+        let historical_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x0"],"id":44}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let historical_response = handle_rpc_request(&historical_req, &node).await;
+        let historical_json: serde_json::Value =
+            serde_json::from_str(&historical_response).unwrap();
+        assert_eq!(
+            historical_json["error"]["message"],
+            "historical proof query not allowed"
+        );
+    }
+
+    #[tokio::test]
     async fn test_websocket_subscribe_new_pending_transactions() {
         let node = make_test_node(1);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -18138,7 +19623,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 25_000_000_000,
             gas_limit: 21_000,
-            to: [0xAB; 20],
+            to: Some([0xAB; 20]),
             value: 1,
             data: vec![],
         };
@@ -18218,7 +19703,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 25_000_000_000,
             gas_limit: 21_000,
-            to: [0xAC; 20],
+            to: Some([0xAC; 20]),
             value: 1,
             data: vec![],
         };
@@ -18271,7 +19756,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 25_000_000_000,
             gas_limit: 50_000,
-            to: contract,
+            to: Some(contract),
             value: 5,
             data: vec![0xAA, 0xBB, 0xCC],
         };
@@ -18321,7 +19806,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 25_000_000_000,
             gas_limit: 50_000,
-            to: contract,
+            to: Some(contract),
             value: 0,
             data: vec![],
         };
@@ -18379,7 +19864,7 @@ mod integration_tests {
             max_priority_fee_per_gas: 1_000_000_000,
             max_fee_per_gas: 25_000_000_000,
             gas_limit: 50_000,
-            to: [0x88; 20],
+            to: Some([0x88; 20]),
             value: 3,
             data: vec![0x01, 0x02],
             access_list: vec![],
@@ -18437,7 +19922,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 26_000_000_000,
             gas_limit: 30_000,
-            to: [0x52; 20],
+            to: Some([0x52; 20]),
             value: 1,
             data: vec![],
         };
@@ -18498,7 +19983,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 27_000_000_000,
             gas_limit: 30_000,
-            to: [0x53; 20],
+            to: Some([0x53; 20]),
             value: 1,
             data: vec![],
         };
@@ -18547,7 +20032,7 @@ mod integration_tests {
             nonce: 0,
             gas_price: 26_000_000_000,
             gas_limit: 30_000,
-            to: [0x54; 20],
+            to: Some([0x54; 20]),
             value: 1,
             data: vec![],
         };
@@ -18868,6 +20353,7 @@ mod integration_tests {
                 stake_duration: None,
                 delegation_fee: None,
                 reward_address: None,
+                rpc_private_keys: vec![],
                 #[cfg(feature = "indexer")]
                 indexer_enabled: false,
                 #[cfg(feature = "indexer")]
@@ -18881,6 +20367,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            rpc_wallets: Arc::new(StdHashMap::new()),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
@@ -19022,6 +20509,7 @@ mod integration_tests {
                 stake_duration: None,
                 delegation_fee: None,
                 reward_address: None,
+                rpc_private_keys: vec![],
                 #[cfg(feature = "indexer")]
                 indexer_enabled: false,
                 #[cfg(feature = "indexer")]
@@ -19035,6 +20523,7 @@ mod integration_tests {
             c_chain_metrics: Arc::new(RwLock::new(ChainMetrics::default())),
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
+            rpc_wallets: Arc::new(StdHashMap::new()),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),

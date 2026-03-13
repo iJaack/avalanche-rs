@@ -102,6 +102,30 @@ pub struct AccessListResult {
     pub error: Option<String>,
 }
 
+/// Result of `eth_getProof` for a single storage slot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StorageProofResult {
+    pub key: String,
+    pub value: String,
+    pub proof: Vec<String>,
+}
+
+/// Result of `eth_getProof` for an account and optional storage keys.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountProofResult {
+    pub address: String,
+    #[serde(rename = "accountProof")]
+    pub account_proof: Vec<String>,
+    pub balance: String,
+    #[serde(rename = "codeHash")]
+    pub code_hash: String,
+    pub nonce: String,
+    #[serde(rename = "storageHash")]
+    pub storage_hash: String,
+    #[serde(rename = "storageProof")]
+    pub storage_proof: Vec<StorageProofResult>,
+}
+
 #[derive(Debug, Default, Clone)]
 struct AccessListInspector {
     accesses: BTreeMap<[u8; 20], BTreeSet<[u8; 32]>>,
@@ -249,6 +273,15 @@ impl EvmExecutor {
             code: Some(bytecode),
         };
         self.db.insert_account_info(addr, info);
+    }
+
+    /// Set a storage slot in the state DB.
+    pub fn set_storage(&mut self, address: [u8; 20], slot: [u8; 32], value: [u8; 32]) {
+        let addr = Address::from(address);
+        let account = self.db.accounts.entry(addr).or_default();
+        account
+            .storage
+            .insert(U256::from_be_bytes(slot), U256::from_be_bytes(value));
     }
 
     /// Get account balance.
@@ -834,6 +867,167 @@ impl EvmExecutor {
         let mut out = [0u8; 32];
         out.copy_from_slice(root.as_slice());
         out
+    }
+
+    /// Build an account/storage proof for the latest in-memory state.
+    pub fn get_proof(
+        &self,
+        address: [u8; 20],
+        storage_keys: &[([u8; 32], String)],
+    ) -> AccountProofResult {
+        use alloy_primitives::{keccak256, B256};
+        use alloy_rlp::{encode, encode_fixed_size};
+        use alloy_trie::{
+            proof::ProofRetainer, HashBuilder, Nibbles, TrieAccount, EMPTY_ROOT_HASH, KECCAK_EMPTY,
+        };
+
+        let account_code_hash = |account: &revm::db::DbAccount| match &account.info.code {
+            Some(code) if !code.is_empty() => B256::from_slice(keccak256(code.bytes()).as_slice()),
+            _ if account.info.code_hash != revm::primitives::KECCAK_EMPTY => {
+                B256::from_slice(account.info.code_hash.as_slice())
+            }
+            _ => KECCAK_EMPTY,
+        };
+
+        let storage_root_for_account = |account: &revm::db::DbAccount| {
+            if account.storage.is_empty() {
+                EMPTY_ROOT_HASH
+            } else {
+                use alloy_trie::root::storage_root_unhashed;
+                let storage_iter = account
+                    .storage
+                    .iter()
+                    .map(|(slot, value)| (B256::from(slot.to_be_bytes::<32>()), *value));
+                storage_root_unhashed(storage_iter)
+            }
+        };
+
+        let db_account = self.db.accounts.get(&Address::from(address));
+        let (storage_hash, storage_proof) = if let Some(account) = db_account {
+            if account.storage.is_empty() {
+                (
+                    EMPTY_ROOT_HASH,
+                    storage_keys
+                        .iter()
+                        .map(|(_, display_key)| StorageProofResult {
+                            key: display_key.clone(),
+                            value: "0x0".to_string(),
+                            proof: vec![],
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                let mut sorted_storage = account
+                    .storage
+                    .iter()
+                    .map(|(slot, value)| (keccak256(slot.to_be_bytes::<32>()), *value))
+                    .collect::<Vec<_>>();
+                sorted_storage.sort_unstable_by_key(|(slot, _)| *slot);
+
+                let mut storage_builder =
+                    HashBuilder::default().with_proof_retainer(ProofRetainer::new(
+                        storage_keys
+                            .iter()
+                            .map(|(slot, _)| Nibbles::unpack(keccak256(*slot)))
+                            .collect(),
+                    ));
+                for (hashed_slot, value) in &sorted_storage {
+                    storage_builder.add_leaf(
+                        Nibbles::unpack(*hashed_slot),
+                        encode_fixed_size(value).as_ref(),
+                    );
+                }
+                let root = storage_builder.root();
+                let proof_nodes = storage_builder.take_proof_nodes();
+                let proofs = storage_keys
+                    .iter()
+                    .map(|(slot, display_key)| {
+                        let target = Nibbles::unpack(keccak256(*slot));
+                        let value = account
+                            .storage
+                            .get(&U256::from_be_bytes(*slot))
+                            .copied()
+                            .unwrap_or_default();
+                        StorageProofResult {
+                            key: display_key.clone(),
+                            value: format!("0x{:x}", value),
+                            proof: proof_nodes
+                                .matching_nodes_sorted(&target)
+                                .into_iter()
+                                .map(|(_, node)| format!("0x{}", hex::encode(node)))
+                                .collect(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (root, proofs)
+            }
+        } else {
+            (
+                EMPTY_ROOT_HASH,
+                storage_keys
+                    .iter()
+                    .map(|(_, display_key)| StorageProofResult {
+                        key: display_key.clone(),
+                        value: "0x0".to_string(),
+                        proof: vec![],
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let mut sorted_accounts = self.db.accounts.iter().collect::<Vec<_>>();
+        sorted_accounts.sort_unstable_by_key(|(addr, _)| keccak256(addr.as_slice()));
+
+        let target_nibbles = Nibbles::unpack(keccak256(address));
+        let mut account_builder = HashBuilder::default()
+            .with_proof_retainer(ProofRetainer::from_iter([target_nibbles.clone()]));
+        for (addr, account) in sorted_accounts {
+            let trie_account = TrieAccount {
+                nonce: account.info.nonce,
+                balance: account.info.balance,
+                storage_root: if addr.as_slice() == address {
+                    storage_hash
+                } else {
+                    storage_root_for_account(account)
+                },
+                code_hash: account_code_hash(account),
+            };
+            account_builder.add_leaf(
+                Nibbles::unpack(keccak256(addr.as_slice())),
+                encode(trie_account).as_ref(),
+            );
+        }
+        let _ = account_builder.root();
+        let account_proof = account_builder
+            .take_proof_nodes()
+            .matching_nodes_sorted(&target_nibbles)
+            .into_iter()
+            .map(|(_, node)| format!("0x{}", hex::encode(node)))
+            .collect::<Vec<_>>();
+
+        let (balance, nonce, code_hash) = if let Some(account) = db_account {
+            (
+                format!("0x{:x}", account.info.balance),
+                format!("0x{:x}", account.info.nonce),
+                format!("0x{}", hex::encode(account_code_hash(account))),
+            )
+        } else {
+            (
+                "0x0".to_string(),
+                "0x0".to_string(),
+                format!("0x{}", hex::encode(KECCAK_EMPTY)),
+            )
+        };
+
+        AccountProofResult {
+            address: format!("0x{}", hex::encode(address)),
+            account_proof,
+            balance,
+            code_hash,
+            nonce,
+            storage_hash: format!("0x{}", hex::encode(storage_hash)),
+            storage_proof,
+        }
     }
 
     /// Verify that the post-execution state root matches the expected value

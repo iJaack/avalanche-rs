@@ -181,7 +181,7 @@ pub struct Eip1559Tx {
     pub max_priority_fee_per_gas: u128,
     pub max_fee_per_gas: u128,
     pub gas_limit: u64,
-    pub to: [u8; 20],
+    pub to: Option<[u8; 20]>,
     pub value: u128,
     pub data: Vec<u8>,
     pub access_list: Vec<AccessListEntry>,
@@ -200,7 +200,7 @@ pub struct LegacyTx {
     pub nonce: u64,
     pub gas_price: u128,
     pub gas_limit: u64,
-    pub to: [u8; 20],
+    pub to: Option<[u8; 20]>,
     pub value: u128,
     pub data: Vec<u8>,
 }
@@ -342,6 +342,14 @@ impl Rlp {
 }
 
 impl Eip1559Tx {
+    /// Signing payload bytes (type prefix + unsigned RLP payload).
+    pub fn signing_payload(&self, chain_id: u64) -> Vec<u8> {
+        let encoded = self.rlp_encode(chain_id);
+        let mut prefixed = vec![0x02];
+        prefixed.extend_from_slice(&encoded);
+        prefixed
+    }
+
     /// RLP encode for signing (without signature)
     fn rlp_encode(&self, chain_id: u64) -> Vec<u8> {
         let mut rlp = Rlp::new();
@@ -352,7 +360,10 @@ impl Eip1559Tx {
         rlp.encode_u128(self.max_priority_fee_per_gas);
         rlp.encode_u128(self.max_fee_per_gas);
         rlp.encode_u64(self.gas_limit);
-        rlp.encode_fixed(&self.to);
+        match self.to {
+            Some(to) => rlp.encode_fixed(&to),
+            None => rlp.encode_bytes(&[]),
+        }
         rlp.encode_u128(self.value);
         rlp.encode_bytes(&self.data);
 
@@ -384,7 +395,10 @@ impl Eip1559Tx {
         rlp.encode_u128(self.max_priority_fee_per_gas);
         rlp.encode_u128(self.max_fee_per_gas);
         rlp.encode_u64(self.gas_limit);
-        rlp.encode_fixed(&self.to);
+        match self.to {
+            Some(to) => rlp.encode_fixed(&to),
+            None => rlp.encode_bytes(&[]),
+        }
         rlp.encode_u128(self.value);
         rlp.encode_bytes(&self.data);
 
@@ -413,6 +427,11 @@ impl Eip1559Tx {
 }
 
 impl LegacyTx {
+    /// Signing payload bytes for EIP-155 legacy transactions.
+    pub fn signing_payload(&self, chain_id: u64) -> Vec<u8> {
+        self.rlp_encode_for_signing(chain_id)
+    }
+
     /// RLP encode for signing (EIP-155: includes chain_id, 0, 0)
     fn rlp_encode_for_signing(&self, chain_id: u64) -> Vec<u8> {
         let mut rlp = Rlp::new();
@@ -421,7 +440,10 @@ impl LegacyTx {
         rlp.encode_u64(self.nonce);
         rlp.encode_u128(self.gas_price);
         rlp.encode_u64(self.gas_limit);
-        rlp.encode_fixed(&self.to);
+        match self.to {
+            Some(to) => rlp.encode_fixed(&to),
+            None => rlp.encode_bytes(&[]),
+        }
         rlp.encode_u128(self.value);
         rlp.encode_bytes(&self.data);
 
@@ -442,7 +464,10 @@ impl LegacyTx {
         rlp.encode_u64(self.nonce);
         rlp.encode_u128(self.gas_price);
         rlp.encode_u64(self.gas_limit);
-        rlp.encode_fixed(&self.to);
+        match self.to {
+            Some(to) => rlp.encode_fixed(&to),
+            None => rlp.encode_bytes(&[]),
+        }
         rlp.encode_u128(self.value);
         rlp.encode_bytes(&self.data);
 
@@ -758,7 +783,7 @@ mod tests {
             max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
             max_fee_per_gas: 30_000_000_000,         // 30 gwei
             gas_limit: 21_000,
-            to: [0u8; 20],
+            to: Some([0u8; 20]),
             value: 1_000_000_000_000_000_000, // 1 AVAX
             data: vec![],
             access_list: vec![],
@@ -779,7 +804,7 @@ mod tests {
             nonce: 5,
             gas_price: 25_000_000_000, // 25 gwei
             gas_limit: 21_000,
-            to: [0xAA; 20],
+            to: Some([0xAA; 20]),
             value: 0,
             data: vec![0xa9, 0x05, 0x9c, 0xbb], // transfer selector
         };
@@ -798,7 +823,7 @@ mod tests {
             max_priority_fee_per_gas: 1_000_000_000,
             max_fee_per_gas: 30_000_000_000,
             gas_limit: 100_000,
-            to: [0xBB; 20],
+            to: Some([0xBB; 20]),
             value: 0,
             data: vec![0x38, 0xed, 0x17, 0x39], // swapExactTokensForTokens
             access_list: vec![AccessListEntry {
@@ -915,7 +940,7 @@ mod tests {
                 max_priority_fee_per_gas: 1_000_000_000,
                 max_fee_per_gas: 30_000_000_000,
                 gas_limit: 21_000,
-                to: [0u8; 20],
+                to: Some([0u8; 20]),
                 value: 0,
                 data: vec![],
                 access_list: vec![],
@@ -943,7 +968,7 @@ mod tests {
             max_priority_fee_per_gas: 1_000_000_000,
             max_fee_per_gas: 30_000_000_000,
             gas_limit: 21_000,
-            to: [0u8; 20],
+            to: Some([0u8; 20]),
             value: 0,
             data: vec![],
             access_list: vec![],
