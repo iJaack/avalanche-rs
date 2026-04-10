@@ -399,6 +399,8 @@ struct ChainMetrics {
     pub tip_height: u64,
     pub tip_hash: [u8; 32],
     pub chain_length: u64,
+    pub canonical_switches: u64,
+    pub last_canonical_switch_height: u64,
     pub last_sync_time: Instant,
 }
 
@@ -422,6 +424,8 @@ impl Default for ChainMetrics {
             tip_height: 0,
             tip_hash: [0u8; 32],
             chain_length: 0,
+            canonical_switches: 0,
+            last_canonical_switch_height: 0,
             last_sync_time: Instant::now(),
         }
     }
@@ -1653,6 +1657,23 @@ fn peer_score(record: &PersistentPeerRecord) -> i64 {
 
 fn latency_to_reputation(latency_ms: u64) -> i32 {
     (1000_i32 - (latency_ms.min(1000) as i32)).max(0)
+}
+
+fn update_canonical_chain_metrics(
+    metrics: &mut ChainMetrics,
+    canonical_height: u64,
+    block_hash: [u8; 32],
+) {
+    let replaced_same_height = canonical_height == metrics.tip_height
+        && metrics.tip_hash != [0u8; 32]
+        && metrics.tip_hash != block_hash;
+    let rolled_back_or_repointed = canonical_height < metrics.tip_height;
+    if replaced_same_height || rolled_back_or_repointed {
+        metrics.canonical_switches += 1;
+        metrics.last_canonical_switch_height = canonical_height;
+    }
+    metrics.tip_height = canonical_height;
+    metrics.tip_hash = block_hash;
 }
 
 fn socket_addr_to_ip_bytes(addr: SocketAddr) -> Vec<u8> {
@@ -3258,9 +3279,8 @@ async fn run_block_builder(node: Arc<NodeState>) {
                 let _ = node.db.set_last_accepted_height(block.number);
                 {
                     let mut m = node.c_chain_metrics.write().await;
-                    m.tip_height = block.number;
-                    m.tip_hash = block.id;
                     m.blocks_synced += 1;
+                    update_canonical_chain_metrics(&mut m, block.number, block.id);
                 }
                 refresh_txpool_base_fee(&node).await;
 
@@ -3727,21 +3747,21 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
             persist_archive_state_changes(node, fields.number, &state_root, &[]);
         }
 
-        let current_height = current_cchain_height(node);
-        if fields.number > current_height {
+        let mut canonical_height = current_cchain_height(node);
+        if fields.number > canonical_height {
             if let Err(e) = node.db.set_last_accepted_height(fields.number) {
                 debug!(
                     "failed to advance imported C-Chain head to #{}: {}",
                     fields.number, e
                 );
             }
+            canonical_height = fields.number;
         }
 
-        // Even with no transactions update tip height and hash
+        // Canonical imports should keep the in-memory tip aligned even on same-height replacement.
         let mut m = node.c_chain_metrics.write().await;
-        if fields.number > m.tip_height {
-            m.tip_height = fields.number;
-            m.tip_hash = block_hash;
+        if fields.number == canonical_height {
+            update_canonical_chain_metrics(&mut m, canonical_height, block_hash);
         }
         drop(m);
         refresh_txpool_base_fee(node).await;
@@ -3861,20 +3881,20 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 );
             }
 
-            let current_height = current_cchain_height(node);
-            if fields.number > current_height {
+            let mut canonical_height = current_cchain_height(node);
+            if fields.number > canonical_height {
                 if let Err(e) = node.db.set_last_accepted_height(fields.number) {
                     debug!(
                         "failed to advance imported C-Chain head to #{}: {}",
                         fields.number, e
                     );
                 }
+                canonical_height = fields.number;
             }
 
             let mut m = node.c_chain_metrics.write().await;
-            if fields.number > m.tip_height {
-                m.tip_height = fields.number;
-                m.tip_hash = block_hash;
+            if fields.number == canonical_height {
+                update_canonical_chain_metrics(&mut m, canonical_height, block_hash);
             }
             drop(m);
             refresh_txpool_base_fee(node).await;
@@ -4477,25 +4497,28 @@ async fn handle_rpc_connection(
 }
 
 async fn render_prometheus_metrics(node: &NodeState) -> String {
+    reconcile_canonical_cchain_metrics(node).await;
     let phase = node.sync_engine.phase().await;
     let sync_stats = node.sync_engine.stats().await;
     let peer_count = node.peer_manager.read().await.connected_count() as u64;
-    let p_height = node.p_chain_metrics.read().await.tip_height;
-    let c_height = node.c_chain_metrics.read().await.tip_height;
+    let p_metrics = node.p_chain_metrics.read().await.clone();
+    let c_metrics = node.c_chain_metrics.read().await.clone();
     let memory = get_rss_bytes();
     let uptime = node.start_time.elapsed().as_secs();
     let handshake_latency = average_handshake_latency_ms(&node.db);
 
     format!(
-        "sync_progress {}\npeer_count {}\nblock_height_p_chain {}\nblock_height_c_chain {}\nmemory_rss_bytes {}\nuptime_seconds {}\nhandshake_latency_ms {}\n",
+        "sync_progress {}\npeer_count {}\nblock_height_p_chain {}\nblock_height_c_chain {}\nc_chain_canonical_switches_total {}\nc_chain_last_canonical_switch_height {}\nmemory_rss_bytes {}\nuptime_seconds {}\nhandshake_latency_ms {}\n",
         if matches!(phase, SyncPhase::Following | SyncPhase::Synced) {
             1.0
         } else {
             sync_stats.progress_pct() / 100.0
         },
         peer_count,
-        p_height,
-        c_height,
+        p_metrics.tip_height,
+        c_metrics.tip_height,
+        c_metrics.canonical_switches,
+        c_metrics.last_canonical_switch_height,
         memory,
         uptime,
         handshake_latency
@@ -4516,6 +4539,19 @@ fn average_handshake_latency_ms(db: &Database) -> u64 {
     } else {
         latencies.iter().sum::<u64>() / latencies.len() as u64
     }
+}
+
+async fn reconcile_canonical_cchain_metrics(node: &NodeState) {
+    let canonical_height = current_cchain_height(node);
+    if canonical_height == 0 {
+        return;
+    }
+    let Ok(Some(raw_block)) = node.db.get_block(canonical_height) else {
+        return;
+    };
+    let canonical_hash = cchain_block_hash(&raw_block);
+    let mut metrics = node.c_chain_metrics.write().await;
+    update_canonical_chain_metrics(&mut metrics, canonical_height, canonical_hash);
 }
 
 /// Parse a hex string (with or without 0x prefix) to bytes.
@@ -22734,9 +22770,54 @@ mod integration_tests {
         assert!(metrics.contains("peer_count"));
         assert!(metrics.contains("block_height_p_chain"));
         assert!(metrics.contains("block_height_c_chain"));
+        assert!(metrics.contains("c_chain_canonical_switches_total"));
+        assert!(metrics.contains("c_chain_last_canonical_switch_height"));
         assert!(metrics.contains("memory_rss_bytes"));
         assert!(metrics.contains("uptime_seconds"));
         assert!(metrics.contains("handshake_latency_ms"));
+    }
+
+    #[tokio::test]
+    async fn test_same_height_canonical_replacement_updates_cchain_metrics_and_prometheus() {
+        let node = make_test_node(1);
+        let first_block =
+            make_cchain_coreth_block_with_transactions([0x11; 32], 1, 1_700_000_000, &[]);
+        let second_block =
+            make_cchain_coreth_block_with_transactions([0x22; 32], 1, 1_700_000_010, &[]);
+        let first_hash = cchain_block_hash(&first_block);
+        let second_hash = cchain_block_hash(&second_block);
+
+        node.db.put_block(1, &first_block).unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+        {
+            let mut metrics = node.c_chain_metrics.write().await;
+            metrics.tip_height = 1;
+            metrics.tip_hash = first_hash;
+        }
+
+        node.db.put_block(1, &second_block).unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let metrics = render_prometheus_metrics(&node).await;
+        {
+            let metrics_state = node.c_chain_metrics.read().await.clone();
+            assert_eq!(metrics_state.tip_height, 1);
+            assert_eq!(metrics_state.tip_hash, second_hash);
+            assert_eq!(metrics_state.canonical_switches, 1);
+            assert_eq!(metrics_state.last_canonical_switch_height, 1);
+        }
+
+        let block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",false],"id":53}"#;
+        let block_response = handle_rpc_request(block_req, &node).await;
+        let block_json: serde_json::Value = serde_json::from_str(&block_response).unwrap();
+        assert_eq!(
+            block_json["result"]["hash"],
+            format!("0x{}", hex::encode(second_hash))
+        );
+
+        assert!(metrics.contains("c_chain_canonical_switches_total 1"));
+        assert!(metrics.contains("c_chain_last_canonical_switch_height 1"));
     }
 
     #[tokio::test]
