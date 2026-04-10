@@ -234,8 +234,17 @@ pub struct EvmExecutor {
     chain_id: u64,
 }
 
+pub struct ArchivedAccountDiff {
+    pub address: [u8; 20],
+    pub state: crate::db::AccountState,
+    pub code: Option<Vec<u8>>,
+    pub storage: Vec<([u8; 32], [u8; 32])>,
+}
+
 impl EvmExecutor {
-    fn account_state_from_db_account(account: &revm::db::DbAccount) -> crate::db::AccountState {
+    fn account_snapshot_from_db_account(
+        account: &revm::db::DbAccount,
+    ) -> (crate::db::AccountState, Option<Vec<u8>>) {
         use alloy_trie::{root::storage_root_unhashed, EMPTY_ROOT_HASH};
 
         let storage_root = if account.storage.is_empty() {
@@ -270,12 +279,15 @@ impl EvmExecutor {
         };
 
         let balance_bytes = account.info.balance.to_le_bytes::<32>();
-        crate::db::AccountState {
-            nonce: account.info.nonce,
-            balance: u128::from_le_bytes(balance_bytes[..16].try_into().unwrap()),
-            storage_root,
-            code_hash,
-        }
+        (
+            crate::db::AccountState {
+                nonce: account.info.nonce,
+                balance: u128::from_le_bytes(balance_bytes[..16].try_into().unwrap()),
+                storage_root,
+                code_hash,
+            },
+            account.info.code.as_ref().map(|code| code.bytes().to_vec()),
+        )
     }
 
     /// Create a new executor with an empty in-memory state.
@@ -382,32 +394,88 @@ impl EvmExecutor {
             .map(|(addr, account)| {
                 let mut raw = [0u8; 20];
                 raw.copy_from_slice(addr.as_slice());
-                (raw, Self::account_state_from_db_account(account))
+                (raw, Self::account_snapshot_from_db_account(account).0)
             })
             .collect()
     }
 
-    /// Return the account states that changed compared with a previous snapshot.
-    pub fn changed_account_states_since(
-        &self,
-        previous: &Self,
-    ) -> Vec<([u8; 20], crate::db::AccountState)> {
-        let current = self.archived_account_states();
-        let previous = previous.archived_account_states();
+    /// Return changed account snapshots, including code bytes and changed storage slots.
+    pub fn changed_account_archive_diffs_since(&self, previous: &Self) -> Vec<ArchivedAccountDiff> {
+        let current = self
+            .db
+            .accounts
+            .iter()
+            .map(|(addr, account)| {
+                let mut raw = [0u8; 20];
+                raw.copy_from_slice(addr.as_slice());
+                let (state, code) = Self::account_snapshot_from_db_account(account);
+                (
+                    raw,
+                    (
+                        state,
+                        code,
+                        account
+                            .storage
+                            .iter()
+                            .map(|(slot, value)| (slot.to_be_bytes::<32>(), value.to_be_bytes()))
+                            .collect::<BTreeMap<_, _>>(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let previous_states = previous.archived_account_states();
         let addresses = current
             .keys()
-            .chain(previous.keys())
+            .chain(previous_states.keys())
             .copied()
             .collect::<BTreeSet<_>>();
 
         addresses
             .into_iter()
             .filter_map(|address| {
-                let current_state = current.get(&address).cloned().unwrap_or_default();
-                if previous.get(&address) == Some(&current_state) {
+                let (current_state, code, current_storage) = current
+                    .get(&address)
+                    .cloned()
+                    .unwrap_or((crate::db::AccountState::default(), None, BTreeMap::new()));
+                if previous_states.get(&address) == Some(&current_state) {
                     None
                 } else {
-                    Some((address, current_state))
+                    let previous_storage = previous
+                        .db
+                        .accounts
+                        .get(&Address::from(address))
+                        .map(|account| {
+                            account
+                                .storage
+                                .iter()
+                                .map(|(slot, value)| {
+                                    (slot.to_be_bytes::<32>(), value.to_be_bytes())
+                                })
+                                .collect::<BTreeMap<_, _>>()
+                        })
+                        .unwrap_or_default();
+                    let changed_slots = current_storage
+                        .keys()
+                        .chain(previous_storage.keys())
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .filter_map(|slot| {
+                            let current_value =
+                                current_storage.get(&slot).copied().unwrap_or([0u8; 32]);
+                            if previous_storage.get(&slot).copied() == Some(current_value) {
+                                None
+                            } else {
+                                Some((slot, current_value))
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    Some(ArchivedAccountDiff {
+                        address,
+                        state: current_state,
+                        code,
+                        storage: changed_slots,
+                    })
                 }
             })
             .collect()

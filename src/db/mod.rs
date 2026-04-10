@@ -27,6 +27,8 @@ pub const CF_STATE_ROOTS: &str = "state_roots";
 pub const CF_PEERS: &str = "peers";
 /// Column family for archive historical account snapshots.
 pub const CF_ARCHIVE_STATE: &str = "archive_state";
+/// Column family for archive historical storage snapshots.
+pub const CF_ARCHIVE_STORAGE: &str = "archive_storage";
 /// Column family for blob sidecar data (EIP-4844).
 pub const CF_BLOBS: &str = "blobs";
 
@@ -41,6 +43,7 @@ const ALL_CFS: &[&str] = &[
     CF_STATE_ROOTS,
     CF_PEERS,
     CF_ARCHIVE_STATE,
+    CF_ARCHIVE_STORAGE,
     CF_BLOBS,
 ];
 
