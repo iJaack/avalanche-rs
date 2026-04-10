@@ -10049,6 +10049,10 @@ fn canonical_filter_start_block(
     last_polled_hash: Option<[u8; 32]>,
     current_height: u64,
 ) -> Option<u64> {
+    if current_height < last_polled_block {
+        return Some(current_height);
+    }
+
     if last_polled_block <= current_height {
         if let Some(previous_hash) = last_polled_hash {
             match canonical_cchain_block_hash_at_height(db, last_polled_block) {
@@ -20596,6 +20600,203 @@ mod integration_tests {
 
         assert_ne!(old_block_hash, new_block_hash);
         assert_ne!(old_tx_hash, new_tx_hash);
+    }
+
+    #[tokio::test]
+    async fn test_filters_detect_rollback_below_last_polled_tip() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        FILTERS.write().await.clear();
+
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let log_address = [0xCD; 20];
+        let log_topic = [0x44; 32];
+
+        let tx_a = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x51; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_b = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x52; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let replacement_tx = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 30_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x53; 20]),
+                value: 3,
+                data: vec![],
+            })
+            .unwrap();
+
+        let old_block_1 = make_cchain_coreth_block_with_transactions(
+            [0x31; 32],
+            1,
+            1_700_000_000,
+            std::slice::from_ref(&tx_a.raw),
+        );
+        let old_block_2 = make_cchain_coreth_block_with_transactions(
+            cchain_block_hash(&old_block_1),
+            2,
+            1_700_000_010,
+            std::slice::from_ref(&tx_b.raw),
+        );
+        let new_block_1 = make_cchain_coreth_block_with_transactions(
+            [0x41; 32],
+            1,
+            1_700_000_020,
+            std::slice::from_ref(&replacement_tx.raw),
+        );
+
+        let old_block_1_hash = cchain_block_hash(&old_block_1);
+        let new_block_1_hash = cchain_block_hash(&new_block_1);
+        let replacement_tx_hash = keccak_tx_hash(&replacement_tx.raw);
+        let old_parsed_1 = vec![parse_raw_cchain_transaction(&tx_a.raw).unwrap()];
+        let old_parsed_2 = vec![parse_raw_cchain_transaction(&tx_b.raw).unwrap()];
+        let new_parsed_1 = vec![parse_raw_cchain_transaction(&replacement_tx.raw).unwrap()];
+        let receipt_with_log = |gas_used| TxReceipt {
+            success: true,
+            gas_used,
+            output: vec![],
+            contract_address: None,
+            logs: vec![EvmLog {
+                address: log_address,
+                topics: vec![log_topic],
+                data: vec![],
+            }],
+        };
+
+        node.db.put_block(1, &old_block_1).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &old_block_1_hash,
+            &old_parsed_1,
+            &[receipt_with_log(21_000)],
+        )
+        .unwrap();
+        node.db.put_block(2, &old_block_2).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            2,
+            &cchain_block_hash(&old_block_2),
+            &old_parsed_2,
+            &[receipt_with_log(22_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let log_filter_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_newFilter","params":[{{"fromBlock":"0x1","address":"0x{}","topics":["0x{}"]}}],"id":41}}"#,
+            hex::encode(log_address),
+            hex::encode(log_topic)
+        );
+        let log_filter_response = handle_rpc_request(&log_filter_req, &node).await;
+        let log_filter_json: serde_json::Value =
+            serde_json::from_str(&log_filter_response).unwrap();
+        let log_filter_id = log_filter_json["result"].as_str().unwrap().to_string();
+
+        let new_block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_newBlockFilter","params":[],"id":42}"#;
+        let new_block_response = handle_rpc_request(new_block_req, &node).await;
+        let new_block_json: serde_json::Value = serde_json::from_str(&new_block_response).unwrap();
+        let block_filter_id = new_block_json["result"].as_str().unwrap().to_string();
+
+        let new_accepted_req = r#"{"jsonrpc":"2.0","method":"eth_newAcceptedTransactions","params":[{"fullTx":true}],"id":43}"#;
+        let new_accepted_response = handle_rpc_request(new_accepted_req, &node).await;
+        let new_accepted_json: serde_json::Value =
+            serde_json::from_str(&new_accepted_response).unwrap();
+        let accepted_filter_id = new_accepted_json["result"].as_str().unwrap().to_string();
+
+        let log_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":44}}"#,
+            log_filter_id
+        );
+        let first_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let first_log_json: serde_json::Value = serde_json::from_str(&first_log_changes).unwrap();
+        assert_eq!(first_log_json["result"].as_array().unwrap().len(), 2);
+
+        let block_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":45}}"#,
+            block_filter_id
+        );
+        let first_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let first_block_json: serde_json::Value =
+            serde_json::from_str(&first_block_changes).unwrap();
+        assert!(first_block_json["result"].as_array().unwrap().is_empty());
+
+        let accepted_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":46}}"#,
+            accepted_filter_id
+        );
+        let first_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let first_accepted_json: serde_json::Value =
+            serde_json::from_str(&first_accepted_changes).unwrap();
+        assert!(first_accepted_json["result"].as_array().unwrap().is_empty());
+
+        clear_canonical_cchain_tx_artifacts(&node.db, 2).unwrap();
+        clear_canonical_cchain_tx_artifacts(&node.db, 1).unwrap();
+        node.db.put_block(1, &new_block_1).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &new_block_1_hash,
+            &new_parsed_1,
+            &[receipt_with_log(30_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let second_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let second_log_json: serde_json::Value = serde_json::from_str(&second_log_changes).unwrap();
+        let second_logs = second_log_json["result"].as_array().unwrap();
+        assert_eq!(second_logs.len(), 1);
+        assert_eq!(
+            second_logs[0]["transactionHash"],
+            format!("0x{}", hex::encode(replacement_tx_hash))
+        );
+        assert_eq!(
+            second_logs[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_1_hash))
+        );
+
+        let second_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let second_block_json: serde_json::Value =
+            serde_json::from_str(&second_block_changes).unwrap();
+        let second_blocks = second_block_json["result"].as_array().unwrap();
+        assert_eq!(second_blocks.len(), 1);
+        assert_eq!(
+            second_blocks[0],
+            format!("0x{}", hex::encode(new_block_1_hash))
+        );
+
+        let second_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let second_accepted_json: serde_json::Value =
+            serde_json::from_str(&second_accepted_changes).unwrap();
+        let second_accepted = second_accepted_json["result"].as_array().unwrap();
+        assert_eq!(second_accepted.len(), 1);
+        assert_eq!(
+            second_accepted[0]["hash"],
+            format!("0x{}", hex::encode(replacement_tx_hash))
+        );
+        assert_eq!(
+            second_accepted[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_1_hash))
+        );
     }
 
     #[tokio::test]
