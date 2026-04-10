@@ -11329,9 +11329,11 @@ fn persist_local_cchain_tx_artifacts(
 ) -> Result<(), avalanche_rs::db::DbError> {
     let mut cumulative_gas = 0u64;
     let mut log_index_offset = 0u32;
+    let mut tx_index_writes = Vec::with_capacity(txs.len());
+    let mut receipt_writes = Vec::with_capacity(block.receipts.len());
 
     for (idx, (tx, receipt)) in txs.iter().zip(block.receipts.iter()).enumerate() {
-        db.put_tx_index(&tx.hash, block.number, idx as u32)?;
+        tx_index_writes.push((tx.hash, block.number, idx as u32));
         cumulative_gas = cumulative_gas.saturating_add(receipt.gas_used);
         let receipt_json = rpc_receipt_from_pool(
             &tx.hash,
@@ -11343,15 +11345,15 @@ fn persist_local_cchain_tx_artifacts(
             cumulative_gas,
             log_index_offset,
         );
-        db.put_receipt(
+        receipt_writes.push((
             block.number,
             idx as u32,
-            receipt_json.to_string().as_bytes(),
-        )?;
+            receipt_json.to_string().into_bytes(),
+        ));
         log_index_offset = log_index_offset.saturating_add(receipt.logs.len() as u32);
     }
 
-    Ok(())
+    db.write_transaction_artifacts(&tx_index_writes, &receipt_writes)
 }
 
 fn clear_canonical_cchain_tx_artifacts(
@@ -11376,10 +11378,12 @@ fn persist_imported_cchain_tx_artifacts(
 ) -> Result<(), avalanche_rs::db::DbError> {
     let mut cumulative_gas = 0u64;
     let mut log_index_offset = 0u32;
+    let mut tx_index_writes = Vec::with_capacity(txs.len());
+    let mut receipt_writes = Vec::with_capacity(receipts.len());
 
     for (idx, (tx, receipt)) in txs.iter().zip(receipts.iter()).enumerate() {
         let pool_tx = pool_tx_from_cchain_raw(tx);
-        db.put_tx_index(&pool_tx.hash, block_number, idx as u32)?;
+        tx_index_writes.push((pool_tx.hash, block_number, idx as u32));
         cumulative_gas = cumulative_gas.saturating_add(receipt.gas_used);
         let receipt_json = rpc_receipt_from_pool(
             &pool_tx.hash,
@@ -11391,15 +11395,15 @@ fn persist_imported_cchain_tx_artifacts(
             cumulative_gas,
             log_index_offset,
         );
-        db.put_receipt(
+        receipt_writes.push((
             block_number,
             idx as u32,
-            receipt_json.to_string().as_bytes(),
-        )?;
+            receipt_json.to_string().into_bytes(),
+        ));
         log_index_offset = log_index_offset.saturating_add(receipt.logs.len() as u32);
     }
 
-    Ok(())
+    db.write_transaction_artifacts(&tx_index_writes, &receipt_writes)
 }
 
 async fn submit_raw_cchain_transaction(
@@ -12189,16 +12193,7 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                                     let receipt_json = String::from_utf8_lossy(&receipt_data);
                                     rpc_ok(&receipt_json, id)
                                 }
-                                _ => {
-                                    // Return minimal receipt only when the indexed tx is still valid.
-                                    rpc_ok(
-                                        &format!(
-                                            "{{\"transactionHash\":\"0x{}\",\"blockNumber\":\"0x{:x}\",\"transactionIndex\":\"0x{:x}\",\"status\":\"0x1\"}}",
-                                            hex::encode(tx_hash), block_height, tx_index
-                                        ),
-                                        id,
-                                    )
-                                }
+                                _ => rpc_ok("null", id),
                             }
                         }
                         _ => rpc_ok("null", id),
@@ -20269,6 +20264,69 @@ mod integration_tests {
             predicted_next_base_fee_from_fields(importer_node.config.network_id, &imported_fields);
         let pool = importer_node.txpool.read().await;
         assert_eq!(pool.base_fee, expected_next_base_fee);
+    }
+
+    #[tokio::test]
+    async fn test_missing_receipt_row_returns_null_after_restart() {
+        let (db, dir) = Database::open_temp().unwrap();
+        let builder_node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0x98; 20]),
+            value: 5,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = builder_node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":27}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &builder_node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let block = build_cchain_block(
+            &builder_node,
+            1,
+            builder_node.txpool.read().await.pending_sorted_cloned(),
+        )
+        .await
+        .expect("block should build");
+
+        db.put_block(1, &block.raw).unwrap();
+        db.put_tx_index(&tx_hash, 1, 0).unwrap();
+        db.set_last_accepted_height(1).unwrap();
+        drop(db);
+
+        let reopened_db = Database::open(dir.path()).unwrap();
+        let reopened_node = make_test_node_with_db(1, reopened_db, false);
+        reopened_node.c_chain_metrics.write().await.tip_height = 1;
+
+        let receipt_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":28}}"#,
+            hex::encode(tx_hash)
+        );
+        let receipt_response = handle_rpc_request(&receipt_req, &reopened_node).await;
+        let receipt_json: serde_json::Value = serde_json::from_str(&receipt_response).unwrap();
+        assert!(receipt_json["result"].is_null());
+
+        let tx_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":29}}"#,
+            hex::encode(tx_hash)
+        );
+        let tx_lookup_response = handle_rpc_request(&tx_lookup_req, &reopened_node).await;
+        let tx_lookup_json: serde_json::Value = serde_json::from_str(&tx_lookup_response).unwrap();
+        assert_eq!(tx_lookup_json["result"]["blockNumber"], "0x1");
     }
 
     #[tokio::test]

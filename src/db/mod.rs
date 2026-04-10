@@ -14,6 +14,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
+#[cfg(test)]
+use std::sync::Mutex;
 
 /// Column family names.
 pub const CF_BLOCKS: &str = "blocks";
@@ -60,6 +62,8 @@ type RocksDB = DBWithThreadMode<MultiThreaded>;
 /// The database wrapper around RocksDB.
 pub struct Database {
     db: Arc<RocksDB>,
+    #[cfg(test)]
+    fail_next_write_batch: Arc<Mutex<bool>>,
 }
 
 /// Persistent Merkle Patricia Trie node record.
@@ -135,7 +139,11 @@ impl Database {
         let db = RocksDB::open_cf_descriptors(&opts, path, cf_descriptors)
             .map_err(|e| DbError::Open(e.to_string()))?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            #[cfg(test)]
+            fail_next_write_batch: Arc::new(Mutex::new(false)),
+        })
     }
 
     /// Open a temporary database (for tests).
@@ -182,9 +190,57 @@ impl Database {
 
     /// Write a batch of operations atomically.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<(), DbError> {
+        #[cfg(test)]
+        {
+            let mut fail_next = self
+                .fail_next_write_batch
+                .lock()
+                .expect("test write batch failpoint lock");
+            if *fail_next {
+                *fail_next = false;
+                return Err(DbError::Write("injected write batch failure".to_string()));
+            }
+        }
         self.db
             .write(batch)
             .map_err(|e| DbError::Write(e.to_string()))
+    }
+
+    pub fn write_transaction_artifacts(
+        &self,
+        tx_indexes: &[([u8; 32], u64, u32)],
+        receipts: &[(u64, u32, Vec<u8>)],
+    ) -> Result<(), DbError> {
+        let mut batch = WriteBatch::default();
+        let tx_index_cf = self.cf_handle(CF_TX_INDEX);
+        let receipts_cf = self.cf_handle(CF_RECEIPTS);
+
+        for (tx_hash, block_height, tx_index) in tx_indexes {
+            let mut value = Vec::with_capacity(12);
+            value.extend_from_slice(&block_height.to_be_bytes());
+            value.extend_from_slice(&tx_index.to_be_bytes());
+            batch.put_cf(&tx_index_cf, tx_hash, &value);
+        }
+
+        for (block_height, tx_index, receipt_data) in receipts {
+            let mut key = Vec::with_capacity(12);
+            key.extend_from_slice(&block_height.to_be_bytes());
+            key.extend_from_slice(&tx_index.to_be_bytes());
+            batch.put_cf(&receipts_cf, &key, receipt_data);
+        }
+
+        drop(tx_index_cf);
+        drop(receipts_cf);
+        self.write_batch(batch)
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_write_batch_for_test(&self) {
+        let mut fail_next = self
+            .fail_next_write_batch
+            .lock()
+            .expect("test write batch failpoint lock");
+        *fail_next = true;
     }
 
     // -----------------------------------------------------------------------
@@ -955,6 +1011,21 @@ mod tests {
             db.get_cf(CF_METADATA, b"batch_key2").unwrap().unwrap(),
             b"val2"
         );
+    }
+
+    #[test]
+    fn test_write_transaction_artifacts_is_atomic_on_batch_failure() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let tx_hash = [0xAB; 32];
+        db.fail_next_write_batch_for_test();
+
+        let result = db.write_transaction_artifacts(
+            &[(tx_hash, 7, 0)],
+            &[(7, 0, br#"{"status":"0x1"}"#.to_vec())],
+        );
+        assert!(matches!(result, Err(DbError::Write(_))));
+        assert!(db.get_tx_index(&tx_hash).unwrap().is_none());
+        assert!(db.get_receipt(7, 0).unwrap().is_none());
     }
 
     #[test]
