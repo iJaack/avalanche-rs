@@ -5089,13 +5089,12 @@ fn resolve_cchain_state_query(
         });
     }
 
-    match node.db.get_block(block_height) {
-        Ok(Some(_)) => Ok(CchainStateQuery {
+    match load_canonical_cchain_block_by_number(&node.db, block_height, current_height) {
+        Some(_) => Ok(CchainStateQuery {
             block_height,
             is_current: false,
         }),
-        Ok(None) => Err(format!("block #{} not found", block_height)),
-        Err(err) => Err(format!("failed to load block #{}: {}", block_height, err)),
+        None => Err(format!("block #{} not found", block_height)),
     }
 }
 
@@ -10026,6 +10025,17 @@ fn load_cchain_block_by_hash(db: &Database, block_hash: &[u8; 32]) -> Option<Vec
     db.get_cf(avalanche_rs::db::CF_BLOCKS, &key).ok().flatten()
 }
 
+fn load_canonical_cchain_block_by_number(
+    db: &Database,
+    block_height: u64,
+    max_canonical_height: u64,
+) -> Option<Vec<u8>> {
+    if block_height > max_canonical_height {
+        return None;
+    }
+    db.get_block(block_height).ok().flatten()
+}
+
 fn canonical_cchain_block_hash_at_height(db: &Database, block_height: u64) -> Option<[u8; 32]> {
     db.get_block(block_height)
         .ok()
@@ -11982,8 +11992,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
                 return rpc_error(-32602, "invalid transaction index", id);
             };
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => {
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => {
                     match rpc_transaction_from_cchain_block_index(&block_data, tx_index) {
                         Some(result) => rpc_ok(&result.to_string(), id),
                         None => rpc_ok("null", id),
@@ -12044,8 +12058,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
                 return rpc_error(-32602, "invalid transaction index", id);
             };
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => {
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => {
                     match raw_transaction_hex_from_cchain_block_index(&block_data, tx_index) {
                         Some(result) => rpc_ok(&format!("\"{}\"", result), id),
                         None => rpc_ok("null", id),
@@ -12099,13 +12117,16 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
             let include_full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => {
-                    match rpc_block_from_cchain_data(&block_data, include_full_txs) {
-                        Some(result) => rpc_ok(&result.to_string(), id),
-                        None => rpc_ok("null", id),
-                    }
-                }
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => match rpc_block_from_cchain_data(&block_data, include_full_txs)
+                {
+                    Some(result) => rpc_ok(&result.to_string(), id),
+                    None => rpc_ok("null", id),
+                },
                 _ => rpc_ok("null", id),
             }
         }
@@ -12142,8 +12163,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         "eth_getBlockTransactionCountByNumber" => {
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => rpc_ok(
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => rpc_ok(
                     &format!("\"0x{:x}\"", cchain_transaction_count(&block_data)),
                     id,
                 ),
@@ -13364,6 +13389,15 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
             let config = TraceConfig::from_json(params.get(1).unwrap_or(&serde_json::Value::Null));
+            if load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            )
+            .is_none()
+            {
+                return rpc_error(-32000, &format!("block #{} not found", block_num), id);
+            }
             match trace_mined_block(&node.db, node.config.chain_id, block_num, &config) {
                 Ok(result) => rpc_ok(&result.to_string(), id),
                 Err(msg) => rpc_error(-32000, &msg, id),
@@ -13373,8 +13407,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         "debug_getBlockByNumber" => {
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
-            match node.db.get_block(block_num) {
-                Ok(Some(data)) => rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id),
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(data) => rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id),
                 _ => rpc_ok("null", id),
             }
         }
@@ -13429,12 +13467,19 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 params.get(0).unwrap_or(&serde_json::Value::Null),
                 node,
             ) {
-                Ok(Some(block_num)) => match node.db.get_block_receipts(block_num) {
-                    Ok(Some(data)) => {
-                        let receipts_json = String::from_utf8_lossy(&data);
-                        rpc_ok(&receipts_json, id)
-                    }
-                    _ => rpc_ok("[]", id),
+                Ok(Some(block_num)) => match load_canonical_cchain_block_by_number(
+                    &node.db,
+                    block_num,
+                    current_cchain_height(node),
+                ) {
+                    Some(_) => match node.db.get_block_receipts(block_num) {
+                        Ok(Some(data)) => {
+                            let receipts_json = String::from_utf8_lossy(&data);
+                            rpc_ok(&receipts_json, id)
+                        }
+                        _ => rpc_ok("[]", id),
+                    },
+                    None => rpc_ok("null", id),
                 },
                 Ok(None) => rpc_ok("null", id),
                 Err(msg) => rpc_error(-32602, &msg, id),
@@ -19611,6 +19656,150 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_number_based_cchain_lookups_reject_orphaned_blocks_above_tip() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let first_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x91; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let first_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":32}}"#,
+            first_signed.raw_hex()
+        );
+        let first_submit_response = handle_rpc_request(&first_submit_req, &node).await;
+        let first_submit_json: serde_json::Value =
+            serde_json::from_str(&first_submit_response).unwrap();
+        assert!(first_submit_json.get("result").is_some());
+
+        let first_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let first_block = build_cchain_block(&node, 1, first_pool_txs.clone())
+            .await
+            .expect("first block should build");
+        let mut first_key = Vec::with_capacity(34);
+        first_key.extend_from_slice(b"c:");
+        first_key.extend_from_slice(&first_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &first_key, &first_block.raw)
+            .unwrap();
+        node.db
+            .put_block(first_block.number, &first_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &first_block, &first_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(first_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &first_pool_txs).await;
+
+        let second_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x92; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let second_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":33}}"#,
+            second_signed.raw_hex()
+        );
+        let second_submit_response = handle_rpc_request(&second_submit_req, &node).await;
+        let second_submit_json: serde_json::Value =
+            serde_json::from_str(&second_submit_response).unwrap();
+        assert!(second_submit_json.get("result").is_some());
+
+        let second_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let second_block = build_cchain_block(&node, 2, second_pool_txs.clone())
+            .await
+            .expect("second block should build");
+        let mut second_key = Vec::with_capacity(34);
+        second_key.extend_from_slice(b"c:");
+        second_key.extend_from_slice(&second_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &second_key, &second_block.raw)
+            .unwrap();
+        node.db
+            .put_block(second_block.number, &second_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &second_block, &second_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(second_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &second_pool_txs).await;
+
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let block_by_number_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x2",true],"id":34}"#;
+        let block_by_number_response = handle_rpc_request(block_by_number_req, &node).await;
+        let block_by_number_json: serde_json::Value =
+            serde_json::from_str(&block_by_number_response).unwrap();
+        assert_eq!(block_by_number_json["result"], serde_json::Value::Null);
+
+        let count_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getBlockTransactionCountByNumber","params":["0x2"],"id":35}"#;
+        let count_by_number_response = handle_rpc_request(count_by_number_req, &node).await;
+        let count_by_number_json: serde_json::Value =
+            serde_json::from_str(&count_by_number_response).unwrap();
+        assert_eq!(count_by_number_json["result"], serde_json::Value::Null);
+
+        let tx_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getTransactionByBlockNumberAndIndex","params":["0x2","0x0"],"id":36}"#;
+        let tx_by_number_response = handle_rpc_request(tx_by_number_req, &node).await;
+        let tx_by_number_json: serde_json::Value =
+            serde_json::from_str(&tx_by_number_response).unwrap();
+        assert_eq!(tx_by_number_json["result"], serde_json::Value::Null);
+
+        let raw_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getRawTransactionByBlockNumberAndIndex","params":["0x2","0x0"],"id":37}"#;
+        let raw_by_number_response = handle_rpc_request(raw_by_number_req, &node).await;
+        let raw_by_number_json: serde_json::Value =
+            serde_json::from_str(&raw_by_number_response).unwrap();
+        assert_eq!(raw_by_number_json["result"], serde_json::Value::Null);
+
+        let debug_block_req =
+            r#"{"jsonrpc":"2.0","method":"debug_getBlockByNumber","params":["0x2"],"id":38}"#;
+        let debug_block_response = handle_rpc_request(debug_block_req, &node).await;
+        let debug_block_json: serde_json::Value =
+            serde_json::from_str(&debug_block_response).unwrap();
+        assert_eq!(debug_block_json["result"], serde_json::Value::Null);
+
+        let debug_trace_block_req =
+            r#"{"jsonrpc":"2.0","method":"debug_traceBlockByNumber","params":["0x2",{}],"id":39}"#;
+        let debug_trace_block_response = handle_rpc_request(debug_trace_block_req, &node).await;
+        let debug_trace_block_json: serde_json::Value =
+            serde_json::from_str(&debug_trace_block_response).unwrap();
+        assert_eq!(
+            debug_trace_block_json["error"]["message"],
+            "block #2 not found"
+        );
+
+        let block_receipts_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockReceipts","params":["0x2"],"id":40}"#;
+        let block_receipts_response = handle_rpc_request(block_receipts_req, &node).await;
+        let block_receipts_json: serde_json::Value =
+            serde_json::from_str(&block_receipts_response).unwrap();
+        assert_eq!(block_receipts_json["result"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn test_eth_block_transaction_count_and_raw_index_lookups() {
         let node = make_test_node(1);
         let wallet = avalanche_rs::tx::Wallet::random(43114);
@@ -21263,6 +21452,54 @@ mod integration_tests {
             call_json["error"]["message"],
             "historical state query not allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_historical_state_queries_reject_orphaned_blocks_above_tip() {
+        let node = make_test_archive_node(1);
+        let account = [0x7C; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x0C; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x0D; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 1,
+                    balance: 111,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 2,
+                    balance: 222,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0x2"],"id":57}}"#,
+            hex::encode(account)
+        );
+        let balance_response = handle_rpc_request(&balance_req, &node).await;
+        let balance_json: serde_json::Value = serde_json::from_str(&balance_response).unwrap();
+        assert_eq!(balance_json["error"]["message"], "block #2 not found");
     }
 
     #[tokio::test]
