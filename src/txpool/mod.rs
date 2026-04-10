@@ -55,6 +55,8 @@ impl PoolTransaction {
 
 /// Maximum transactions per account.
 const DEFAULT_MAX_PER_ACCOUNT: usize = 64;
+/// Required fee bump percentage for same-nonce replacement.
+const REPLACEMENT_BUMP_PERCENT: u128 = 10;
 
 /// Transaction pool with EIP-1559 aware priority ordering.
 pub struct TransactionPool {
@@ -97,12 +99,29 @@ impl TransactionPool {
     }
 
     /// Add a transaction to the pool.
-    /// Returns Ok(true) if added, Ok(false) if replaced existing, Err if rejected.
+    /// Returns Ok(true) if newly added, Ok(false) if duplicate/replaced, Err if rejected.
     pub fn add(&mut self, tx: PoolTransaction, account_nonce: u64) -> Result<bool, PoolError> {
-        // Check per-account limit
-        let account_count = self.account_tx_count(&tx.from);
-        if account_count >= self.max_per_account {
-            return Err(PoolError::AccountLimitReached(self.max_per_account));
+        let existing = self.get_by_sender_nonce(&tx.from, tx.nonce).cloned();
+        let is_duplicate = existing
+            .as_ref()
+            .is_some_and(|current| current.hash == tx.hash);
+
+        if existing.is_none() {
+            let account_count = self.account_tx_count(&tx.from);
+            if account_count >= self.max_per_account {
+                return Err(PoolError::AccountLimitReached(self.max_per_account));
+            }
+        }
+
+        if is_duplicate {
+            return Ok(false);
+        }
+
+        if let Some(current) = existing.as_ref() {
+            if !replacement_fee_bumped(&tx, current) {
+                return Err(PoolError::UnderpricedReplacement);
+            }
+            let _ = self.remove(&current.hash);
         }
 
         // Determine if pending or queued based on nonce
@@ -116,9 +135,6 @@ impl TransactionPool {
         let nonce = tx.nonce;
         let hash = tx.hash;
 
-        // Check for replacement
-        let replaced = self.by_hash.contains_key(&hash);
-
         if is_pending {
             self.pending.entry(from).or_default().insert(nonce, tx);
             self.by_hash.insert(hash, (from, nonce, true));
@@ -127,8 +143,8 @@ impl TransactionPool {
             self.by_hash.insert(hash, (from, nonce, false));
         }
 
-        if !replaced {
-            self.total_count += 1;
+        self.total_count += 1;
+        if existing.is_none() {
             self.adds += 1;
         }
 
@@ -140,7 +156,7 @@ impl TransactionPool {
         // Try to promote queued → pending
         self.promote_queued(&from, account_nonce);
 
-        Ok(!replaced)
+        Ok(existing.is_none())
     }
 
     /// Remove a transaction by hash.
@@ -394,6 +410,16 @@ impl TransactionPool {
     }
 }
 
+fn replacement_fee_bumped(new: &PoolTransaction, old: &PoolTransaction) -> bool {
+    exceeds_replacement_bump(new.max_fee_per_gas, old.max_fee_per_gas)
+        && exceeds_replacement_bump(new.max_priority_fee_per_gas, old.max_priority_fee_per_gas)
+}
+
+fn exceeds_replacement_bump(new_fee: u128, old_fee: u128) -> bool {
+    let threshold = old_fee.saturating_mul(100 + REPLACEMENT_BUMP_PERCENT) / 100;
+    new_fee > threshold
+}
+
 fn pool_tx_info(tx: &PoolTransaction) -> PoolTxInfo {
     PoolTxInfo {
         hash: format!("0x{}", hex::encode(tx.hash)),
@@ -509,6 +535,57 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert!(pool.get(&hash).is_some());
         assert_eq!(pool.get(&hash).unwrap().nonce, 0);
+    }
+
+    #[test]
+    fn test_same_hash_duplicate_is_noop() {
+        let mut pool = TransactionPool::new(100);
+        let tx = make_tx(0x01, 0, 100, 10);
+        let hash = tx.hash;
+
+        assert!(pool.add(tx.clone(), 0).unwrap());
+        assert!(!pool.add(tx, 0).unwrap());
+
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.status().total, 1);
+        assert_eq!(pool.get(&hash).unwrap().max_fee_per_gas, 100);
+    }
+
+    #[test]
+    fn test_same_nonce_replacement_requires_fee_bump() {
+        let mut pool = TransactionPool::new(100);
+        let original = make_tx(0x01, 0, 100, 100);
+        let mut underpriced = make_tx(0x01, 0, 110, 110);
+        underpriced.hash[31] = 0xAA;
+
+        assert!(pool.add(original, 0).unwrap());
+        let err = pool.add(underpriced, 0).unwrap_err();
+        assert!(matches!(err, PoolError::UnderpricedReplacement));
+
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.status().total, 1);
+    }
+
+    #[test]
+    fn test_same_nonce_replacement_replaces_hash_index_cleanly() {
+        let mut pool = TransactionPool::new(100);
+        let original = make_tx(0x01, 0, 100, 100);
+        let original_hash = original.hash;
+        let mut replacement = make_tx(0x01, 0, 111, 111);
+        replacement.hash[31] = 0xBB;
+        let replacement_hash = replacement.hash;
+
+        assert!(pool.add(original, 0).unwrap());
+        assert!(!pool.add(replacement, 0).unwrap());
+
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.status().total, 1);
+        assert!(pool.get(&original_hash).is_none());
+        assert_eq!(pool.get(&replacement_hash).unwrap().max_fee_per_gas, 111);
+        assert_eq!(
+            pool.get_by_sender_nonce(&[0x01; 20], 0).unwrap().hash,
+            replacement_hash
+        );
     }
 
     #[test]

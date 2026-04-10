@@ -4970,7 +4970,7 @@ async fn rpc_resend_transaction(
             let replacement_fee = gas_price_override.unwrap_or(existing.max_fee_per_gas);
             RpcManagedTxEnvelope::Eip1559(Eip1559Tx {
                 nonce,
-                max_priority_fee_per_gas: replacement_fee.min(existing.max_priority_fee_per_gas),
+                max_priority_fee_per_gas: replacement_fee,
                 max_fee_per_gas: replacement_fee,
                 gas_limit: gas_limit_override.unwrap_or(existing.gas_limit),
                 to: existing.to,
@@ -10978,13 +10978,6 @@ async fn submit_raw_cchain_transaction(
     }
 
     let mut txpool = node.txpool.write().await;
-    if let Some(existing) = txpool.get_by_sender_nonce(&from, parsed.nonce) {
-        if existing.hash == tx_hash {
-            return Ok(tx_hash);
-        }
-        return Err("replacement transaction not supported".to_string());
-    }
-
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -11005,9 +10998,7 @@ async fn submit_raw_cchain_transaction(
         timestamp,
     };
 
-    txpool
-        .add(tx, account_nonce)
-        .map_err(|e| format!("transaction rejected: {}", e))?;
+    txpool.add(tx, account_nonce).map_err(|e| e.to_string())?;
     drop(txpool);
 
     record_pending_filter_event(tx_hash).await;
@@ -18562,7 +18553,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_eth_send_raw_transaction_rejects_same_nonce_replacement() {
+    async fn test_eth_send_raw_transaction_accepts_same_nonce_replacement_with_fee_bump() {
         let node = make_test_node(1);
         let wallet = avalanche_rs::tx::Wallet::random(43114);
 
@@ -18602,12 +18593,68 @@ mod integration_tests {
         let second_response = handle_rpc_request(&second_req, &node).await;
         let second_json: serde_json::Value = serde_json::from_str(&second_response).unwrap();
         assert_eq!(
-            second_json["error"]["message"],
-            "replacement transaction not supported"
+            second_json["result"],
+            format!("0x{}", hex::encode(keccak_tx_hash(&second_signed.raw)))
         );
 
         let pool = node.txpool.read().await;
         assert_eq!(pool.len(), 1);
+        let pooled = pool
+            .get(&keccak_tx_hash(&second_signed.raw))
+            .expect("replacement tx should be stored in txpool");
+        assert_eq!(pooled.value, 2);
+        assert!(pool.get(&keccak_tx_hash(&first_signed.raw)).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_eth_send_raw_transaction_rejects_underpriced_same_nonce_replacement() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        let first = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0x56; 20]),
+            value: 1,
+            data: vec![],
+        };
+        let second = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 27_500_000_000,
+            gas_limit: 21_000,
+            to: Some([0x56; 20]),
+            value: 2,
+            data: vec![],
+        };
+
+        let first_signed = wallet.sign_legacy(&first).expect("first tx should sign");
+        let second_signed = wallet.sign_legacy(&second).expect("second tx should sign");
+
+        let first_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":12}}"#,
+            first_signed.raw_hex()
+        );
+        let second_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":13}}"#,
+            second_signed.raw_hex()
+        );
+
+        let first_response = handle_rpc_request(&first_req, &node).await;
+        let first_json: serde_json::Value = serde_json::from_str(&first_response).unwrap();
+        assert!(first_json.get("result").is_some());
+
+        let second_response = handle_rpc_request(&second_req, &node).await;
+        let second_json: serde_json::Value = serde_json::from_str(&second_response).unwrap();
+        assert_eq!(
+            second_json["error"]["message"],
+            "replacement tx underpriced"
+        );
+
+        let pool = node.txpool.read().await;
+        assert_eq!(pool.len(), 1);
+        assert!(pool.get(&keccak_tx_hash(&first_signed.raw)).is_some());
+        assert!(pool.get(&keccak_tx_hash(&second_signed.raw)).is_none());
     }
 
     #[tokio::test]
@@ -19547,6 +19594,51 @@ mod integration_tests {
         let replacement = pool.get(&replacement_hash).unwrap();
         assert_eq!(replacement.gas_limit, 30_000);
         assert_eq!(replacement.max_fee_per_gas, 2_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_eth_resend_replaces_managed_eip1559_transaction() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        PENDING_FILTER_EVENTS.write().await.clear();
+        NEXT_PENDING_FILTER_EVENT_ID.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let wallet = Wallet::from_hex(
+            "0x8f2a5594906d42f2b7d3b913f5cf2c1e0ed6f3d1063f4042afe7f18413cf5df2",
+            43114,
+        )
+        .unwrap();
+        let node = make_test_node_with_rpc_wallets(1, vec![wallet.clone()]);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let send_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendTransaction","params":[{{"from":"{}","to":"0x{}","value":"0x3","maxFeePerGas":"0x5d21dba00","maxPriorityFeePerGas":"0x3b9aca00","nonce":"0x0","gas":"0x5208"}}],"id":51}}"#,
+            wallet.address_hex(),
+            hex::encode([0x57; 20])
+        );
+        let send_response = handle_rpc_request(&send_req, &node).await;
+        let send_json: serde_json::Value = serde_json::from_str(&send_response).unwrap();
+        let first_hash = parse_hex_hash(send_json["result"].as_str().unwrap()).unwrap();
+
+        let resend_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_resend","params":[{{"from":"{}","to":"0x{}","value":"0x3","data":"0x","nonce":"0x0"}},"0x77359400","0x7530"],"id":52}}"#,
+            wallet.address_hex(),
+            hex::encode([0x57; 20])
+        );
+        let resend_response = handle_rpc_request(&resend_req, &node).await;
+        let resend_json: serde_json::Value = serde_json::from_str(&resend_response).unwrap();
+        let replacement_hash = parse_hex_hash(resend_json["result"].as_str().unwrap()).unwrap();
+
+        assert_ne!(replacement_hash, first_hash);
+        let pool = node.txpool.read().await;
+        assert!(pool.get(&first_hash).is_none());
+        let replacement = pool.get(&replacement_hash).unwrap();
+        assert_eq!(replacement.gas_limit, 30_000);
+        assert_eq!(replacement.max_fee_per_gas, 2_000_000_000);
+        assert_eq!(replacement.max_priority_fee_per_gas, 2_000_000_000);
     }
 
     #[tokio::test]
