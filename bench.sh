@@ -177,6 +177,22 @@ http_time_ms() {
   fi
 }
 
+sleep_remaining_from_start() {
+  local start_ns="$1"
+  local duration_secs="$2"
+  local now_ns
+  now_ns="$(date +%s%N)"
+  local elapsed_ns=$((now_ns - start_ns))
+  local target_ns=$((duration_secs * 1000000000))
+  if [ "$elapsed_ns" -lt "$target_ns" ]; then
+    local remaining_ns=$((target_ns - elapsed_ns))
+    awk -v ns="$remaining_ns" 'BEGIN { printf "%.3f", ns / 1000000000 }' | {
+      read -r sleep_secs
+      sleep "$sleep_secs"
+    }
+  fi
+}
+
 json_field() {
   local input="$1"
   local filter="$2"
@@ -224,7 +240,7 @@ run_avalanche_rs() {
   handshake_ms="$(wait_for_log_pattern "$log_file" "Handshake complete|TLS handshake complete" 60 "$start_ns")"
   wait_for_http "http://127.0.0.1:${http_port}/ext/health" 120 || true
 
-  sleep "$DURATION"
+  sleep_remaining_from_start "$start_ns" "$DURATION"
 
   local c_url="http://127.0.0.1:${http_port}/ext/bc/C/rpc"
   local p_url="http://127.0.0.1:${http_port}/ext/bc/P"
@@ -340,7 +356,7 @@ run_avalanchego() {
   handshake_ms="$(wait_for_log_pattern "$log_file" "connected to|handshake" 120 "$start_ns")"
   wait_for_http "http://127.0.0.1:${http_port}/ext/health" 180 || true
 
-  sleep "$DURATION"
+  sleep_remaining_from_start "$start_ns" "$DURATION"
 
   local c_url="http://127.0.0.1:${http_port}/ext/bc/C/rpc"
   local p_url="http://127.0.0.1:${http_port}/ext/bc/P"

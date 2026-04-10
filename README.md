@@ -11,14 +11,14 @@ Tested on Fuji testnet, **5 minutes each**, on `Darwin arm64` (2026-04-10):
 | Metric | avalanche-rs | AvalancheGo v1.14.2 |
 |--------|-------------|----------------------|
 | Binary size | 10,272 KB | 88,968 KB |
-| Final RSS | 21,584 KB | 39,008 KB |
-| Peak RSS | 22,896 KB | 77,040 KB |
+| Final RSS | 12,848 KB | 75,696 KB |
+| Peak RSS | 121,936 KB | 91,264 KB |
 | P-Chain bootstrapped | `true` | `false` |
-| C-Chain block number | `0x0` | `null` |
-| Peer count | `null` | `42` |
-| Health endpoint healthy | `null` | `false` |
+| C-Chain block number | `0x336e5ac` | `null` |
+| Peer count | `1` | `42` |
+| Health endpoint healthy | `false` | `false` |
 
-This run is useful as a production smoke benchmark, not a victory lap. `avalanche-rs` stayed much smaller and answered part of the C-Chain RPC slice inside 5 minutes, but the same run also exposed real parity bugs: `platform.getHeight` returned an impossible value, `info.peers` was not usable in-window, `/ext/health` was not usable in-window, and C-Chain stayed at `0x0`.
+This run is useful as a production smoke benchmark, not a victory lap. `avalanche-rs` now reports sane P-Chain height, usable peers/health, and non-zero C-Chain head progress inside 5 minutes. It still reports unhealthy readiness because C-Chain cold start is header-only until full state sync is implemented.
 
 > Full benchmark details: [`BENCHMARK.md`](BENCHMARK.md)
 >

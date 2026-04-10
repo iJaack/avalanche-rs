@@ -22,7 +22,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use alloy_primitives::U256;
@@ -45,8 +45,9 @@ use tracing_subscriber::{reload, EnvFilter, Registry};
 
 use avalanche_rs::archive::ArchiveStore;
 use avalanche_rs::block::{
-    extract_cchain_atomic_transactions, extract_cchain_block_fields, extract_cchain_transactions,
-    parse_raw_cchain_transaction, BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
+    cchain_block_id, extract_cchain_atomic_transactions, extract_cchain_block_fields,
+    extract_cchain_transactions, parse_cchain_network_block, parse_raw_cchain_transaction,
+    BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
 };
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{
@@ -399,6 +400,7 @@ struct ChainMetrics {
     pub tip_height: u64,
     pub tip_hash: [u8; 32],
     pub chain_length: u64,
+    pub headers_only: bool,
     pub canonical_switches: u64,
     pub last_canonical_switch_height: u64,
     pub last_sync_time: Instant,
@@ -424,6 +426,7 @@ impl Default for ChainMetrics {
             tip_height: 0,
             tip_hash: [0u8; 32],
             chain_length: 0,
+            headers_only: false,
             canonical_switches: 0,
             last_canonical_switch_height: 0,
             last_sync_time: Instant::now(),
@@ -795,6 +798,9 @@ struct NodeState {
     evm: Arc<RwLock<EvmExecutor>>,
     sync_engine: Arc<SyncEngine>,
     peer_manager: Arc<RwLock<PeerManager>>,
+    /// Best-effort connected-peer snapshot for read APIs that must not block on
+    /// the hot peer-manager write path.
+    peer_snapshot: Arc<StdRwLock<Vec<Peer>>>,
     config: Cli,
     start_time: Instant,
     validators: std::collections::HashMap<String, ValidatorInfo>,
@@ -1186,6 +1192,7 @@ async fn main() {
         evm,
         sync_engine: sync_engine.clone(),
         peer_manager,
+        peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
         config: cli,
         start_time: Instant::now(),
         validators,
@@ -1492,6 +1499,7 @@ async fn handle_inbound_connection(
     peer.state = PeerState::Connected;
     let reputation = peer.reputation;
     if pm.add_peer(peer).is_ok() {
+        refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
         persist_connected_peer(&node, &peer_node_id, peer_addr, reputation, 0);
     }
 }
@@ -2150,6 +2158,7 @@ async fn connect_and_handshake_with_timeouts(
     peer.reported_uptime = peer_reported_uptime;
     peer.is_validator = false;
     if let Ok(()) = pm.add_peer(peer) {
+        refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
         info!("Peer {} registered (NodeID: {})", addr, peer_node_id);
         persist_connected_peer(
             &node,
@@ -2351,6 +2360,7 @@ async fn connect_and_handshake_with_timeouts(
                                                 {
                                                     peer.reported_uptime = uptime;
                                                 }
+                                                refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
                                                 drop(pm);
                                                 let pong = NetworkMessage::Pong { uptime };
                                                 if let Ok(encoded) = pong.encode_proto() {
@@ -2537,12 +2547,20 @@ async fn connect_and_handshake_with_timeouts(
                                                 let _ = chain_id;
                                             }
                                             NetworkMessage::Ancestors { request_id, containers, chain_id } => {
-                                                let total_bytes: usize = containers.iter().map(|c| c.len()).sum();
                                                 let is_cchain = chain_id.0 == cchain_id;
+                                                let decoded_cchain_containers = is_cchain
+                                                    .then(|| expand_cchain_ancestor_containers(&containers));
+                                                let effective_containers = decoded_cchain_containers
+                                                    .as_ref()
+                                                    .unwrap_or(&containers);
+                                                let total_bytes: usize = effective_containers
+                                                    .iter()
+                                                    .map(|c| c.len())
+                                                    .sum();
                                                 info!(
                                                     "{} Ancestors from {} — {} containers, {} bytes total",
                                                     if is_cchain { "C-Chain" } else { "P-Chain" },
-                                                    addr, containers.len(), total_bytes
+                                                    addr, effective_containers.len(), total_bytes
                                                 );
 
                                                 if is_cchain {
@@ -2555,6 +2573,7 @@ async fn connect_and_handshake_with_timeouts(
 
                                                     if let Some((req, depth, prev_total)) = expected_req {
                                                         if request_id == req {
+                                                            let containers = effective_containers;
                                                             if let Some(target_id) = cchain_ancestors_target {
                                                                 if let Err(e) = SyncEngine::validate_cchain_ancestor_chain(&containers, target_id) {
                                                                     warn!("C-Chain Bootstrap: invalid ancestor hash chain: {}", e);
@@ -2564,61 +2583,67 @@ async fn connect_and_handshake_with_timeouts(
                                                             }
 
                                                             let mut stored = 0u32;
-                                                            let mut oldest_container: Option<Vec<u8>> = None;
+                                                            let mut oldest_block: Option<avalanche_rs::block::CChainNetworkBlock> = None;
 
-                                                            for container in &containers {
+                                                            for container in containers {
+                                                                let parsed_block = parse_cchain_network_block(container);
+                                                                let inner_block = parsed_block
+                                                                    .as_ref()
+                                                                    .map(|block| block.inner_block.as_slice())
+                                                                    .unwrap_or(container.as_slice());
                                                                 // Debug: log first C-Chain block format once
                                                                 if !cchain_debug_logged {
                                                                     cchain_debug_logged = true;
-                                                                    let preview_len = container.len().min(20);
+                                                                    let preview_len = inner_block.len().min(20);
                                                                     info!(
                                                                         "C-Chain block format debug: first {} bytes = {:02x?} (total {} bytes)",
-                                                                        preview_len, &container[..preview_len], container.len()
+                                                                        preview_len, &inner_block[..preview_len], inner_block.len()
                                                                     );
-                                                                    if container.len() >= 2 {
-                                                                        if container[0] == 0x00 && container[1] == 0x00 {
+                                                                    if inner_block.len() >= 2 {
+                                                                        if inner_block[0] == 0x00 && inner_block[1] == 0x00 {
                                                                             info!("C-Chain block: detected Avalanche codec wrapper (0x00 0x00 prefix)");
-                                                                        } else if container[0] >= 0xf8 {
-                                                                            info!("C-Chain block: detected raw RLP long list (0x{:02x} prefix)", container[0]);
-                                                                        } else if container[0] >= 0xc0 {
-                                                                            info!("C-Chain block: detected raw RLP short list (0x{:02x} prefix)", container[0]);
+                                                                        } else if inner_block[0] >= 0xf8 {
+                                                                            info!("C-Chain block: detected raw RLP long list (0x{:02x} prefix)", inner_block[0]);
+                                                                        } else if inner_block[0] >= 0xc0 {
+                                                                            info!("C-Chain block: detected raw RLP short list (0x{:02x} prefix)", inner_block[0]);
                                                                         } else {
-                                                                            warn!("C-Chain block: unexpected format — first byte 0x{:02x}", container[0]);
+                                                                            warn!("C-Chain block: unexpected format — first byte 0x{:02x}", inner_block[0]);
                                                                         }
                                                                     }
                                                                 }
 
-                                                                let mut hasher = Sha256::new();
-                                                                hasher.update(container);
-                                                                let hash: [u8; 32] = hasher.finalize().into();
+                                                                let hash = cchain_block_hash(inner_block);
                                                                 // Prefix C-Chain keys with "c:" to distinguish from P-Chain
                                                                 let mut key = Vec::with_capacity(34);
                                                                 key.extend_from_slice(b"c:");
                                                                 key.extend_from_slice(&hash);
-                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, container) {
+                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, inner_block) {
                                                                     warn!("C-Chain: failed to store block {:02x?}: {}", &hash[..4], e);
                                                                 } else {
                                                                     stored += 1;
                                                                     // Store stateRoot → block_hash mapping
-                                                                    if let Some(state_root) = avalanche_rs::block::BlockHeader::extract_state_root(container) {
+                                                                    if let Some(state_root) = avalanche_rs::block::BlockHeader::extract_state_root(inner_block) {
                                                                         if let Err(e) = node.db.put_cf(CF_STATE_ROOTS, &state_root, &hash) {
                                                                             debug!("state_root store failed: {}", e);
                                                                         }
                                                                     }
                                                                     // Execute block through EVM and store receipts
                                                                     execute_cchain_block_and_store(
-                                                                        container,
+                                                                        inner_block,
                                                                         &node,
+                                                                        CChainImportMode::BootstrapAllowHeaderOnly,
                                                                     ).await;
                                                                     // Index block for PostgreSQL analytics
                                                                     #[cfg(feature = "indexer")]
                                                                     if let Some(ref indexer) = node.indexer {
-                                                                        if let Some(indexed) = build_indexed_cchain_block(container, &hash) {
+                                                                        if let Some(indexed) = build_indexed_cchain_block(inner_block, &hash) {
                                                                             indexer.index_block(indexed).await;
                                                                         }
                                                                     }
                                                                 }
-                                                                oldest_container = Some(container.clone());
+                                                                oldest_block = parsed_block
+                                                                    .clone()
+                                                                    .or_else(|| parse_cchain_network_block(inner_block));
                                                             }
 
                                                             let new_total = prev_total + stored;
@@ -2636,25 +2661,23 @@ async fn connect_and_handshake_with_timeouts(
                                                             // Use block parser to determine if oldest block is genesis
                                                             // (handles both raw RLP and Avalanche-wrapped format)
                                                             let should_recurse = depth < 10
-                                                                && oldest_container.as_ref().is_some_and(|c| {
-                                                                    match avalanche_rs::block::BlockHeader::parse(c, avalanche_rs::block::Chain::CChain) {
+                                                                && oldest_block.as_ref().is_some_and(|block| {
+                                                                    match avalanche_rs::block::BlockHeader::parse(&block.inner_block, avalanche_rs::block::Chain::CChain) {
                                                                         Ok(h) => !h.is_genesis(),
-                                                                        Err(_) => !c.is_empty() && c[0] >= 0xc0,
+                                                                        Err(_) => !block.inner_block.is_empty() && block.inner_block[0] >= 0xc0,
                                                                     }
                                                                 });
 
                                                             if should_recurse {
-                                                                let oldest = oldest_container.unwrap();
-                                                                let mut hasher = Sha256::new();
-                                                                hasher.update(&oldest);
-                                                                let oldest_id: [u8; 32] = hasher.finalize().into();
+                                                                let oldest = oldest_block.unwrap();
+                                                                let oldest_parent = oldest.parent_id;
                                                                 let new_req = req + 1;
                                                                 let new_depth = depth + 1;
                                                                 let get_ancestors = NetworkMessage::GetAncestors {
                                                                     chain_id: ChainId(cchain_id),
                                                                     request_id: new_req,
                                                                     deadline: 5_000_000_000u64,
-                                                                    container_id: BlockId(oldest_id),
+                                                                    container_id: BlockId(oldest_parent),
                                                                     max_containers_size: 2_000_000,
                                                                 };
                                                                 if let Ok(encoded) = get_ancestors.encode_proto() {
@@ -2664,7 +2687,7 @@ async fn connect_and_handshake_with_timeouts(
                                                                             "C-Chain Bootstrap: recursive GetAncestors depth={} req={} (total: {})",
                                                                             new_depth, new_req, new_total
                                                                         );
-                                                                        cchain_ancestors_target = Some(oldest_id);
+                                                                        cchain_ancestors_target = Some(oldest_parent);
                                                                         cchain_bootstrap_state = CChainBootstrapState::FetchingAncestors {
                                                                             req: new_req,
                                                                             depth: new_depth,
@@ -2888,9 +2911,7 @@ async fn connect_and_handshake_with_timeouts(
                                                         || (container.len() >= 6 && container[0] == 0x00 && container[1] == 0x00));
                                                 if is_cchain_block && matches!(bootstrap_state, BootstrapState::Done) {
                                                     // Store the new block
-                                                    let mut h = sha2::Sha256::new();
-                                                    sha2::Digest::update(&mut h, &container);
-                                                    let hash: [u8; 32] = sha2::Digest::finalize(h).into();
+                                                    let hash = cchain_block_hash(&container);
                                                     let mut key = Vec::with_capacity(34);
                                                     key.extend_from_slice(b"c:");
                                                     key.extend_from_slice(&hash);
@@ -2899,6 +2920,7 @@ async fn connect_and_handshake_with_timeouts(
                                                     execute_cchain_block_and_store(
                                                         &container,
                                                         &node,
+                                                        CChainImportMode::Strict,
                                                     ).await;
                                                     if let Some(fields) = extract_cchain_block_fields(&container) {
                                                         info!("Following: new C-Chain block #{} via PushQuery from {}", fields.number, addr);
@@ -2975,6 +2997,7 @@ async fn connect_and_handshake_with_timeouts(
     // Remove peer on disconnect
     let mut pm = node.peer_manager.write().await;
     pm.remove_peer(&peer_node_id);
+    refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
     warn!("Peer {} disconnected", addr);
 
     Ok(())
@@ -3328,7 +3351,6 @@ async fn build_cchain_block(
     block_number: u64,
     txs: Vec<PoolTransaction>,
 ) -> Result<BuiltBlock, Box<dyn std::error::Error + Send + Sync>> {
-    use sha2::{Digest, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let timestamp = SystemTime::now()
@@ -3400,10 +3422,8 @@ async fn build_cchain_block(
         &txs,
     );
 
-    // Compute block ID = SHA-256 of raw bytes
-    let mut hasher = Sha256::new();
-    hasher.update(&raw);
-    let id: [u8; 32] = hasher.finalize().into();
+    // Coreth/AvalancheGo use the Ethereum block hash as the C-Chain block ID.
+    let id = cchain_block_hash(&raw);
 
     // Sign with BLS key
     let bls_signature = node.identity.sign_block_bls(&id);
@@ -3690,17 +3710,65 @@ fn build_indexed_pchain_block(container: &[u8], block_id: &[u8; 32]) -> Option<I
 // C-Chain EVM execution helper
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CChainImportMode {
+    Strict,
+    BootstrapAllowHeaderOnly,
+}
+
+async fn import_cchain_block_header_only(raw_block: &[u8], node: &NodeState) -> Result<(), String> {
+    let fields = extract_cchain_block_fields(raw_block)
+        .ok_or_else(|| "cannot parse block fields".to_string())?;
+    let block_hash = cchain_block_hash(raw_block);
+
+    let mut key = Vec::with_capacity(34);
+    key.extend_from_slice(b"c:");
+    key.extend_from_slice(&block_hash);
+    node.db
+        .put_cf(CF_BLOCKS, &key, raw_block)
+        .map_err(|e| format!("failed to store header-only C-Chain block hash entry: {e}"))?;
+
+    clear_canonical_cchain_tx_artifacts(&node.db, fields.number)
+        .map_err(|e| format!("failed to clear canonical tx artifacts: {e}"))?;
+
+    node.db
+        .put_block(fields.number, raw_block)
+        .map_err(|e| format!("failed to store header-only C-Chain block by height: {e}"))?;
+
+    let mut canonical_height = current_cchain_height(node);
+    if fields.number > canonical_height {
+        node.db
+            .set_last_accepted_height(fields.number)
+            .map_err(|e| format!("failed to advance header-only C-Chain head: {e}"))?;
+        canonical_height = fields.number;
+    }
+
+    let mut metrics = node.c_chain_metrics.write().await;
+    if fields.number == canonical_height {
+        update_canonical_chain_metrics(&mut metrics, canonical_height, block_hash);
+    }
+    metrics.headers_only = true;
+    drop(metrics);
+
+    refresh_txpool_base_fee(node).await;
+    Ok(())
+}
+
 /// Execute a downloaded C-Chain block through the EVM and persist receipts.
 ///
 /// Extracts transactions from the raw RLP block, runs them through the in-memory
 /// EVM executor, and stores receipts in CF_RECEIPTS keyed by `(block_height, tx_idx)`.
 /// The EVM state is cumulative across blocks within a single peer session.
-async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
+async fn execute_cchain_block_and_store(
+    raw_block: &[u8],
+    node: &NodeState,
+    mode: CChainImportMode,
+) -> bool {
     let fields = match extract_cchain_block_fields(raw_block) {
         Some(f) => f,
         None => {
             record_bad_cchain_block(node, raw_block, None, "invalid c-chain block", Vec::new());
-            return;
+            return false;
         }
     };
     let expected_state_root = BlockHeader::extract_state_root(raw_block);
@@ -3722,8 +3790,22 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                     hex::encode(computed)
                 );
                 debug!("C-Chain #{} {}", fields.number, reason);
+                if mode == CChainImportMode::BootstrapAllowHeaderOnly {
+                    if let Err(import_err) = import_cchain_block_header_only(raw_block, node).await
+                    {
+                        record_bad_cchain_block(
+                            node,
+                            raw_block,
+                            Some(fields.number),
+                            format!("{reason}; header-only import failed: {import_err}"),
+                            Vec::new(),
+                        );
+                        return false;
+                    }
+                    return true;
+                }
                 record_bad_cchain_block(node, raw_block, Some(fields.number), reason, Vec::new());
-                return;
+                return false;
             }
         }
 
@@ -3762,11 +3844,12 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
         let mut m = node.c_chain_metrics.write().await;
         if fields.number == canonical_height {
             update_canonical_chain_metrics(&mut m, canonical_height, block_hash);
+            m.headers_only = false;
         }
         drop(m);
         refresh_txpool_base_fee(node).await;
         websocket_broadcast_cchain_block_events(node, raw_block, &[], &[]).await;
-        return;
+        return true;
     }
 
     let ctx = BlockContext {
@@ -3818,6 +3901,27 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                         hex::encode(block_result.state_root)
                     );
                     debug!("C-Chain #{} {}", fields.number, reason);
+                    if mode == CChainImportMode::BootstrapAllowHeaderOnly {
+                        if let Err(import_err) =
+                            import_cchain_block_header_only(raw_block, node).await
+                        {
+                            let bad_receipts = bad_block_receipt_values(
+                                &raw_txs,
+                                &block_result.receipts,
+                                &block_hash,
+                                fields.number,
+                            );
+                            record_bad_cchain_block(
+                                node,
+                                raw_block,
+                                Some(fields.number),
+                                format!("{reason}; header-only import failed: {import_err}"),
+                                bad_receipts,
+                            );
+                            return false;
+                        }
+                        return true;
+                    }
                     let bad_receipts = bad_block_receipt_values(
                         &raw_txs,
                         &block_result.receipts,
@@ -3831,7 +3935,7 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                         reason,
                         bad_receipts,
                     );
-                    return;
+                    return false;
                 }
             }
             persist_archive_state_changes(node, fields.number, &block_result.state_root, &result.1);
@@ -3895,6 +3999,7 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
             let mut m = node.c_chain_metrics.write().await;
             if fields.number == canonical_height {
                 update_canonical_chain_metrics(&mut m, canonical_height, block_hash);
+                m.headers_only = false;
             }
             drop(m);
             refresh_txpool_base_fee(node).await;
@@ -3910,9 +4015,26 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 &block_result.receipts,
             )
             .await;
+            true
         }
         Err(e) => {
             debug!("C-Chain #{} EVM execution error: {}", fields.number, e);
+            if mode == CChainImportMode::BootstrapAllowHeaderOnly {
+                if let Err(import_err) = import_cchain_block_header_only(raw_block, node).await {
+                    record_bad_cchain_block(
+                        node,
+                        raw_block,
+                        Some(fields.number),
+                        format!(
+                            "evm execution error: {}; header-only import failed: {}",
+                            e, import_err
+                        ),
+                        Vec::new(),
+                    );
+                    return false;
+                }
+                return true;
+            }
             record_bad_cchain_block(
                 node,
                 raw_block,
@@ -3920,6 +4042,7 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 format!("evm execution error: {}", e),
                 Vec::new(),
             );
+            false
         }
     }
 }
@@ -6345,21 +6468,18 @@ async fn info_is_bootstrapped(node: &NodeState, chain: &str) -> Result<bool, Str
         return Err("argument 'chain' not given".to_string());
     }
 
-    let phase = node.sync_engine.phase().await;
-    let bootstrapped = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
-    if matches!(
-        chain.to_ascii_lowercase().as_str(),
-        "p" | "platform" | "c" | "evm"
-    ) {
-        return Ok(bootstrapped);
+    match chain.to_ascii_lowercase().as_str() {
+        "p" | "platform" => return Ok(pchain_bootstrapped(node).await),
+        "c" | "evm" => return Ok(cchain_bootstrapped(node).await),
+        _ => {}
     }
 
     if let Some(chain_id) = resolve_blockchain_alias_id(node, chain).await {
         if chain_id == platform_pchain_blockchain_id() {
-            return Ok(bootstrapped);
+            return Ok(pchain_bootstrapped(node).await);
         }
         if chain_id == platform_cchain_blockchain_id(node.config.network_id) {
-            return Ok(bootstrapped);
+            return Ok(cchain_bootstrapped(node).await);
         }
 
         let tracker = node.subnet_tracker.read().await;
@@ -6538,33 +6658,6 @@ fn health_tags_include_tracked_chain(
     })
 }
 
-fn chain_health_value(
-    chain_name: &str,
-    last_accepted_height: u64,
-    last_accepted_id: [u8; 32],
-    percent_connected: f64,
-) -> serde_json::Value {
-    let _ = chain_name;
-    health_check_value(
-        Some(serde_json::json!({
-            "engine": {
-                "consensus": {
-                    "lastAcceptedHeight": last_accepted_height,
-                    "lastAcceptedID": cb58_encode_id(last_accepted_id),
-                    "longestProcessingBlock": "0s",
-                    "processingBlocks": 0,
-                },
-                "vm": serde_json::Value::Null,
-            },
-            "networking": {
-                "percentConnected": percent_connected,
-            }
-        })),
-        None,
-        Duration::ZERO,
-    )
-}
-
 async fn health_report(
     node: &NodeState,
     kind: HealthReportKind,
@@ -6577,8 +6670,8 @@ async fn health_report(
         });
     }
 
-    let phase = node.sync_engine.phase().await;
-    let is_bootstrapped = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
+    let p_bootstrapped = pchain_bootstrapped(node).await;
+    let c_bootstrapped = cchain_bootstrapped(node).await;
     let db_accessible = node.db.last_accepted_height().is_ok();
 
     let p_metrics = node.p_chain_metrics.read().await.clone();
@@ -6592,14 +6685,8 @@ async fn health_report(
         .collect::<Vec<_>>();
     drop(tracker);
 
-    let pm = node.peer_manager.read().await;
-    let connected_ids = pm.connected_peers();
-    let connected_peers = connected_ids
-        .iter()
-        .filter_map(|node_id| pm.get_peer(node_id).cloned())
-        .collect::<Vec<_>>();
+    let connected_peers = cached_connected_peers(node);
     let peer_count = connected_peers.len();
-    drop(pm);
 
     let now = Instant::now();
     let last_received = connected_peers
@@ -6621,7 +6708,24 @@ async fn health_report(
     let mut checks = serde_json::Map::new();
     let mut healthy = true;
 
-    let bootstrapped_error = if is_bootstrapped {
+    let includes_p = health_tags_include_primary_chain(
+        tags,
+        &["P", "platform"],
+        platform_pchain_blockchain_id(),
+    );
+    let includes_c = health_tags_include_primary_chain(
+        tags,
+        &["C", "evm"],
+        platform_cchain_blockchain_id(node.config.network_id),
+    );
+    let bootstrapped_for_scope = match (includes_p, includes_c) {
+        (true, true) => p_bootstrapped && c_bootstrapped,
+        (true, false) => p_bootstrapped,
+        (false, true) => c_bootstrapped,
+        (false, false) => p_bootstrapped && c_bootstrapped,
+    };
+
+    let bootstrapped_error = if bootstrapped_for_scope {
         None
     } else {
         Some("node is bootstrapping".to_string())
@@ -6680,31 +6784,64 @@ async fn health_report(
         ),
     );
 
-    if health_tags_include_primary_chain(tags, &["P", "platform"], platform_pchain_blockchain_id())
-    {
+    if includes_p {
+        if !p_bootstrapped {
+            healthy = false;
+        }
         checks.insert(
             "P".to_string(),
-            chain_health_value(
-                "P",
-                p_metrics.tip_height,
-                p_metrics.tip_hash,
-                percent_connected,
+            health_check_value(
+                Some(serde_json::json!({
+                    "engine": {
+                        "consensus": {
+                            "lastAcceptedHeight": p_metrics.tip_height,
+                            "lastAcceptedID": cb58_encode_id(p_metrics.tip_hash),
+                            "longestProcessingBlock": "0s",
+                            "processingBlocks": 0,
+                        },
+                        "vm": serde_json::Value::Null,
+                    },
+                    "networking": {
+                        "percentConnected": percent_connected,
+                    }
+                })),
+                if p_bootstrapped {
+                    None
+                } else {
+                    Some("P-Chain is bootstrapping".to_string())
+                },
+                Duration::ZERO,
             ),
         );
     }
 
-    if health_tags_include_primary_chain(
-        tags,
-        &["C", "evm"],
-        platform_cchain_blockchain_id(node.config.network_id),
-    ) {
+    if includes_c {
+        if !c_bootstrapped {
+            healthy = false;
+        }
         checks.insert(
             "C".to_string(),
-            chain_health_value(
-                "C",
-                current_cchain_height(node).max(c_metrics.tip_height),
-                c_metrics.tip_hash,
-                percent_connected,
+            health_check_value(
+                Some(serde_json::json!({
+                    "engine": {
+                        "consensus": {
+                            "lastAcceptedHeight": current_cchain_height(node).max(c_metrics.tip_height),
+                            "lastAcceptedID": cb58_encode_id(c_metrics.tip_hash),
+                            "longestProcessingBlock": "0s",
+                            "processingBlocks": 0,
+                        },
+                        "vm": serde_json::Value::Null,
+                    },
+                    "networking": {
+                        "percentConnected": percent_connected,
+                    }
+                })),
+                if c_bootstrapped {
+                    None
+                } else {
+                    Some("C-Chain is bootstrapping".to_string())
+                },
+                Duration::ZERO,
             ),
         );
     }
@@ -6909,16 +7046,76 @@ fn latest_pchain_block_metadata(db: &Database) -> Option<BlockMetadata> {
     db.iter_cf_owned(CF_BLOCKS)
         .into_iter()
         .filter(|(key, _)| !key.starts_with(b"c:") && key.len() == 32)
-        .filter_map(|(_, raw)| BlockMetadata::from_raw(&raw, Chain::PChain).ok())
+        .filter_map(|(key, raw)| {
+            let computed = sha2::Sha256::digest(&raw);
+            if computed[..] != key[..] {
+                return None;
+            }
+            BlockMetadata::from_raw(&raw, Chain::PChain).ok()
+        })
         .max_by_key(|meta| meta.height)
 }
 
 async fn current_pchain_height(node: &NodeState) -> u64 {
     let metric_height = node.p_chain_metrics.read().await.tip_height;
+    if metric_height > 0 {
+        return metric_height;
+    }
+
+    if let Some(height) = node
+        .persisted_sync_state
+        .read()
+        .await
+        .as_ref()
+        .map(|state| state.p_chain_tip_height)
+        .filter(|height| *height > 0)
+    {
+        return height;
+    }
+
     latest_pchain_block_metadata(&node.db)
         .map(|meta| meta.height)
-        .unwrap_or(metric_height)
-        .max(metric_height)
+        .unwrap_or(0)
+}
+
+fn connected_peer_snapshot_from_manager(pm: &PeerManager) -> Vec<Peer> {
+    pm.connected_peers()
+        .into_iter()
+        .filter_map(|node_id| pm.get_peer(&node_id).cloned())
+        .collect()
+}
+
+fn refresh_peer_snapshot_from_manager(pm: &PeerManager, snapshot: &StdRwLock<Vec<Peer>>) {
+    *snapshot.write().expect("peer snapshot write lock") = connected_peer_snapshot_from_manager(pm);
+}
+
+fn cached_connected_peers(node: &NodeState) -> Vec<Peer> {
+    if let Ok(pm) = node.peer_manager.try_read() {
+        let peers = connected_peer_snapshot_from_manager(&pm);
+        refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
+        peers
+    } else {
+        node.peer_snapshot
+            .read()
+            .expect("peer snapshot read lock")
+            .clone()
+    }
+}
+
+async fn pchain_bootstrapped(node: &NodeState) -> bool {
+    let phase = node.sync_engine.phase().await;
+    matches!(phase, SyncPhase::Synced | SyncPhase::Following)
+        && current_pchain_height(node).await > 0
+}
+
+async fn cchain_bootstrapped(node: &NodeState) -> bool {
+    if !pchain_bootstrapped(node).await {
+        return false;
+    }
+
+    let metrics = node.c_chain_metrics.read().await.clone();
+    let tip_height = current_cchain_height(node).max(metrics.tip_height);
+    tip_height > 0 && metrics.blocks_synced > 0 && !metrics.headers_only
 }
 
 async fn platform_current_supply_result(
@@ -10996,11 +11193,73 @@ fn load_indexed_mined_cchain_transaction(
 }
 
 fn cchain_block_hash(block_data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
+    cchain_block_id(block_data).unwrap_or_else(|| {
+        use sha2::{Digest, Sha256};
 
-    let mut hasher = Sha256::new();
-    hasher.update(block_data);
-    hasher.finalize().into()
+        let mut hasher = Sha256::new();
+        hasher.update(block_data);
+        hasher.finalize().into()
+    })
+}
+
+fn decode_coreth_block_response(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if bytes.len() < 6 {
+        return None;
+    }
+
+    let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+    if version != 0 {
+        return None;
+    }
+
+    let count = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+    if count == 0 || count > 1024 {
+        return None;
+    }
+
+    let mut offset = 6usize;
+    let mut blocks = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 4 > bytes.len() {
+            return None;
+        }
+        let block_len = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if block_len == 0 || offset + block_len > bytes.len() {
+            return None;
+        }
+        let block = bytes[offset..offset + block_len].to_vec();
+        offset += block_len;
+        if block.is_empty()
+            || !(block[0] >= 0xc0 || (block.len() >= 6 && block[0] == 0 && block[1] == 0))
+        {
+            return None;
+        }
+        blocks.push(block);
+    }
+
+    if offset != bytes.len() {
+        return None;
+    }
+
+    Some(blocks)
+}
+
+fn expand_cchain_ancestor_containers(containers: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut expanded = Vec::new();
+    for container in containers {
+        if let Some(blocks) = decode_coreth_block_response(container) {
+            expanded.extend(blocks);
+        } else {
+            expanded.push(container.clone());
+        }
+    }
+    expanded
 }
 
 fn rpc_block_from_cchain_data(
@@ -13887,17 +14146,14 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         "info.getNodeVersion" => rpc_ok(&info_get_node_version_result().to_string(), id),
 
         "info.peers" => {
-            let pm = node.peer_manager.read().await;
             let requested_node_ids = info_node_ids_param(params);
             let requested = requested_node_ids
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>();
-            let peers = pm
-                .connected_peers()
+            let peers = cached_connected_peers(node)
                 .into_iter()
-                .filter_map(|node_id| pm.get_peer(&node_id))
                 .filter(|peer| requested.is_empty() || requested.contains(&peer.node_id.0))
-                .map(info_peer_json)
+                .map(|peer| info_peer_json(&peer))
                 .collect::<Vec<_>>();
             rpc_ok(
                 &serde_json::json!({
@@ -14229,6 +14485,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id,
                 data_dir: PathBuf::from("./data/test-rpc"),
@@ -14366,6 +14623,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id,
                 data_dir: PathBuf::from("./data/test-rpc"),
@@ -14548,6 +14806,18 @@ mod integration_tests {
 
     fn make_banff_std(parent: [u8; 32], height: u64) -> Vec<u8> {
         make_banff_std_with_timestamp(parent, height, 1_700_000_000)
+    }
+
+    fn encode_coreth_block_response(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut encoded =
+            Vec::with_capacity(6 + blocks.iter().map(|block| 4 + block.len()).sum::<usize>());
+        encoded.extend_from_slice(&0u16.to_be_bytes());
+        encoded.extend_from_slice(&(blocks.len() as u32).to_be_bytes());
+        for block in blocks {
+            encoded.extend_from_slice(&(block.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(block);
+        }
+        encoded
     }
 
     fn make_signed_platform_base_tx_bytes() -> Vec<u8> {
@@ -16270,6 +16540,27 @@ mod integration_tests {
             min_stake_json["result"]["minDelegatorStake"],
             MIN_DELEGATOR_STAKE.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_height_ignores_mismatched_block_keys() {
+        let node = make_test_node(1);
+
+        let canonical_block = make_banff_std([0x11; 32], 42);
+        let canonical_id = sha256_bytes(&canonical_block);
+        node.db
+            .put_cf(CF_BLOCKS, &canonical_id, &canonical_block)
+            .unwrap();
+
+        let bogus_high_block = make_banff_std([0x22; 32], 9_999);
+        node.db
+            .put_cf(CF_BLOCKS, &[0xAB; 32], &bogus_high_block)
+            .unwrap();
+
+        let height_req = r#"{"jsonrpc":"2.0","method":"platform.getHeight","params":{},"id":9}"#;
+        let height_response = handle_rpc_request(height_req, &node).await;
+        let height_json: serde_json::Value = serde_json::from_str(&height_response).unwrap();
+        assert_eq!(height_json["result"]["height"], "42");
     }
 
     #[tokio::test]
@@ -18569,6 +18860,12 @@ mod integration_tests {
     async fn test_info_endpoints_return_avalanchego_shapes() {
         let node = make_test_node(1);
         node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        {
+            let mut c_metrics = node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 34;
+            c_metrics.blocks_synced = 1;
+        }
         *node.resolved_public_ip.write().await = Some("198.51.100.8:9651".parse().unwrap());
 
         let peer_id = NodeId([0x11; 20]);
@@ -18937,6 +19234,12 @@ mod integration_tests {
     async fn test_admin_alias_chain_updates_chain_alias_resolution() {
         let node = make_test_node(1);
         node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        {
+            let mut c_metrics = node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 34;
+            c_metrics.blocks_synced = 1;
+        }
 
         let alias_req = r#"{"jsonrpc":"2.0","method":"admin.aliasChain","params":{"chain":"C","alias":"myc"},"id":37}"#;
         let alias_response = handle_rpc_request(alias_req, &node).await;
@@ -19014,6 +19317,7 @@ mod integration_tests {
             let mut c = node.c_chain_metrics.write().await;
             c.tip_height = 34;
             c.tip_hash = [0xCC; 32];
+            c.blocks_synced = 1;
         }
 
         let mut peer = Peer::new(NodeId([0x42; 20]), "127.0.0.1:9651".parse().unwrap());
@@ -19052,6 +19356,149 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_bootstrap_truthfulness_requires_cchain_progress_for_global_readiness() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+
+        let p_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"P"},"id":30}"#;
+        let p_response = handle_rpc_request(p_req, &node).await;
+        let p_json: serde_json::Value = serde_json::from_str(&p_response).unwrap();
+        assert_eq!(p_json["result"]["isBootstrapped"], true);
+
+        let c_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"C"},"id":31}"#;
+        let c_response = handle_rpc_request(c_req, &node).await;
+        let c_json: serde_json::Value = serde_json::from_str(&c_response).unwrap();
+        assert_eq!(c_json["result"]["isBootstrapped"], false);
+
+        let readiness_req = r#"{"jsonrpc":"2.0","method":"health.readiness","params":{},"id":32}"#;
+        let readiness_response = handle_rpc_request(readiness_req, &node).await;
+        let readiness_json: serde_json::Value = serde_json::from_str(&readiness_response).unwrap();
+        assert_eq!(readiness_json["result"]["healthy"], false);
+        assert_eq!(
+            readiness_json["result"]["checks"]["bootstrapped"]["error"],
+            "node is bootstrapping"
+        );
+
+        let p_readiness_req =
+            r#"{"jsonrpc":"2.0","method":"health.readiness","params":{"tags":["P"]},"id":33}"#;
+        let p_readiness_response = handle_rpc_request(p_readiness_req, &node).await;
+        let p_readiness_json: serde_json::Value =
+            serde_json::from_str(&p_readiness_response).unwrap();
+        assert_eq!(p_readiness_json["result"]["healthy"], true);
+    }
+
+    #[tokio::test]
+    async fn test_headers_only_cchain_progress_does_not_mark_node_bootstrapped() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        {
+            let mut c_metrics = node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 34;
+            c_metrics.blocks_synced = 1;
+            c_metrics.headers_only = true;
+        }
+        node.db.set_last_accepted_height(34).unwrap();
+
+        let c_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"C"},"id":34}"#;
+        let c_response = handle_rpc_request(c_req, &node).await;
+        let c_json: serde_json::Value = serde_json::from_str(&c_response).unwrap();
+        assert_eq!(c_json["result"]["isBootstrapped"], false);
+
+        let readiness_req = r#"{"jsonrpc":"2.0","method":"health.readiness","params":{},"id":35}"#;
+        let readiness_response = handle_rpc_request(readiness_req, &node).await;
+        let readiness_json: serde_json::Value = serde_json::from_str(&readiness_response).unwrap();
+        assert_eq!(readiness_json["result"]["healthy"], false);
+        assert_eq!(
+            readiness_json["result"]["checks"]["bootstrapped"]["error"],
+            "node is bootstrapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_snapshot_serves_info_and_health_when_peer_manager_is_locked() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        node.c_chain_metrics.write().await.tip_height = 34;
+        node.c_chain_metrics.write().await.blocks_synced = 1;
+        node.db.set_last_accepted_height(34).unwrap();
+
+        let mut peer = Peer::new(NodeId([0x42; 20]), "127.0.0.1:9651".parse().unwrap());
+        peer.state = PeerState::Connected;
+        peer.last_ping_sent = Some(Instant::now());
+        peer.public_ip = Some("203.0.113.10:9651".parse().unwrap());
+        {
+            let mut pm = node.peer_manager.write().await;
+            pm.add_peer(peer).unwrap();
+            refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
+        }
+
+        let _peer_manager_guard = node.peer_manager.write().await;
+
+        let peers_req = r#"{"jsonrpc":"2.0","method":"info.peers","params":{},"id":34}"#;
+        let peers_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            handle_rpc_request(peers_req, &node),
+        )
+        .await
+        .expect("info.peers should not block on peer manager lock");
+        let peers_json: serde_json::Value = serde_json::from_str(&peers_response).unwrap();
+        assert_eq!(peers_json["result"]["numPeers"], "1");
+        assert_eq!(peers_json["result"]["peers"].as_array().unwrap().len(), 1);
+
+        let health_req =
+            r#"{"jsonrpc":"2.0","method":"health.health","params":{"tags":["C"]},"id":35}"#;
+        let health_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            handle_rpc_request(health_req, &node),
+        )
+        .await
+        .expect("health.health should not block on peer manager lock");
+        let health_json: serde_json::Value = serde_json::from_str(&health_response).unwrap();
+        assert_eq!(health_json["result"]["healthy"], true);
+        assert_eq!(
+            health_json["result"]["checks"]["network"]["message"]["connectedPeers"],
+            1
+        );
+    }
+
+    #[test]
+    fn test_expand_cchain_ancestor_containers_decodes_coreth_block_response() {
+        let genesis = encode_cchain_block_rlp(
+            &[0u8; 32],
+            &[0u8; 20],
+            &[1u8; 32],
+            0,
+            DEFAULT_CCHAIN_GAS_LIMIT,
+            0,
+            1_700_000_000,
+            DEFAULT_BASE_FEE_PER_GAS,
+            &[],
+        );
+        let genesis_hash = cchain_block_hash(&genesis);
+        let child = encode_cchain_block_rlp(
+            &genesis_hash,
+            &[0u8; 20],
+            &[2u8; 32],
+            1,
+            DEFAULT_CCHAIN_GAS_LIMIT,
+            0,
+            1_700_000_002,
+            DEFAULT_BASE_FEE_PER_GAS,
+            &[],
+        );
+
+        let wrapped = encode_coreth_block_response(&[child.clone(), genesis.clone()]);
+        let expanded = expand_cchain_ancestor_containers(&[wrapped]);
+        assert_eq!(expanded, vec![child, genesis]);
+    }
+
+    #[tokio::test]
     async fn test_http_ext_health_status_codes_and_paths() {
         let unhealthy_node = make_test_node(1);
         let unhealthy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -19074,7 +19521,11 @@ mod integration_tests {
         let healthy_node = make_test_node(1);
         healthy_node.sync_engine.mark_following().await;
         healthy_node.p_chain_metrics.write().await.tip_height = 7;
-        healthy_node.c_chain_metrics.write().await.tip_height = 8;
+        {
+            let mut c_metrics = healthy_node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 8;
+            c_metrics.blocks_synced = 1;
+        }
         let mut peer = Peer::new(NodeId([0x24; 20]), "127.0.0.1:9651".parse().unwrap());
         peer.state = PeerState::Connected;
         healthy_node
@@ -20168,7 +20619,7 @@ mod integration_tests {
             .expect("block should build");
 
         let importer_node = make_test_node(1);
-        execute_cchain_block_and_store(&block.raw, &importer_node).await;
+        execute_cchain_block_and_store(&block.raw, &importer_node, CChainImportMode::Strict).await;
 
         let imported_block = importer_node
             .db
@@ -20264,6 +20715,77 @@ mod integration_tests {
             predicted_next_base_fee_from_fields(importer_node.config.network_id, &imported_fields);
         let pool = importer_node.txpool.read().await;
         assert_eq!(pool.base_fee, expected_next_base_fee);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_import_falls_back_to_headers_only_when_state_is_missing() {
+        let builder_node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 1,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0x97; 20]),
+            value: 5,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = builder_node.evm.write().await;
+            evm.set_account(*wallet.address(), u128::MAX / 2, 1, vec![]);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":27}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &builder_node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let block = build_cchain_block(
+            &builder_node,
+            1,
+            builder_node.txpool.read().await.pending_sorted_cloned(),
+        )
+        .await
+        .expect("block should build");
+
+        let importer_node = make_test_node(1);
+        let imported = execute_cchain_block_and_store(
+            &block.raw,
+            &importer_node,
+            CChainImportMode::BootstrapAllowHeaderOnly,
+        )
+        .await;
+        assert!(
+            imported,
+            "bootstrap import should fall back to header-only mode"
+        );
+        assert_eq!(importer_node.db.last_accepted_height().unwrap(), Some(1));
+        assert_eq!(importer_node.c_chain_metrics.read().await.tip_height, 1);
+        assert!(importer_node.c_chain_metrics.read().await.headers_only);
+
+        let receipt_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":28}}"#,
+            hex::encode(tx_hash)
+        );
+        let receipt_response = handle_rpc_request(&receipt_req, &importer_node).await;
+        let receipt_json: serde_json::Value = serde_json::from_str(&receipt_response).unwrap();
+        assert!(
+            receipt_json["result"].is_null(),
+            "header-only import should not fabricate receipts"
+        );
+
+        importer_node.sync_engine.mark_following().await;
+        importer_node.p_chain_metrics.write().await.tip_height = 12;
+        let boot_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"C"},"id":29}"#;
+        let boot_response = handle_rpc_request(boot_req, &importer_node).await;
+        let boot_json: serde_json::Value = serde_json::from_str(&boot_response).unwrap();
+        assert_eq!(boot_json["result"]["isBootstrapped"], false);
     }
 
     #[tokio::test]
@@ -20378,7 +20900,7 @@ mod integration_tests {
         bad_raw[state_root_offset] ^= 0x01;
 
         let importer_node = make_test_node(1);
-        execute_cchain_block_and_store(&bad_raw, &importer_node).await;
+        execute_cchain_block_and_store(&bad_raw, &importer_node, CChainImportMode::Strict).await;
         assert!(
             importer_node.db.get_block(1).unwrap().is_none(),
             "bad block should not be stored as accepted"
@@ -22205,7 +22727,7 @@ mod integration_tests {
         let block = build_cchain_block(&node, 1, vec![])
             .await
             .expect("empty block should build");
-        execute_cchain_block_and_store(&block.raw, &node).await;
+        execute_cchain_block_and_store(&block.raw, &node, CChainImportMode::Strict).await;
 
         let notification = read_ws_text_frame(&mut stream).await;
         assert_eq!(notification["method"], "eth_subscription");
@@ -22260,7 +22782,7 @@ mod integration_tests {
         let block = build_cchain_block(&builder_node, 1, vec![pool_tx_from_cchain_raw(&parsed_tx)])
             .await
             .expect("block should build");
-        execute_cchain_block_and_store(&block.raw, &node).await;
+        execute_cchain_block_and_store(&block.raw, &node, CChainImportMode::Strict).await;
         assert!(
             node.db.get_block(1).unwrap().is_some(),
             "accepted block should be stored before websocket notification"
@@ -22997,6 +23519,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id: 1,
                 data_dir: PathBuf::from("./data/test-mainnet-sync"),
@@ -23153,6 +23676,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id: 5,
                 data_dir: PathBuf::from("./data/test-fuji-sync"),

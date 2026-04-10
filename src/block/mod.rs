@@ -93,7 +93,10 @@ impl BlockHeader {
     ///
     /// **C-Chain block layout:** RLP-encoded Ethereum block (possibly with Avalanche wrapper).
     pub fn parse(raw: &[u8], chain: Chain) -> Result<Self, String> {
-        let id = sha256(raw);
+        let id = match chain {
+            Chain::PChain => sha256(raw),
+            Chain::CChain => cchain_block_id(raw).unwrap_or_else(|| sha256(raw)),
+        };
         match chain {
             Chain::PChain => parse_pchain_block(raw, id),
             Chain::CChain => parse_cchain_block(raw, id),
@@ -371,6 +374,15 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
 fn parse_cchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
     if raw.is_empty() {
         return Err("empty C-Chain block".to_string());
+    }
+
+    if raw.len() >= 6 && raw[0] == 0x00 && raw[1] == 0x00 {
+        let type_id = u32::from_be_bytes([raw[2], raw[3], raw[4], raw[5]]);
+        if type_id == 0 || type_id == 2 {
+            return Err(
+                "wrapped ProposerVM block must be parsed via network block parser".to_string(),
+            );
+        }
     }
 
     // Detect Avalanche codec wrapper: version bytes 0x00 0x00 followed by typeID
@@ -674,6 +686,13 @@ pub struct CChainBlockFields {
     pub base_fee: u128,
     /// Block producer / coinbase address.
     pub miner: [u8; 20],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CChainNetworkBlock {
+    pub block_id: [u8; 32],
+    pub parent_id: [u8; 32],
+    pub inner_block: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1243,6 +1262,103 @@ fn strip_avalanche_wrapper(raw: &[u8]) -> &[u8] {
     } else {
         raw
     }
+}
+
+/// Compute the canonical C-Chain block ID used by Coreth/AvalancheGo.
+///
+/// This is the Ethereum block hash, i.e. `keccak256(header_rlp)`, not a
+/// sha256 of the full raw container bytes.
+pub fn cchain_block_id(raw: &[u8]) -> Option<[u8; 32]> {
+    let rlp = strip_avalanche_wrapper(raw);
+    if rlp.is_empty() || rlp[0] < 0xc0 {
+        return None;
+    }
+
+    let (_, header_start) = rlp_list_start(rlp, 0).ok()?;
+    let header_end = rlp_skip(rlp, header_start).ok()?;
+    let header_rlp = rlp.get(header_start..header_end)?;
+    let hash = revm::primitives::keccak256(header_rlp);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hash.as_slice());
+    Some(out)
+}
+
+pub fn parse_cchain_network_block(raw: &[u8]) -> Option<CChainNetworkBlock> {
+    fn read_u32_be(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+        if *offset + 4 > bytes.len() {
+            return None;
+        }
+        let value = u32::from_be_bytes([
+            bytes[*offset],
+            bytes[*offset + 1],
+            bytes[*offset + 2],
+            bytes[*offset + 3],
+        ]);
+        *offset += 4;
+        Some(value)
+    }
+
+    fn take_len_prefixed<'a>(bytes: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+        let len = read_u32_be(bytes, offset)? as usize;
+        if *offset + len > bytes.len() {
+            return None;
+        }
+        let slice = &bytes[*offset..*offset + len];
+        *offset += len;
+        Some(slice)
+    }
+
+    if raw.len() >= 6 && raw[0] == 0x00 && raw[1] == 0x00 {
+        let type_id = u32::from_be_bytes([raw[2], raw[3], raw[4], raw[5]]);
+        if type_id == 0 || type_id == 2 {
+            let mut offset = 6usize;
+            if offset + 32 > raw.len() {
+                return None;
+            }
+            let mut parent_id = [0u8; 32];
+            parent_id.copy_from_slice(&raw[offset..offset + 32]);
+            offset += 32;
+
+            if offset + 16 > raw.len() {
+                return None;
+            }
+            offset += 16;
+
+            let _certificate = take_len_prefixed(raw, &mut offset)?;
+            let inner_block = take_len_prefixed(raw, &mut offset)?.to_vec();
+
+            if type_id == 2 {
+                if offset + 24 > raw.len() {
+                    return None;
+                }
+                offset += 24;
+            }
+
+            let sig_len = read_u32_be(raw, &mut offset)? as usize;
+            if offset + sig_len != raw.len() {
+                return None;
+            }
+
+            let unsigned_end = raw.len().checked_sub(4 + sig_len)?;
+            let block_id = sha256(&raw[..unsigned_end]);
+
+            return Some(CChainNetworkBlock {
+                block_id,
+                parent_id,
+                inner_block,
+            });
+        }
+    }
+
+    if let Ok(header) = BlockHeader::parse(raw, Chain::CChain) {
+        return Some(CChainNetworkBlock {
+            block_id: header.id,
+            parent_id: header.parent_id,
+            inner_block: raw.to_vec(),
+        });
+    }
+
+    None
 }
 
 /// Parse a legacy (type-0) Ethereum transaction from an RLP list.
@@ -2006,6 +2122,23 @@ mod tests {
         wrapped
     }
 
+    fn make_cchain_proposervm_granite_block(parent: [u8; 32], inner_block: &[u8]) -> Vec<u8> {
+        let mut wrapped = Vec::new();
+        wrapped.extend_from_slice(&[0x00, 0x00]); // codec version
+        wrapped.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // typeID = granite block
+        wrapped.extend_from_slice(&parent);
+        wrapped.extend_from_slice(&1_700_000_000i64.to_be_bytes());
+        wrapped.extend_from_slice(&123u64.to_be_bytes());
+        wrapped.extend_from_slice(&0u32.to_be_bytes()); // certificate len
+        wrapped.extend_from_slice(&(inner_block.len() as u32).to_be_bytes());
+        wrapped.extend_from_slice(inner_block);
+        wrapped.extend_from_slice(&456u64.to_be_bytes()); // epoch p-chain height
+        wrapped.extend_from_slice(&7u64.to_be_bytes()); // epoch number
+        wrapped.extend_from_slice(&1_700_000_111i64.to_be_bytes()); // epoch start time
+        wrapped.extend_from_slice(&0u32.to_be_bytes()); // signature len
+        wrapped
+    }
+
     fn encode_rlp_u64(buf: &mut Vec<u8>, v: u64) {
         if v == 0 {
             buf.push(0x80);
@@ -2121,6 +2254,21 @@ mod tests {
         let raw = make_cchain_block_with_state_root([0u8; 32], 1, 1_700_000_000, state_root);
         let extracted = BlockHeader::extract_state_root(&raw);
         assert_eq!(extracted, Some(state_root));
+    }
+
+    #[test]
+    fn test_parse_cchain_network_block_prefers_proposervm_wrapper_over_rlp_lookalike_parent() {
+        let mut parent = [0u8; 32];
+        parent[0] = 0xde;
+        parent[1] = 0xf9;
+        let inner = make_cchain_block([0u8; 32], 1, 1_700_000_000);
+        let wrapped = make_cchain_proposervm_granite_block(parent, &inner);
+
+        let parsed = parse_cchain_network_block(&wrapped).expect("parse network wrapper");
+        assert_eq!(parsed.parent_id, parent);
+        assert_eq!(parsed.inner_block, inner);
+        assert_eq!(parsed.block_id, sha256(&wrapped[..wrapped.len() - 4]));
+        assert!(BlockHeader::parse(&wrapped, Chain::CChain).is_err());
     }
 
     #[test]
