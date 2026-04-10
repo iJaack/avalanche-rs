@@ -579,25 +579,54 @@ impl SyncEngine {
         containers: &[Vec<u8>],
         target_id: [u8; 32],
     ) -> Result<(), String> {
+        fn strip_wrapper(raw: &[u8]) -> &[u8] {
+            if raw.len() >= 6 && raw[0] == 0x00 && raw[1] == 0x00 {
+                &raw[6..]
+            } else {
+                raw
+            }
+        }
+
         if containers.is_empty() {
             return Err("empty ancestor container list".to_string());
         }
 
         let mut expected_id = target_id;
         for (index, container) in containers.iter().enumerate() {
-            let block_id: [u8; 32] = Sha256::digest(container).into();
+            let parsed = crate::block::parse_cchain_network_block(container);
+            let block_id = parsed
+                .as_ref()
+                .map(|block| block.block_id)
+                .or_else(|| crate::block::cchain_block_id(container))
+                .unwrap_or_else(|| Sha256::digest(container).into());
             if block_id != expected_id {
+                let raw_sha256: [u8; 32] = Sha256::digest(container).into();
+                let full_rlp_keccak = {
+                    let hash = revm::primitives::keccak256(strip_wrapper(container));
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(hash.as_slice());
+                    out
+                };
+                let preview_len = container.len().min(8);
                 return Err(format!(
-                    "hash-chain mismatch at index {}: expected {:02x?}, got {:02x?}",
+                    "hash-chain mismatch at index {}: expected {:02x?}, header-keccak {:02x?}, full-rlp-keccak {:02x?}, raw-sha256 {:02x?}, first-bytes {:02x?}",
                     index,
                     &expected_id[..4],
-                    &block_id[..4]
+                    &block_id[..4],
+                    &full_rlp_keccak[..4],
+                    &raw_sha256[..4],
+                    &container[..preview_len]
                 ));
             }
 
-            let header = crate::block::BlockHeader::parse(container, crate::block::Chain::CChain)
-                .map_err(|e| format!("failed to parse C-Chain block {}: {}", index, e))?;
-            expected_id = header.parent_id;
+            if let Some(block) = parsed {
+                expected_id = block.parent_id;
+            } else {
+                let header =
+                    crate::block::BlockHeader::parse(container, crate::block::Chain::CChain)
+                        .map_err(|e| format!("failed to parse C-Chain block {}: {}", index, e))?;
+                expected_id = header.parent_id;
+            }
         }
 
         Ok(())
@@ -1299,25 +1328,69 @@ mod tests {
             enc_list(vec![header, txs, uncles])
         }
 
+        fn wrap_cchain_block(
+            parent: [u8; 32],
+            inner_block: &[u8],
+            signature: &[u8],
+        ) -> (Vec<u8>, [u8; 32]) {
+            let mut out = Vec::new();
+            out.extend_from_slice(&0u16.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&parent);
+            out.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+            out.extend_from_slice(&123u64.to_be_bytes());
+            out.extend_from_slice(&(0u32).to_be_bytes());
+            out.extend_from_slice(&(inner_block.len() as u32).to_be_bytes());
+            out.extend_from_slice(inner_block);
+            out.extend_from_slice(&(signature.len() as u32).to_be_bytes());
+            out.extend_from_slice(signature);
+            let unsigned_end = out.len() - 4 - signature.len();
+            let block_id: [u8; 32] = Sha256::digest(&out[..unsigned_end]).into();
+            (out, block_id)
+        }
+
         let genesis = build_cchain_block([0u8; 32], 0, 1_700_000_000);
-        let genesis_id: [u8; 32] = Sha256::digest(&genesis).into();
+        let genesis_id = crate::block::cchain_block_id(&genesis).expect("genesis cchain id");
         let block1 = build_cchain_block(genesis_id, 1, 1_700_000_002);
-        let block1_id: [u8; 32] = Sha256::digest(&block1).into();
+        let block1_id = crate::block::cchain_block_id(&block1).expect("block1 cchain id");
         let block2 = build_cchain_block(block1_id, 2, 1_700_000_004);
         let bad = build_cchain_block([9u8; 32], 2, 1_700_000_004);
 
         let good = vec![block2.clone(), block1.clone(), genesis.clone()];
-        assert!(
-            SyncEngine::validate_cchain_ancestor_chain(&good, Sha256::digest(&block2).into())
-                .is_ok()
-        );
+        assert!(SyncEngine::validate_cchain_ancestor_chain(
+            &good,
+            crate::block::cchain_block_id(&block2).expect("block2 cchain id")
+        )
+        .is_ok());
 
-        let bad_chain = vec![bad, block1, genesis];
+        let bad_chain = vec![bad, block1.clone(), genesis.clone()];
         assert!(SyncEngine::validate_cchain_ancestor_chain(
             &bad_chain,
-            Sha256::digest(&block2).into()
+            crate::block::cchain_block_id(&block2).expect("block2 cchain id")
         )
         .is_err());
+
+        let (wrapped_genesis, wrapped_genesis_id) = wrap_cchain_block([0u8; 32], &genesis, &[1, 2]);
+        let (wrapped_block1, wrapped_block1_id) =
+            wrap_cchain_block(wrapped_genesis_id, &block1, &[3, 4]);
+        let (wrapped_block2, wrapped_block2_id) =
+            wrap_cchain_block(wrapped_block1_id, &block2, &[5, 6]);
+        let (wrapped_bad, _) = wrap_cchain_block([9u8; 32], &block2, &[7, 8]);
+
+        let wrapped_good = vec![
+            wrapped_block2.clone(),
+            wrapped_block1.clone(),
+            wrapped_genesis.clone(),
+        ];
+        assert!(
+            SyncEngine::validate_cchain_ancestor_chain(&wrapped_good, wrapped_block2_id).is_ok()
+        );
+
+        let wrapped_bad_chain = vec![wrapped_bad, wrapped_block1, wrapped_genesis];
+        assert!(
+            SyncEngine::validate_cchain_ancestor_chain(&wrapped_bad_chain, wrapped_block2_id)
+                .is_err()
+        );
     }
 
     #[tokio::test]

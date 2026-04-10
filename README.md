@@ -4,23 +4,25 @@
 
 A production-grade Rust implementation of the Avalanche network protocol. Connects to real AvalancheGo nodes on Fuji testnet and mainnet. Includes an optional PostgreSQL/TimescaleDB-backed indexer for explorer-style APIs, catchup, balances, and Prometheus metrics. 31.6K lines of Rust, 670+ tests, ~11 MB release binary with indexer enabled.
 
-## Benchmarks vs AvalancheGo 1.14.1
+## Benchmarks vs AvalancheGo v1.14.2
 
-Tested on Mac Mini M4 (Apple Silicon), Fuji testnet, **3 minutes each** (2026-03-08):
+Tested on Fuji testnet, **5 minutes each**, on `Darwin arm64` (2026-04-10):
 
-| Metric | avalanche-rs | AvalancheGo 1.14.1 | Δ |
-|--------|-------------|-------------------|---|
-| **Binary size** | 8.5 MB | 88.7 MB | **10.4× smaller** |
-| **Memory (RSS) @ 3 min** | 67 MB | 1,787 MB | **26.7× less** |
-| **First peer handshake** | 100 ms | ~8 s | **~80× faster** |
-| **P-Chain bootstrap** | ✅ Complete + following | ❌ 40.8% executed | **avalanche-rs wins** |
-| **P-Chain blocks synced** | 3,066 | 267K fetched, 109K executed | * |
-| **C-Chain blocks synced** | 516 | 0 (not started) | ∞ |
-| **Status at 3 min** | ✅ Following chain tip | ⏳ Still executing | — |
+| Metric | avalanche-rs | AvalancheGo v1.14.2 |
+|--------|-------------|----------------------|
+| Binary size | 10,272 KB | 88,968 KB |
+| Final RSS | 12,848 KB | 75,696 KB |
+| Peak RSS | 121,936 KB | 91,264 KB |
+| P-Chain bootstrapped | `true` | `false` |
+| C-Chain block number | `0x336e5ac` | `null` |
+| Peer count | `1` | `42` |
+| Health endpoint healthy | `false` | `false` |
 
-avalanche-rs completes full P-Chain + C-Chain bootstrap in **~12 seconds**, then tracks the chain tip. AvalancheGo is still executing blocks after 3 minutes.
+This run is useful as a production smoke benchmark, not a victory lap. `avalanche-rs` now reports sane P-Chain height, usable peers/health, and non-zero C-Chain head progress inside 5 minutes. It still reports unhealthy readiness because C-Chain cold start is header-only until full state sync is implemented.
 
 > Full benchmark details: [`BENCHMARK.md`](BENCHMARK.md)
+>
+> Dated run report: [`docs/benchmarks/2026-04-10-fuji-300s.md`](docs/benchmarks/2026-04-10-fuji-300s.md)
 >
 > **Indexer validation on Mac mini M1 (2026-03-10):** full real DB-backed indexer/API suite (`api_integration`, `indexer_integration`, `indexer_comprehensive`) passed **32/32** tests in **149.75s** with peak memory footprint of about **106 MB**.
 
@@ -97,6 +99,19 @@ avalanche-rs completes full P-Chain + C-Chain bootstrap in **~12 seconds**, then
 - MEV engine (V2/V4 AMM math, sandwich sim, arbitrage detection)
 - WASM build target (avalanche-core → wasm32)
 - `no_std` core library (avalanche-core crate)
+
+### Archive Historical RPC Support
+
+With `--archive` enabled, canonical historical block queries are supported for:
+- `eth_getBalance`
+- `eth_getTransactionCount`
+- `eth_getCode`
+- `eth_getStorageAt`
+- `eth_getProof`
+- `eth_call`
+
+Without `--archive`, historical state queries return `historical state query not allowed`.
+`latest` and `pending` always use the live in-memory state. Hex block heights below the current tip use archived canonical state snapshots when available.
 
 ## Quick Start
 

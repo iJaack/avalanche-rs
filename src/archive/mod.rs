@@ -5,14 +5,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::db::{AccountState, Database, CF_STATE_ROOTS};
+use crate::db::{AccountState, Database, CF_ARCHIVE_STATE, CF_ARCHIVE_STORAGE, CF_STATE_ROOTS};
 
 // ---------------------------------------------------------------------------
 // Archive Store
 // ---------------------------------------------------------------------------
-
-/// Column family for historical account snapshots: key = height(8) + address(20).
-pub const CF_ARCHIVE_STATE: &str = "archive_state";
 
 /// Archive node store. Keeps per-block snapshots of modified accounts
 /// so any historical block can be queried.
@@ -84,7 +81,8 @@ impl ArchiveStore {
             return Ok(Some(crate::db::decode_account_state_rlp(&data)));
         }
 
-        // Walk backward from height to find most recent snapshot
+        // Walk backward from height to find most recent snapshot.
+        // This favors correctness over performance until the archive index is upgraded.
         for h in (0..height).rev() {
             let mut scan_key = Vec::with_capacity(28);
             scan_key.extend_from_slice(&h.to_be_bytes());
@@ -92,11 +90,6 @@ impl ArchiveStore {
 
             if let Some(data) = db.get_cf(CF_ARCHIVE_STATE, &scan_key)? {
                 return Ok(Some(crate::db::decode_account_state_rlp(&data)));
-            }
-
-            // Don't scan more than 1000 blocks back for performance
-            if height - h > 1000 {
-                break;
             }
         }
 
@@ -114,6 +107,72 @@ impl ArchiveStore {
             return Ok(());
         }
         db.put_cf(CF_STATE_ROOTS, &height.to_be_bytes(), state_root)
+    }
+
+    /// Record a storage slot value at a given block height.
+    /// Key = height(8 BE) ++ address(20) ++ slot(32).
+    pub fn put_storage_snapshot(
+        &self,
+        db: &Database,
+        height: u64,
+        address: &[u8; 20],
+        slot: &[u8; 32],
+        value: &[u8; 32],
+    ) -> Result<(), crate::db::DbError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let mut key = Vec::with_capacity(60);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(address);
+        key.extend_from_slice(slot);
+
+        db.put_cf(CF_ARCHIVE_STORAGE, &key, value)?;
+        self.disk_usage
+            .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Get a storage slot value at or before a historical block height.
+    pub fn get_storage_at_height(
+        &self,
+        db: &Database,
+        address: &[u8; 20],
+        slot: &[u8; 32],
+        height: u64,
+    ) -> Result<Option<[u8; 32]>, crate::db::DbError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let mut key = Vec::with_capacity(60);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(address);
+        key.extend_from_slice(slot);
+        if let Some(data) = db.get_cf(CF_ARCHIVE_STORAGE, &key)? {
+            if data.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&data);
+                return Ok(Some(out));
+            }
+        }
+
+        for h in (0..height).rev() {
+            let mut scan_key = Vec::with_capacity(60);
+            scan_key.extend_from_slice(&h.to_be_bytes());
+            scan_key.extend_from_slice(address);
+            scan_key.extend_from_slice(slot);
+            if let Some(data) = db.get_cf(CF_ARCHIVE_STORAGE, &scan_key)? {
+                if data.len() == 32 {
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&data);
+                    return Ok(Some(out));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Get metrics for archive storage.
@@ -226,6 +285,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(at_150.balance, 1000);
+    }
+
+    #[test]
+    fn test_archive_query_walks_back_more_than_1000_blocks() {
+        let store = ArchiveStore::new(true);
+        let (db, _dir) = Database::open_temp().unwrap();
+        let addr = [0x22u8; 20];
+        let state = AccountState {
+            nonce: 9,
+            balance: 1234,
+            storage_root: [0u8; 32],
+            code_hash: [0u8; 32],
+        };
+
+        store.put_account_snapshot(&db, 1, &addr, &state).unwrap();
+
+        let at_2000 = store
+            .get_account_at_height(&db, &addr, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_2000.balance, 1234);
+        assert_eq!(at_2000.nonce, 9);
+    }
+
+    #[test]
+    fn test_archive_storage_query_at_different_heights() {
+        let store = ArchiveStore::new(true);
+        let (db, _dir) = Database::open_temp().unwrap();
+        let addr = [0x33u8; 20];
+        let slot = [0x44u8; 32];
+        let mut value_100 = [0u8; 32];
+        value_100[31] = 0x0a;
+        let mut value_200 = [0u8; 32];
+        value_200[31] = 0x0b;
+
+        store
+            .put_storage_snapshot(&db, 100, &addr, &slot, &value_100)
+            .unwrap();
+        store
+            .put_storage_snapshot(&db, 200, &addr, &slot, &value_200)
+            .unwrap();
+
+        assert_eq!(
+            store.get_storage_at_height(&db, &addr, &slot, 100).unwrap(),
+            Some(value_100)
+        );
+        assert_eq!(
+            store.get_storage_at_height(&db, &addr, &slot, 150).unwrap(),
+            Some(value_100)
+        );
+        assert_eq!(
+            store.get_storage_at_height(&db, &addr, &slot, 200).unwrap(),
+            Some(value_200)
+        );
     }
 
     #[test]

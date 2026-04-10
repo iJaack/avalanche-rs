@@ -22,7 +22,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use alloy_primitives::U256;
@@ -45,13 +45,18 @@ use tracing_subscriber::{reload, EnvFilter, Registry};
 
 use avalanche_rs::archive::ArchiveStore;
 use avalanche_rs::block::{
-    extract_cchain_atomic_transactions, extract_cchain_block_fields, extract_cchain_transactions,
-    parse_raw_cchain_transaction, BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
+    cchain_block_id, extract_cchain_atomic_transactions, extract_cchain_block_fields,
+    extract_cchain_transactions, parse_cchain_network_block, parse_raw_cchain_transaction,
+    BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
 };
 use avalanche_rs::consensus::SnowmanConsensus;
-use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
+use avalanche_rs::db::{
+    AccountState, Database, CF_ARCHIVE_STATE, CF_ARCHIVE_STORAGE, CF_BLOCKS, CF_STATE_ROOTS,
+};
 use avalanche_rs::debug::{EvmTracer, TraceConfig, TracerType};
-use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction, TxReceipt};
+use avalanche_rs::evm::{
+    ArchivedAccountDiff, BlockContext, EvmExecutor, EvmLog, EvmTransaction, TxReceipt,
+};
 use avalanche_rs::hardening::get_rss_bytes;
 use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
@@ -87,6 +92,7 @@ const AVAX_ASSET_ID_MAINNET: &str = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDG
 const AVAX_ASSET_ID_FUJI: &str = "U8iRqJoiJm8xZHAacmvYyZVwqQx6uDNtQeP3CQ6fcgQk3JqnK";
 const BAD_BLOCK_LIMIT: usize = 10;
 const PENDING_FILTER_EVENT_LIMIT: usize = 4096;
+const PERSISTENT_PEER_MAX_FAILURES: u64 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformDynamicFeeConfig {
@@ -216,7 +222,7 @@ struct Cli {
     light_client: bool,
 
     /// Enable archive mode: keep ALL historical state, never prune.
-    /// Allows eth_getBalance/eth_call at any historical block number.
+    /// Enables supported historical state queries against canonical blocks.
     #[arg(long, default_value = "false", env = "AVAX_ARCHIVE")]
     archive: bool,
 
@@ -394,6 +400,9 @@ struct ChainMetrics {
     pub tip_height: u64,
     pub tip_hash: [u8; 32],
     pub chain_length: u64,
+    pub headers_only: bool,
+    pub canonical_switches: u64,
+    pub last_canonical_switch_height: u64,
     pub last_sync_time: Instant,
 }
 
@@ -417,6 +426,9 @@ impl Default for ChainMetrics {
             tip_height: 0,
             tip_hash: [0u8; 32],
             chain_length: 0,
+            headers_only: false,
+            canonical_switches: 0,
+            last_canonical_switch_height: 0,
             last_sync_time: Instant::now(),
         }
     }
@@ -786,6 +798,9 @@ struct NodeState {
     evm: Arc<RwLock<EvmExecutor>>,
     sync_engine: Arc<SyncEngine>,
     peer_manager: Arc<RwLock<PeerManager>>,
+    /// Best-effort connected-peer snapshot for read APIs that must not block on
+    /// the hot peer-manager write path.
+    peer_snapshot: Arc<StdRwLock<Vec<Peer>>>,
     config: Cli,
     start_time: Instant,
     validators: std::collections::HashMap<String, ValidatorInfo>,
@@ -1177,6 +1192,7 @@ async fn main() {
         evm,
         sync_engine: sync_engine.clone(),
         peer_manager,
+        peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
         config: cli,
         start_time: Instant::now(),
         validators,
@@ -1483,6 +1499,7 @@ async fn handle_inbound_connection(
     peer.state = PeerState::Connected;
     let reputation = peer.reputation;
     if pm.add_peer(peer).is_ok() {
+        refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
         persist_connected_peer(&node, &peer_node_id, peer_addr, reputation, 0);
     }
 }
@@ -1492,6 +1509,19 @@ async fn handle_inbound_connection(
 // ---------------------------------------------------------------------------
 
 async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
+    connect_to_bootstrap_nodes_with_timeouts(
+        node,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await;
+}
+
+async fn connect_to_bootstrap_nodes_with_timeouts(
+    node: Arc<NodeState>,
+    tcp_connect_timeout: Duration,
+    tls_handshake_timeout: Duration,
+) {
     let bootstrap_ips: Vec<String> = if node.config.bootstrap_ips.is_empty() {
         match node.config.network_id {
             1 => MAINNET_BOOTSTRAP_IPS
@@ -1548,7 +1578,15 @@ async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
         let addr = target.addr;
         let node = node.clone();
         tokio::spawn(async move {
-            if let Err(e) = connect_and_handshake(addr, node).await {
+            if let Err(e) = connect_and_handshake_with_timeouts(
+                addr,
+                node.clone(),
+                tcp_connect_timeout,
+                tls_handshake_timeout,
+            )
+            .await
+            {
+                persist_failed_peer(&node, addr);
                 warn!("Startup peer {} failed: {}", addr, e);
             }
         });
@@ -1598,6 +1636,28 @@ fn persist_connected_peer(
     }
 }
 
+fn persist_failed_peer(node: &NodeState, addr: SocketAddr) {
+    for (_key, value) in node.db.load_all_peers() {
+        let Some(mut record) = PersistentPeerRecord::decode(&value) else {
+            continue;
+        };
+        if record.socket_addr() != Some(addr) {
+            continue;
+        }
+
+        record.record_failure();
+        let result = if record.should_evict(PERSISTENT_PEER_MAX_FAILURES) {
+            node.db.delete_peer(&record.node_id)
+        } else {
+            node.db.put_peer(&record.node_id, &record.encode())
+        };
+        if let Err(e) = result {
+            debug!("Failed to persist peer failure for {}: {}", addr, e);
+        }
+        return;
+    }
+}
+
 fn peer_score(record: &PersistentPeerRecord) -> i64 {
     let latency_component = (record.latency_ms as i64 / 10).min(10_000);
     (record.reputation as i64 * 10) + record.reliability_score as i64 - latency_component
@@ -1605,6 +1665,23 @@ fn peer_score(record: &PersistentPeerRecord) -> i64 {
 
 fn latency_to_reputation(latency_ms: u64) -> i32 {
     (1000_i32 - (latency_ms.min(1000) as i32)).max(0)
+}
+
+fn update_canonical_chain_metrics(
+    metrics: &mut ChainMetrics,
+    canonical_height: u64,
+    block_hash: [u8; 32],
+) {
+    let replaced_same_height = canonical_height == metrics.tip_height
+        && metrics.tip_hash != [0u8; 32]
+        && metrics.tip_hash != block_hash;
+    let rolled_back_or_repointed = canonical_height < metrics.tip_height;
+    if replaced_same_height || rolled_back_or_repointed {
+        metrics.canonical_switches += 1;
+        metrics.last_canonical_switch_height = canonical_height;
+    }
+    metrics.tip_height = canonical_height;
+    metrics.tip_hash = block_hash;
 }
 
 fn socket_addr_to_ip_bytes(addr: SocketAddr) -> Vec<u8> {
@@ -1683,7 +1760,8 @@ fn dial_new_peers(new_peers: Vec<PeerInfo>, node: Arc<NodeState>) {
         let node = node.clone();
         tokio::spawn(async move {
             info!("Dialing discovered peer {}", addr);
-            if let Err(e) = connect_and_handshake(addr, node).await {
+            if let Err(e) = connect_and_handshake(addr, node.clone()).await {
+                persist_failed_peer(&node, addr);
                 debug!("Discovered peer {} failed: {}", addr, e);
             }
         });
@@ -1788,17 +1866,30 @@ async fn connect_and_handshake(
     addr: SocketAddr,
     node: Arc<NodeState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_and_handshake_with_timeouts(
+        addr,
+        node,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn connect_and_handshake_with_timeouts(
+    addr: SocketAddr,
+    node: Arc<NodeState>,
+    tcp_connect_timeout: Duration,
+    tls_handshake_timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Connecting to bootstrap node {}", addr);
     let dial_started = Instant::now();
 
     // 1. TCP connect with timeout
-    let tcp_stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| format!("TCP connect timeout to {}", addr))?
-    .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
+    let tcp_stream =
+        tokio::time::timeout(tcp_connect_timeout, tokio::net::TcpStream::connect(addr))
+            .await
+            .map_err(|_| format!("TCP connect timeout to {}", addr))?
+            .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
 
     tcp_stream.set_nodelay(true).ok();
     info!("TCP connected to {}", addr);
@@ -1814,7 +1905,7 @@ async fn connect_and_handshake(
         .map_err(|e| format!("server name: {}", e))?;
 
     let mut tls_stream = tokio::time::timeout(
-        Duration::from_secs(10),
+        tls_handshake_timeout,
         connector.connect(server_name.to_owned(), tcp_stream),
     )
     .await
@@ -2067,6 +2158,7 @@ async fn connect_and_handshake(
     peer.reported_uptime = peer_reported_uptime;
     peer.is_validator = false;
     if let Ok(()) = pm.add_peer(peer) {
+        refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
         info!("Peer {} registered (NodeID: {})", addr, peer_node_id);
         persist_connected_peer(
             &node,
@@ -2268,6 +2360,7 @@ async fn connect_and_handshake(
                                                 {
                                                     peer.reported_uptime = uptime;
                                                 }
+                                                refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
                                                 drop(pm);
                                                 let pong = NetworkMessage::Pong { uptime };
                                                 if let Ok(encoded) = pong.encode_proto() {
@@ -2454,12 +2547,20 @@ async fn connect_and_handshake(
                                                 let _ = chain_id;
                                             }
                                             NetworkMessage::Ancestors { request_id, containers, chain_id } => {
-                                                let total_bytes: usize = containers.iter().map(|c| c.len()).sum();
                                                 let is_cchain = chain_id.0 == cchain_id;
+                                                let decoded_cchain_containers = is_cchain
+                                                    .then(|| expand_cchain_ancestor_containers(&containers));
+                                                let effective_containers = decoded_cchain_containers
+                                                    .as_ref()
+                                                    .unwrap_or(&containers);
+                                                let total_bytes: usize = effective_containers
+                                                    .iter()
+                                                    .map(|c| c.len())
+                                                    .sum();
                                                 info!(
                                                     "{} Ancestors from {} — {} containers, {} bytes total",
                                                     if is_cchain { "C-Chain" } else { "P-Chain" },
-                                                    addr, containers.len(), total_bytes
+                                                    addr, effective_containers.len(), total_bytes
                                                 );
 
                                                 if is_cchain {
@@ -2472,6 +2573,7 @@ async fn connect_and_handshake(
 
                                                     if let Some((req, depth, prev_total)) = expected_req {
                                                         if request_id == req {
+                                                            let containers = effective_containers;
                                                             if let Some(target_id) = cchain_ancestors_target {
                                                                 if let Err(e) = SyncEngine::validate_cchain_ancestor_chain(&containers, target_id) {
                                                                     warn!("C-Chain Bootstrap: invalid ancestor hash chain: {}", e);
@@ -2481,61 +2583,67 @@ async fn connect_and_handshake(
                                                             }
 
                                                             let mut stored = 0u32;
-                                                            let mut oldest_container: Option<Vec<u8>> = None;
+                                                            let mut oldest_block: Option<avalanche_rs::block::CChainNetworkBlock> = None;
 
-                                                            for container in &containers {
+                                                            for container in containers {
+                                                                let parsed_block = parse_cchain_network_block(container);
+                                                                let inner_block = parsed_block
+                                                                    .as_ref()
+                                                                    .map(|block| block.inner_block.as_slice())
+                                                                    .unwrap_or(container.as_slice());
                                                                 // Debug: log first C-Chain block format once
                                                                 if !cchain_debug_logged {
                                                                     cchain_debug_logged = true;
-                                                                    let preview_len = container.len().min(20);
+                                                                    let preview_len = inner_block.len().min(20);
                                                                     info!(
                                                                         "C-Chain block format debug: first {} bytes = {:02x?} (total {} bytes)",
-                                                                        preview_len, &container[..preview_len], container.len()
+                                                                        preview_len, &inner_block[..preview_len], inner_block.len()
                                                                     );
-                                                                    if container.len() >= 2 {
-                                                                        if container[0] == 0x00 && container[1] == 0x00 {
+                                                                    if inner_block.len() >= 2 {
+                                                                        if inner_block[0] == 0x00 && inner_block[1] == 0x00 {
                                                                             info!("C-Chain block: detected Avalanche codec wrapper (0x00 0x00 prefix)");
-                                                                        } else if container[0] >= 0xf8 {
-                                                                            info!("C-Chain block: detected raw RLP long list (0x{:02x} prefix)", container[0]);
-                                                                        } else if container[0] >= 0xc0 {
-                                                                            info!("C-Chain block: detected raw RLP short list (0x{:02x} prefix)", container[0]);
+                                                                        } else if inner_block[0] >= 0xf8 {
+                                                                            info!("C-Chain block: detected raw RLP long list (0x{:02x} prefix)", inner_block[0]);
+                                                                        } else if inner_block[0] >= 0xc0 {
+                                                                            info!("C-Chain block: detected raw RLP short list (0x{:02x} prefix)", inner_block[0]);
                                                                         } else {
-                                                                            warn!("C-Chain block: unexpected format — first byte 0x{:02x}", container[0]);
+                                                                            warn!("C-Chain block: unexpected format — first byte 0x{:02x}", inner_block[0]);
                                                                         }
                                                                     }
                                                                 }
 
-                                                                let mut hasher = Sha256::new();
-                                                                hasher.update(container);
-                                                                let hash: [u8; 32] = hasher.finalize().into();
+                                                                let hash = cchain_block_hash(inner_block);
                                                                 // Prefix C-Chain keys with "c:" to distinguish from P-Chain
                                                                 let mut key = Vec::with_capacity(34);
                                                                 key.extend_from_slice(b"c:");
                                                                 key.extend_from_slice(&hash);
-                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, container) {
+                                                                if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, inner_block) {
                                                                     warn!("C-Chain: failed to store block {:02x?}: {}", &hash[..4], e);
                                                                 } else {
                                                                     stored += 1;
                                                                     // Store stateRoot → block_hash mapping
-                                                                    if let Some(state_root) = avalanche_rs::block::BlockHeader::extract_state_root(container) {
+                                                                    if let Some(state_root) = avalanche_rs::block::BlockHeader::extract_state_root(inner_block) {
                                                                         if let Err(e) = node.db.put_cf(CF_STATE_ROOTS, &state_root, &hash) {
                                                                             debug!("state_root store failed: {}", e);
                                                                         }
                                                                     }
                                                                     // Execute block through EVM and store receipts
                                                                     execute_cchain_block_and_store(
-                                                                        container,
+                                                                        inner_block,
                                                                         &node,
+                                                                        CChainImportMode::BootstrapAllowHeaderOnly,
                                                                     ).await;
                                                                     // Index block for PostgreSQL analytics
                                                                     #[cfg(feature = "indexer")]
                                                                     if let Some(ref indexer) = node.indexer {
-                                                                        if let Some(indexed) = build_indexed_cchain_block(container, &hash) {
+                                                                        if let Some(indexed) = build_indexed_cchain_block(inner_block, &hash) {
                                                                             indexer.index_block(indexed).await;
                                                                         }
                                                                     }
                                                                 }
-                                                                oldest_container = Some(container.clone());
+                                                                oldest_block = parsed_block
+                                                                    .clone()
+                                                                    .or_else(|| parse_cchain_network_block(inner_block));
                                                             }
 
                                                             let new_total = prev_total + stored;
@@ -2553,25 +2661,23 @@ async fn connect_and_handshake(
                                                             // Use block parser to determine if oldest block is genesis
                                                             // (handles both raw RLP and Avalanche-wrapped format)
                                                             let should_recurse = depth < 10
-                                                                && oldest_container.as_ref().is_some_and(|c| {
-                                                                    match avalanche_rs::block::BlockHeader::parse(c, avalanche_rs::block::Chain::CChain) {
+                                                                && oldest_block.as_ref().is_some_and(|block| {
+                                                                    match avalanche_rs::block::BlockHeader::parse(&block.inner_block, avalanche_rs::block::Chain::CChain) {
                                                                         Ok(h) => !h.is_genesis(),
-                                                                        Err(_) => !c.is_empty() && c[0] >= 0xc0,
+                                                                        Err(_) => !block.inner_block.is_empty() && block.inner_block[0] >= 0xc0,
                                                                     }
                                                                 });
 
                                                             if should_recurse {
-                                                                let oldest = oldest_container.unwrap();
-                                                                let mut hasher = Sha256::new();
-                                                                hasher.update(&oldest);
-                                                                let oldest_id: [u8; 32] = hasher.finalize().into();
+                                                                let oldest = oldest_block.unwrap();
+                                                                let oldest_parent = oldest.parent_id;
                                                                 let new_req = req + 1;
                                                                 let new_depth = depth + 1;
                                                                 let get_ancestors = NetworkMessage::GetAncestors {
                                                                     chain_id: ChainId(cchain_id),
                                                                     request_id: new_req,
                                                                     deadline: 5_000_000_000u64,
-                                                                    container_id: BlockId(oldest_id),
+                                                                    container_id: BlockId(oldest_parent),
                                                                     max_containers_size: 2_000_000,
                                                                 };
                                                                 if let Ok(encoded) = get_ancestors.encode_proto() {
@@ -2581,7 +2687,7 @@ async fn connect_and_handshake(
                                                                             "C-Chain Bootstrap: recursive GetAncestors depth={} req={} (total: {})",
                                                                             new_depth, new_req, new_total
                                                                         );
-                                                                        cchain_ancestors_target = Some(oldest_id);
+                                                                        cchain_ancestors_target = Some(oldest_parent);
                                                                         cchain_bootstrap_state = CChainBootstrapState::FetchingAncestors {
                                                                             req: new_req,
                                                                             depth: new_depth,
@@ -2805,9 +2911,7 @@ async fn connect_and_handshake(
                                                         || (container.len() >= 6 && container[0] == 0x00 && container[1] == 0x00));
                                                 if is_cchain_block && matches!(bootstrap_state, BootstrapState::Done) {
                                                     // Store the new block
-                                                    let mut h = sha2::Sha256::new();
-                                                    sha2::Digest::update(&mut h, &container);
-                                                    let hash: [u8; 32] = sha2::Digest::finalize(h).into();
+                                                    let hash = cchain_block_hash(&container);
                                                     let mut key = Vec::with_capacity(34);
                                                     key.extend_from_slice(b"c:");
                                                     key.extend_from_slice(&hash);
@@ -2816,6 +2920,7 @@ async fn connect_and_handshake(
                                                     execute_cchain_block_and_store(
                                                         &container,
                                                         &node,
+                                                        CChainImportMode::Strict,
                                                     ).await;
                                                     if let Some(fields) = extract_cchain_block_fields(&container) {
                                                         info!("Following: new C-Chain block #{} via PushQuery from {}", fields.number, addr);
@@ -2892,6 +2997,7 @@ async fn connect_and_handshake(
     // Remove peer on disconnect
     let mut pm = node.peer_manager.write().await;
     pm.remove_peer(&peer_node_id);
+    refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
     warn!("Peer {} disconnected", addr);
 
     Ok(())
@@ -3173,6 +3279,12 @@ async fn run_block_builder(node: Arc<NodeState>) {
                     );
                     continue;
                 }
+                if let Err(e) = clear_canonical_cchain_tx_artifacts(&node.db, block.number) {
+                    warn!(
+                        "Block builder: failed to clear old tx artifacts for block #{}: {}",
+                        block.number, e
+                    );
+                }
                 if let Err(e) = node.db.put_block(block.number, &block.raw) {
                     warn!(
                         "Block builder: failed to store block #{} by height: {}",
@@ -3190,9 +3302,8 @@ async fn run_block_builder(node: Arc<NodeState>) {
                 let _ = node.db.set_last_accepted_height(block.number);
                 {
                     let mut m = node.c_chain_metrics.write().await;
-                    m.tip_height = block.number;
-                    m.tip_hash = block.id;
                     m.blocks_synced += 1;
+                    update_canonical_chain_metrics(&mut m, block.number, block.id);
                 }
                 refresh_txpool_base_fee(&node).await;
 
@@ -3240,7 +3351,6 @@ async fn build_cchain_block(
     block_number: u64,
     txs: Vec<PoolTransaction>,
 ) -> Result<BuiltBlock, Box<dyn std::error::Error + Send + Sync>> {
-    use sha2::{Digest, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let timestamp = SystemTime::now()
@@ -3284,14 +3394,20 @@ async fn build_cchain_block(
 
     let evm_txs: Vec<EvmTransaction> = txs.iter().map(pool_tx_to_evm_tx).collect();
 
-    let (block_result, state_root) = {
+    let (block_result, state_root, archive_changes) = {
         let mut evm = node.evm.write().await;
+        let before = node.archive_store.enabled.then(|| evm.snapshot());
         let result = evm
             .execute_block(&evm_txs, &ctx)
             .map_err(|e| format!("EVM execution: {}", e))?;
         let state_root = result.state_root;
-        (result, state_root)
+        let archive_changes = before
+            .as_ref()
+            .map(|snapshot| evm.changed_account_archive_diffs_since(snapshot))
+            .unwrap_or_default();
+        (result, state_root, archive_changes)
     };
+    persist_archive_state_changes(node, block_number, &state_root, &archive_changes);
 
     // Build RLP block
     let raw = encode_cchain_block_rlp(
@@ -3306,10 +3422,8 @@ async fn build_cchain_block(
         &txs,
     );
 
-    // Compute block ID = SHA-256 of raw bytes
-    let mut hasher = Sha256::new();
-    hasher.update(&raw);
-    let id: [u8; 32] = hasher.finalize().into();
+    // Coreth/AvalancheGo use the Ethereum block hash as the C-Chain block ID.
+    let id = cchain_block_hash(&raw);
 
     // Sign with BLS key
     let bls_signature = node.identity.sign_block_bls(&id);
@@ -3596,17 +3710,65 @@ fn build_indexed_pchain_block(container: &[u8], block_id: &[u8; 32]) -> Option<I
 // C-Chain EVM execution helper
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CChainImportMode {
+    Strict,
+    BootstrapAllowHeaderOnly,
+}
+
+async fn import_cchain_block_header_only(raw_block: &[u8], node: &NodeState) -> Result<(), String> {
+    let fields = extract_cchain_block_fields(raw_block)
+        .ok_or_else(|| "cannot parse block fields".to_string())?;
+    let block_hash = cchain_block_hash(raw_block);
+
+    let mut key = Vec::with_capacity(34);
+    key.extend_from_slice(b"c:");
+    key.extend_from_slice(&block_hash);
+    node.db
+        .put_cf(CF_BLOCKS, &key, raw_block)
+        .map_err(|e| format!("failed to store header-only C-Chain block hash entry: {e}"))?;
+
+    clear_canonical_cchain_tx_artifacts(&node.db, fields.number)
+        .map_err(|e| format!("failed to clear canonical tx artifacts: {e}"))?;
+
+    node.db
+        .put_block(fields.number, raw_block)
+        .map_err(|e| format!("failed to store header-only C-Chain block by height: {e}"))?;
+
+    let mut canonical_height = current_cchain_height(node);
+    if fields.number > canonical_height {
+        node.db
+            .set_last_accepted_height(fields.number)
+            .map_err(|e| format!("failed to advance header-only C-Chain head: {e}"))?;
+        canonical_height = fields.number;
+    }
+
+    let mut metrics = node.c_chain_metrics.write().await;
+    if fields.number == canonical_height {
+        update_canonical_chain_metrics(&mut metrics, canonical_height, block_hash);
+    }
+    metrics.headers_only = true;
+    drop(metrics);
+
+    refresh_txpool_base_fee(node).await;
+    Ok(())
+}
+
 /// Execute a downloaded C-Chain block through the EVM and persist receipts.
 ///
 /// Extracts transactions from the raw RLP block, runs them through the in-memory
 /// EVM executor, and stores receipts in CF_RECEIPTS keyed by `(block_height, tx_idx)`.
 /// The EVM state is cumulative across blocks within a single peer session.
-async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
+async fn execute_cchain_block_and_store(
+    raw_block: &[u8],
+    node: &NodeState,
+    mode: CChainImportMode,
+) -> bool {
     let fields = match extract_cchain_block_fields(raw_block) {
         Some(f) => f,
         None => {
             record_bad_cchain_block(node, raw_block, None, "invalid c-chain block", Vec::new());
-            return;
+            return false;
         }
     };
     let expected_state_root = BlockHeader::extract_state_root(raw_block);
@@ -3628,8 +3790,22 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                     hex::encode(computed)
                 );
                 debug!("C-Chain #{} {}", fields.number, reason);
+                if mode == CChainImportMode::BootstrapAllowHeaderOnly {
+                    if let Err(import_err) = import_cchain_block_header_only(raw_block, node).await
+                    {
+                        record_bad_cchain_block(
+                            node,
+                            raw_block,
+                            Some(fields.number),
+                            format!("{reason}; header-only import failed: {import_err}"),
+                            Vec::new(),
+                        );
+                        return false;
+                    }
+                    return true;
+                }
                 record_bad_cchain_block(node, raw_block, Some(fields.number), reason, Vec::new());
-                return;
+                return false;
             }
         }
 
@@ -3649,27 +3825,31 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 fields.number, e
             );
         }
+        if let Some(state_root) = expected_state_root {
+            persist_archive_state_changes(node, fields.number, &state_root, &[]);
+        }
 
-        let current_height = current_cchain_height(node);
-        if fields.number > current_height {
+        let mut canonical_height = current_cchain_height(node);
+        if fields.number > canonical_height {
             if let Err(e) = node.db.set_last_accepted_height(fields.number) {
                 debug!(
                     "failed to advance imported C-Chain head to #{}: {}",
                     fields.number, e
                 );
             }
+            canonical_height = fields.number;
         }
 
-        // Even with no transactions update tip height and hash
+        // Canonical imports should keep the in-memory tip aligned even on same-height replacement.
         let mut m = node.c_chain_metrics.write().await;
-        if fields.number > m.tip_height {
-            m.tip_height = fields.number;
-            m.tip_hash = block_hash;
+        if fields.number == canonical_height {
+            update_canonical_chain_metrics(&mut m, canonical_height, block_hash);
+            m.headers_only = false;
         }
         drop(m);
         refresh_txpool_base_fee(node).await;
         websocket_broadcast_cchain_block_events(node, raw_block, &[], &[]).await;
-        return;
+        return true;
     }
 
     let ctx = BlockContext {
@@ -3685,6 +3865,7 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
     // Recover sender addresses from ECDSA signatures, falling back to zero address
     let result = {
         let mut evm = node.evm.write().await;
+        let before = node.archive_store.enabled.then(|| evm.snapshot());
         let evm_txs: Vec<EvmTransaction> = raw_txs
             .iter()
             .map(|t| {
@@ -3702,10 +3883,15 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 }
             })
             .collect();
-        evm.execute_block(&evm_txs, &ctx)
+        let result = evm.execute_block(&evm_txs, &ctx);
+        let archive_changes = before
+            .as_ref()
+            .map(|snapshot| evm.changed_account_archive_diffs_since(snapshot))
+            .unwrap_or_default();
+        (result, archive_changes)
     };
 
-    match result {
+    match result.0 {
         Ok(block_result) => {
             if let Some(expected) = expected_state_root {
                 if block_result.state_root != expected {
@@ -3715,6 +3901,27 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                         hex::encode(block_result.state_root)
                     );
                     debug!("C-Chain #{} {}", fields.number, reason);
+                    if mode == CChainImportMode::BootstrapAllowHeaderOnly {
+                        if let Err(import_err) =
+                            import_cchain_block_header_only(raw_block, node).await
+                        {
+                            let bad_receipts = bad_block_receipt_values(
+                                &raw_txs,
+                                &block_result.receipts,
+                                &block_hash,
+                                fields.number,
+                            );
+                            record_bad_cchain_block(
+                                node,
+                                raw_block,
+                                Some(fields.number),
+                                format!("{reason}; header-only import failed: {import_err}"),
+                                bad_receipts,
+                            );
+                            return false;
+                        }
+                        return true;
+                    }
                     let bad_receipts = bad_block_receipt_values(
                         &raw_txs,
                         &block_result.receipts,
@@ -3728,9 +3935,10 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                         reason,
                         bad_receipts,
                     );
-                    return;
+                    return false;
                 }
             }
+            persist_archive_state_changes(node, fields.number, &block_result.state_root, &result.1);
 
             debug!(
                 "C-Chain #{}: executed {} txs, {} gas used, state_root=0x{}",
@@ -3746,6 +3954,13 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
             if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, raw_block) {
                 debug!(
                     "failed to store imported C-Chain block hash entry #{}: {}",
+                    fields.number, e
+                );
+            }
+
+            if let Err(e) = clear_canonical_cchain_tx_artifacts(&node.db, fields.number) {
+                debug!(
+                    "failed to clear canonical tx artifacts for imported C-Chain block #{}: {}",
                     fields.number, e
                 );
             }
@@ -3770,20 +3985,21 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 );
             }
 
-            let current_height = current_cchain_height(node);
-            if fields.number > current_height {
+            let mut canonical_height = current_cchain_height(node);
+            if fields.number > canonical_height {
                 if let Err(e) = node.db.set_last_accepted_height(fields.number) {
                     debug!(
                         "failed to advance imported C-Chain head to #{}: {}",
                         fields.number, e
                     );
                 }
+                canonical_height = fields.number;
             }
 
             let mut m = node.c_chain_metrics.write().await;
-            if fields.number > m.tip_height {
-                m.tip_height = fields.number;
-                m.tip_hash = block_hash;
+            if fields.number == canonical_height {
+                update_canonical_chain_metrics(&mut m, canonical_height, block_hash);
+                m.headers_only = false;
             }
             drop(m);
             refresh_txpool_base_fee(node).await;
@@ -3799,9 +4015,26 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 &block_result.receipts,
             )
             .await;
+            true
         }
         Err(e) => {
             debug!("C-Chain #{} EVM execution error: {}", fields.number, e);
+            if mode == CChainImportMode::BootstrapAllowHeaderOnly {
+                if let Err(import_err) = import_cchain_block_header_only(raw_block, node).await {
+                    record_bad_cchain_block(
+                        node,
+                        raw_block,
+                        Some(fields.number),
+                        format!(
+                            "evm execution error: {}; header-only import failed: {}",
+                            e, import_err
+                        ),
+                        Vec::new(),
+                    );
+                    return false;
+                }
+                return true;
+            }
             record_bad_cchain_block(
                 node,
                 raw_block,
@@ -3809,6 +4042,7 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 format!("evm execution error: {}", e),
                 Vec::new(),
             );
+            false
         }
     }
 }
@@ -4386,25 +4620,28 @@ async fn handle_rpc_connection(
 }
 
 async fn render_prometheus_metrics(node: &NodeState) -> String {
+    reconcile_canonical_cchain_metrics(node).await;
     let phase = node.sync_engine.phase().await;
     let sync_stats = node.sync_engine.stats().await;
     let peer_count = node.peer_manager.read().await.connected_count() as u64;
-    let p_height = node.p_chain_metrics.read().await.tip_height;
-    let c_height = node.c_chain_metrics.read().await.tip_height;
+    let p_metrics = node.p_chain_metrics.read().await.clone();
+    let c_metrics = node.c_chain_metrics.read().await.clone();
     let memory = get_rss_bytes();
     let uptime = node.start_time.elapsed().as_secs();
     let handshake_latency = average_handshake_latency_ms(&node.db);
 
     format!(
-        "sync_progress {}\npeer_count {}\nblock_height_p_chain {}\nblock_height_c_chain {}\nmemory_rss_bytes {}\nuptime_seconds {}\nhandshake_latency_ms {}\n",
+        "sync_progress {}\npeer_count {}\nblock_height_p_chain {}\nblock_height_c_chain {}\nc_chain_canonical_switches_total {}\nc_chain_last_canonical_switch_height {}\nmemory_rss_bytes {}\nuptime_seconds {}\nhandshake_latency_ms {}\n",
         if matches!(phase, SyncPhase::Following | SyncPhase::Synced) {
             1.0
         } else {
             sync_stats.progress_pct() / 100.0
         },
         peer_count,
-        p_height,
-        c_height,
+        p_metrics.tip_height,
+        c_metrics.tip_height,
+        c_metrics.canonical_switches,
+        c_metrics.last_canonical_switch_height,
         memory,
         uptime,
         handshake_latency
@@ -4425,6 +4662,19 @@ fn average_handshake_latency_ms(db: &Database) -> u64 {
     } else {
         latencies.iter().sum::<u64>() / latencies.len() as u64
     }
+}
+
+async fn reconcile_canonical_cchain_metrics(node: &NodeState) {
+    let canonical_height = current_cchain_height(node);
+    if canonical_height == 0 {
+        return;
+    }
+    let Ok(Some(raw_block)) = node.db.get_block(canonical_height) else {
+        return;
+    };
+    let canonical_hash = cchain_block_hash(&raw_block);
+    let mut metrics = node.c_chain_metrics.write().await;
+    update_canonical_chain_metrics(&mut metrics, canonical_height, canonical_hash);
 }
 
 /// Parse a hex string (with or without 0x prefix) to bytes.
@@ -5030,6 +5280,179 @@ fn parse_block_number(val: &serde_json::Value, node: &NodeState) -> u64 {
             u64::from_str_radix(s, 16).unwrap_or(0)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CchainStateQuery {
+    block_height: u64,
+    is_current: bool,
+}
+
+fn resolve_cchain_state_query(
+    selector: &serde_json::Value,
+    node: &NodeState,
+) -> Result<CchainStateQuery, String> {
+    let current_height = current_cchain_height(node);
+    let block_height = parse_block_number(selector, node);
+    let is_current = match selector.as_str() {
+        Some("latest") | Some("pending") | None => true,
+        _ => block_height == current_height,
+    };
+
+    if is_current {
+        return Ok(CchainStateQuery {
+            block_height,
+            is_current: true,
+        });
+    }
+
+    match load_canonical_cchain_block_by_number(&node.db, block_height, current_height) {
+        Some(_) => Ok(CchainStateQuery {
+            block_height,
+            is_current: false,
+        }),
+        None => Err(format!("block #{} not found", block_height)),
+    }
+}
+
+fn load_historical_account_state(
+    node: &NodeState,
+    address: [u8; 20],
+    block_height: u64,
+) -> Result<Option<AccountState>, String> {
+    if !node.archive_store.enabled {
+        return Err("historical state query not allowed".to_string());
+    }
+
+    node.archive_store
+        .get_account_at_height(&node.db, &address, block_height)
+        .map_err(|err| format!("failed to load historical state: {}", err))
+}
+
+fn load_historical_storage_value(
+    node: &NodeState,
+    address: [u8; 20],
+    slot: [u8; 32],
+    block_height: u64,
+) -> Result<[u8; 32], String> {
+    if !node.archive_store.enabled {
+        return Err("historical state query not allowed".to_string());
+    }
+
+    node.archive_store
+        .get_storage_at_height(&node.db, &address, &slot, block_height)
+        .map(|value| value.unwrap_or([0u8; 32]))
+        .map_err(|err| format!("failed to load historical storage: {}", err))
+}
+
+fn load_historical_state_root(
+    node: &NodeState,
+    block_height: u64,
+) -> Result<Option<[u8; 32]>, String> {
+    match node.db.get_cf(CF_STATE_ROOTS, &block_height.to_be_bytes()) {
+        Ok(Some(bytes)) if bytes.len() == 32 => {
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&bytes);
+            Ok(Some(root))
+        }
+        Ok(Some(_)) | Ok(None) => Ok(None),
+        Err(err) => Err(format!("failed to load historical state root: {}", err)),
+    }
+}
+
+fn historical_rpc_simulation_block_context(
+    node: &NodeState,
+    block_height: u64,
+) -> Result<BlockContext, String> {
+    let Some(fields) = load_cchain_block_fields(&node.db, block_height) else {
+        return Err(format!("block #{} not found", block_height));
+    };
+    Ok(BlockContext {
+        number: fields.number,
+        timestamp: fields.timestamp,
+        coinbase: fields.miner,
+        gas_limit: if fields.gas_limit == 0 {
+            DEFAULT_CCHAIN_GAS_LIMIT
+        } else {
+            fields.gas_limit
+        },
+        base_fee: fields.base_fee,
+        difficulty: 0,
+        chain_id: node.config.chain_id,
+    })
+}
+
+fn historical_evm_at_height(node: &NodeState, block_height: u64) -> Result<EvmExecutor, String> {
+    if !node.archive_store.enabled {
+        return Err("historical state query not allowed".to_string());
+    }
+
+    let mut evm = EvmExecutor::new(node.config.chain_id);
+    let mut accounts = std::collections::BTreeMap::<[u8; 20], AccountState>::new();
+    for (key, value) in node.db.iter_cf_owned(CF_ARCHIVE_STATE) {
+        if key.len() != 28 {
+            continue;
+        }
+        let entry_height = u64::from_be_bytes(key[..8].try_into().unwrap());
+        if entry_height > block_height {
+            continue;
+        }
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&key[8..28]);
+        accounts.insert(address, avalanche_rs::db::decode_account_state_rlp(&value));
+    }
+
+    for (address, state) in &accounts {
+        let code = if is_empty_code_hash(&state.code_hash) {
+            None
+        } else {
+            match node.db.get_code(&state.code_hash) {
+                Ok(Some(code)) => Some(code),
+                Ok(None) => return Err("historical code not found".to_string()),
+                Err(err) => return Err(format!("failed to load historical code: {}", err)),
+            }
+        };
+        evm.import_account_state(*address, state, code);
+    }
+
+    let mut storage = std::collections::BTreeMap::<([u8; 20], [u8; 32]), [u8; 32]>::new();
+    for (key, value) in node.db.iter_cf_owned(CF_ARCHIVE_STORAGE) {
+        if key.len() != 60 || value.len() != 32 {
+            continue;
+        }
+        let entry_height = u64::from_be_bytes(key[..8].try_into().unwrap());
+        if entry_height > block_height {
+            continue;
+        }
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&key[8..28]);
+        let mut slot = [0u8; 32];
+        slot.copy_from_slice(&key[28..60]);
+        let mut slot_value = [0u8; 32];
+        slot_value.copy_from_slice(&value);
+        storage.insert((address, slot), slot_value);
+    }
+
+    for ((address, slot), value) in storage {
+        if value != [0u8; 32] {
+            evm.set_storage(address, slot, value);
+        }
+    }
+
+    if let Some(expected_root) = load_historical_state_root(node, block_height)? {
+        if evm.compute_state_root_mpt() != expected_root {
+            return Err(format!(
+                "historical state root mismatch at block #{}",
+                block_height
+            ));
+        }
+    }
+
+    Ok(evm)
+}
+
+fn is_empty_code_hash(code_hash: &[u8; 32]) -> bool {
+    *code_hash == [0u8; 32] || code_hash.as_slice() == revm::primitives::KECCAK_EMPTY.as_slice()
 }
 
 fn resolve_cchain_block_height(
@@ -6045,21 +6468,18 @@ async fn info_is_bootstrapped(node: &NodeState, chain: &str) -> Result<bool, Str
         return Err("argument 'chain' not given".to_string());
     }
 
-    let phase = node.sync_engine.phase().await;
-    let bootstrapped = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
-    if matches!(
-        chain.to_ascii_lowercase().as_str(),
-        "p" | "platform" | "c" | "evm"
-    ) {
-        return Ok(bootstrapped);
+    match chain.to_ascii_lowercase().as_str() {
+        "p" | "platform" => return Ok(pchain_bootstrapped(node).await),
+        "c" | "evm" => return Ok(cchain_bootstrapped(node).await),
+        _ => {}
     }
 
     if let Some(chain_id) = resolve_blockchain_alias_id(node, chain).await {
         if chain_id == platform_pchain_blockchain_id() {
-            return Ok(bootstrapped);
+            return Ok(pchain_bootstrapped(node).await);
         }
         if chain_id == platform_cchain_blockchain_id(node.config.network_id) {
-            return Ok(bootstrapped);
+            return Ok(cchain_bootstrapped(node).await);
         }
 
         let tracker = node.subnet_tracker.read().await;
@@ -6238,33 +6658,6 @@ fn health_tags_include_tracked_chain(
     })
 }
 
-fn chain_health_value(
-    chain_name: &str,
-    last_accepted_height: u64,
-    last_accepted_id: [u8; 32],
-    percent_connected: f64,
-) -> serde_json::Value {
-    let _ = chain_name;
-    health_check_value(
-        Some(serde_json::json!({
-            "engine": {
-                "consensus": {
-                    "lastAcceptedHeight": last_accepted_height,
-                    "lastAcceptedID": cb58_encode_id(last_accepted_id),
-                    "longestProcessingBlock": "0s",
-                    "processingBlocks": 0,
-                },
-                "vm": serde_json::Value::Null,
-            },
-            "networking": {
-                "percentConnected": percent_connected,
-            }
-        })),
-        None,
-        Duration::ZERO,
-    )
-}
-
 async fn health_report(
     node: &NodeState,
     kind: HealthReportKind,
@@ -6277,8 +6670,8 @@ async fn health_report(
         });
     }
 
-    let phase = node.sync_engine.phase().await;
-    let is_bootstrapped = matches!(phase, SyncPhase::Synced | SyncPhase::Following);
+    let p_bootstrapped = pchain_bootstrapped(node).await;
+    let c_bootstrapped = cchain_bootstrapped(node).await;
     let db_accessible = node.db.last_accepted_height().is_ok();
 
     let p_metrics = node.p_chain_metrics.read().await.clone();
@@ -6292,14 +6685,8 @@ async fn health_report(
         .collect::<Vec<_>>();
     drop(tracker);
 
-    let pm = node.peer_manager.read().await;
-    let connected_ids = pm.connected_peers();
-    let connected_peers = connected_ids
-        .iter()
-        .filter_map(|node_id| pm.get_peer(node_id).cloned())
-        .collect::<Vec<_>>();
+    let connected_peers = cached_connected_peers(node);
     let peer_count = connected_peers.len();
-    drop(pm);
 
     let now = Instant::now();
     let last_received = connected_peers
@@ -6321,7 +6708,24 @@ async fn health_report(
     let mut checks = serde_json::Map::new();
     let mut healthy = true;
 
-    let bootstrapped_error = if is_bootstrapped {
+    let includes_p = health_tags_include_primary_chain(
+        tags,
+        &["P", "platform"],
+        platform_pchain_blockchain_id(),
+    );
+    let includes_c = health_tags_include_primary_chain(
+        tags,
+        &["C", "evm"],
+        platform_cchain_blockchain_id(node.config.network_id),
+    );
+    let bootstrapped_for_scope = match (includes_p, includes_c) {
+        (true, true) => p_bootstrapped && c_bootstrapped,
+        (true, false) => p_bootstrapped,
+        (false, true) => c_bootstrapped,
+        (false, false) => p_bootstrapped && c_bootstrapped,
+    };
+
+    let bootstrapped_error = if bootstrapped_for_scope {
         None
     } else {
         Some("node is bootstrapping".to_string())
@@ -6380,31 +6784,64 @@ async fn health_report(
         ),
     );
 
-    if health_tags_include_primary_chain(tags, &["P", "platform"], platform_pchain_blockchain_id())
-    {
+    if includes_p {
+        if !p_bootstrapped {
+            healthy = false;
+        }
         checks.insert(
             "P".to_string(),
-            chain_health_value(
-                "P",
-                p_metrics.tip_height,
-                p_metrics.tip_hash,
-                percent_connected,
+            health_check_value(
+                Some(serde_json::json!({
+                    "engine": {
+                        "consensus": {
+                            "lastAcceptedHeight": p_metrics.tip_height,
+                            "lastAcceptedID": cb58_encode_id(p_metrics.tip_hash),
+                            "longestProcessingBlock": "0s",
+                            "processingBlocks": 0,
+                        },
+                        "vm": serde_json::Value::Null,
+                    },
+                    "networking": {
+                        "percentConnected": percent_connected,
+                    }
+                })),
+                if p_bootstrapped {
+                    None
+                } else {
+                    Some("P-Chain is bootstrapping".to_string())
+                },
+                Duration::ZERO,
             ),
         );
     }
 
-    if health_tags_include_primary_chain(
-        tags,
-        &["C", "evm"],
-        platform_cchain_blockchain_id(node.config.network_id),
-    ) {
+    if includes_c {
+        if !c_bootstrapped {
+            healthy = false;
+        }
         checks.insert(
             "C".to_string(),
-            chain_health_value(
-                "C",
-                current_cchain_height(node).max(c_metrics.tip_height),
-                c_metrics.tip_hash,
-                percent_connected,
+            health_check_value(
+                Some(serde_json::json!({
+                    "engine": {
+                        "consensus": {
+                            "lastAcceptedHeight": current_cchain_height(node).max(c_metrics.tip_height),
+                            "lastAcceptedID": cb58_encode_id(c_metrics.tip_hash),
+                            "longestProcessingBlock": "0s",
+                            "processingBlocks": 0,
+                        },
+                        "vm": serde_json::Value::Null,
+                    },
+                    "networking": {
+                        "percentConnected": percent_connected,
+                    }
+                })),
+                if c_bootstrapped {
+                    None
+                } else {
+                    Some("C-Chain is bootstrapping".to_string())
+                },
+                Duration::ZERO,
             ),
         );
     }
@@ -6609,16 +7046,76 @@ fn latest_pchain_block_metadata(db: &Database) -> Option<BlockMetadata> {
     db.iter_cf_owned(CF_BLOCKS)
         .into_iter()
         .filter(|(key, _)| !key.starts_with(b"c:") && key.len() == 32)
-        .filter_map(|(_, raw)| BlockMetadata::from_raw(&raw, Chain::PChain).ok())
+        .filter_map(|(key, raw)| {
+            let computed = sha2::Sha256::digest(&raw);
+            if computed[..] != key[..] {
+                return None;
+            }
+            BlockMetadata::from_raw(&raw, Chain::PChain).ok()
+        })
         .max_by_key(|meta| meta.height)
 }
 
 async fn current_pchain_height(node: &NodeState) -> u64 {
     let metric_height = node.p_chain_metrics.read().await.tip_height;
+    if metric_height > 0 {
+        return metric_height;
+    }
+
+    if let Some(height) = node
+        .persisted_sync_state
+        .read()
+        .await
+        .as_ref()
+        .map(|state| state.p_chain_tip_height)
+        .filter(|height| *height > 0)
+    {
+        return height;
+    }
+
     latest_pchain_block_metadata(&node.db)
         .map(|meta| meta.height)
-        .unwrap_or(metric_height)
-        .max(metric_height)
+        .unwrap_or(0)
+}
+
+fn connected_peer_snapshot_from_manager(pm: &PeerManager) -> Vec<Peer> {
+    pm.connected_peers()
+        .into_iter()
+        .filter_map(|node_id| pm.get_peer(&node_id).cloned())
+        .collect()
+}
+
+fn refresh_peer_snapshot_from_manager(pm: &PeerManager, snapshot: &StdRwLock<Vec<Peer>>) {
+    *snapshot.write().expect("peer snapshot write lock") = connected_peer_snapshot_from_manager(pm);
+}
+
+fn cached_connected_peers(node: &NodeState) -> Vec<Peer> {
+    if let Ok(pm) = node.peer_manager.try_read() {
+        let peers = connected_peer_snapshot_from_manager(&pm);
+        refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
+        peers
+    } else {
+        node.peer_snapshot
+            .read()
+            .expect("peer snapshot read lock")
+            .clone()
+    }
+}
+
+async fn pchain_bootstrapped(node: &NodeState) -> bool {
+    let phase = node.sync_engine.phase().await;
+    matches!(phase, SyncPhase::Synced | SyncPhase::Following)
+        && current_pchain_height(node).await > 0
+}
+
+async fn cchain_bootstrapped(node: &NodeState) -> bool {
+    if !pchain_bootstrapped(node).await {
+        return false;
+    }
+
+    let metrics = node.c_chain_metrics.read().await.clone();
+    let tip_height = current_cchain_height(node).max(metrics.tip_height);
+    tip_height > 0 && metrics.blocks_synced > 0 && !metrics.headers_only
 }
 
 async fn platform_current_supply_result(
@@ -9789,17 +10286,19 @@ fn parse_log_filter(filter_obj: &serde_json::Value, node: &NodeState) -> LogFilt
             .collect(),
         _ => vec![],
     };
+    let last_polled_block = if filter_obj.get("fromBlock").is_some() {
+        from_block.saturating_sub(1)
+    } else {
+        current_height
+    };
 
     LogFilter {
         from_block,
         to_block,
         addresses,
         topics: parse_filter_topics(filter_obj),
-        last_polled_block: if filter_obj.get("fromBlock").is_some() {
-            from_block.saturating_sub(1)
-        } else {
-            current_height
-        },
+        last_polled_block,
+        last_polled_hash: canonical_cchain_block_hash_at_height(&node.db, last_polled_block),
     }
 }
 
@@ -9815,6 +10314,53 @@ fn load_cchain_block_by_hash(db: &Database, block_hash: &[u8; 32]) -> Option<Vec
     key.extend_from_slice(b"c:");
     key.extend_from_slice(block_hash);
     db.get_cf(avalanche_rs::db::CF_BLOCKS, &key).ok().flatten()
+}
+
+fn load_canonical_cchain_block_by_number(
+    db: &Database,
+    block_height: u64,
+    max_canonical_height: u64,
+) -> Option<Vec<u8>> {
+    if block_height > max_canonical_height {
+        return None;
+    }
+    db.get_block(block_height).ok().flatten()
+}
+
+fn canonical_cchain_block_hash_at_height(db: &Database, block_height: u64) -> Option<[u8; 32]> {
+    db.get_block(block_height)
+        .ok()
+        .flatten()
+        .map(|block_data| cchain_block_hash(&block_data))
+}
+
+fn canonical_filter_start_block(
+    db: &Database,
+    last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
+    current_height: u64,
+) -> Option<u64> {
+    if current_height < last_polled_block {
+        return Some(current_height);
+    }
+
+    if last_polled_block <= current_height {
+        if let Some(previous_hash) = last_polled_hash {
+            match canonical_cchain_block_hash_at_height(db, last_polled_block) {
+                Some(current_hash) if current_hash != previous_hash => {
+                    return Some(last_polled_block);
+                }
+                None => return Some(last_polled_block),
+                _ => {}
+            }
+        }
+    }
+
+    if current_height > last_polled_block {
+        Some(last_polled_block.saturating_add(1))
+    } else {
+        None
+    }
 }
 
 fn cchain_transaction_count(block_data: &[u8]) -> u64 {
@@ -10630,12 +11176,90 @@ fn load_mined_cchain_transaction(
     Some((block_hash, pool_tx_from_cchain_raw(tx)))
 }
 
-fn cchain_block_hash(block_data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
+fn load_indexed_mined_cchain_transaction(
+    db: &Database,
+    tx_hash: &[u8; 32],
+    max_canonical_height: u64,
+) -> Option<(u64, u32, [u8; 32], PoolTransaction)> {
+    let (block_height, tx_index) = db.get_tx_index(tx_hash).ok()??;
+    if block_height > max_canonical_height {
+        return None;
+    }
+    let (block_hash, tx) = load_mined_cchain_transaction(db, block_height, tx_index)?;
+    if tx.hash != *tx_hash {
+        return None;
+    }
+    Some((block_height, tx_index, block_hash, tx))
+}
 
-    let mut hasher = Sha256::new();
-    hasher.update(block_data);
-    hasher.finalize().into()
+fn cchain_block_hash(block_data: &[u8]) -> [u8; 32] {
+    cchain_block_id(block_data).unwrap_or_else(|| {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(block_data);
+        hasher.finalize().into()
+    })
+}
+
+fn decode_coreth_block_response(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if bytes.len() < 6 {
+        return None;
+    }
+
+    let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+    if version != 0 {
+        return None;
+    }
+
+    let count = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+    if count == 0 || count > 1024 {
+        return None;
+    }
+
+    let mut offset = 6usize;
+    let mut blocks = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 4 > bytes.len() {
+            return None;
+        }
+        let block_len = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if block_len == 0 || offset + block_len > bytes.len() {
+            return None;
+        }
+        let block = bytes[offset..offset + block_len].to_vec();
+        offset += block_len;
+        if block.is_empty()
+            || !(block[0] >= 0xc0 || (block.len() >= 6 && block[0] == 0 && block[1] == 0))
+        {
+            return None;
+        }
+        blocks.push(block);
+    }
+
+    if offset != bytes.len() {
+        return None;
+    }
+
+    Some(blocks)
+}
+
+fn expand_cchain_ancestor_containers(containers: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut expanded = Vec::new();
+    for container in containers {
+        if let Some(blocks) = decode_coreth_block_response(container) {
+            expanded.extend(blocks);
+        } else {
+            expanded.push(container.clone());
+        }
+    }
+    expanded
 }
 
 fn rpc_block_from_cchain_data(
@@ -10889,6 +11513,74 @@ fn record_bad_cchain_block(
     );
 }
 
+fn persist_archive_state_changes(
+    node: &NodeState,
+    block_height: u64,
+    state_root: &[u8; 32],
+    changes: &[ArchivedAccountDiff],
+) {
+    if !node.archive_store.enabled {
+        return;
+    }
+
+    if let Err(err) = node
+        .archive_store
+        .put_state_root(&node.db, block_height, state_root)
+    {
+        debug!(
+            "failed to persist archive state root for block #{}: {}",
+            block_height, err
+        );
+    }
+
+    for diff in changes {
+        if let Err(err) = node.archive_store.put_account_snapshot(
+            &node.db,
+            block_height,
+            &diff.address,
+            &diff.state,
+        ) {
+            debug!(
+                "failed to persist archive snapshot for block #{} account 0x{}: {}",
+                block_height,
+                hex::encode(diff.address),
+                err
+            );
+        }
+
+        if let Some(code) = &diff.code {
+            if !is_empty_code_hash(&diff.state.code_hash) {
+                if let Err(err) = node.db.put_code(&diff.state.code_hash, code) {
+                    debug!(
+                        "failed to persist archive code for block #{} account 0x{}: {}",
+                        block_height,
+                        hex::encode(diff.address),
+                        err
+                    );
+                }
+            }
+        }
+
+        for (slot, value) in &diff.storage {
+            if let Err(err) = node.archive_store.put_storage_snapshot(
+                &node.db,
+                block_height,
+                &diff.address,
+                slot,
+                value,
+            ) {
+                debug!(
+                    "failed to persist archive storage for block #{} account 0x{} slot 0x{}: {}",
+                    block_height,
+                    hex::encode(diff.address),
+                    hex::encode(slot),
+                    err
+                );
+            }
+        }
+    }
+}
+
 fn persist_local_cchain_tx_artifacts(
     db: &Database,
     block: &BuiltBlock,
@@ -10896,9 +11588,11 @@ fn persist_local_cchain_tx_artifacts(
 ) -> Result<(), avalanche_rs::db::DbError> {
     let mut cumulative_gas = 0u64;
     let mut log_index_offset = 0u32;
+    let mut tx_index_writes = Vec::with_capacity(txs.len());
+    let mut receipt_writes = Vec::with_capacity(block.receipts.len());
 
     for (idx, (tx, receipt)) in txs.iter().zip(block.receipts.iter()).enumerate() {
-        db.put_tx_index(&tx.hash, block.number, idx as u32)?;
+        tx_index_writes.push((tx.hash, block.number, idx as u32));
         cumulative_gas = cumulative_gas.saturating_add(receipt.gas_used);
         let receipt_json = rpc_receipt_from_pool(
             &tx.hash,
@@ -10910,14 +11604,27 @@ fn persist_local_cchain_tx_artifacts(
             cumulative_gas,
             log_index_offset,
         );
-        db.put_receipt(
+        receipt_writes.push((
             block.number,
             idx as u32,
-            receipt_json.to_string().as_bytes(),
-        )?;
+            receipt_json.to_string().into_bytes(),
+        ));
         log_index_offset = log_index_offset.saturating_add(receipt.logs.len() as u32);
     }
 
+    db.write_transaction_artifacts(&tx_index_writes, &receipt_writes)
+}
+
+fn clear_canonical_cchain_tx_artifacts(
+    db: &Database,
+    block_height: u64,
+) -> Result<(), avalanche_rs::db::DbError> {
+    if let Some(existing_block) = db.get_block(block_height)? {
+        for tx in extract_cchain_transactions(&existing_block) {
+            db.delete_tx_index(&raw_tx_hash(&tx.raw))?;
+        }
+    }
+    db.clear_block_receipts(block_height)?;
     Ok(())
 }
 
@@ -10930,10 +11637,12 @@ fn persist_imported_cchain_tx_artifacts(
 ) -> Result<(), avalanche_rs::db::DbError> {
     let mut cumulative_gas = 0u64;
     let mut log_index_offset = 0u32;
+    let mut tx_index_writes = Vec::with_capacity(txs.len());
+    let mut receipt_writes = Vec::with_capacity(receipts.len());
 
     for (idx, (tx, receipt)) in txs.iter().zip(receipts.iter()).enumerate() {
         let pool_tx = pool_tx_from_cchain_raw(tx);
-        db.put_tx_index(&pool_tx.hash, block_number, idx as u32)?;
+        tx_index_writes.push((pool_tx.hash, block_number, idx as u32));
         cumulative_gas = cumulative_gas.saturating_add(receipt.gas_used);
         let receipt_json = rpc_receipt_from_pool(
             &pool_tx.hash,
@@ -10945,15 +11654,15 @@ fn persist_imported_cchain_tx_artifacts(
             cumulative_gas,
             log_index_offset,
         );
-        db.put_receipt(
+        receipt_writes.push((
             block_number,
             idx as u32,
-            receipt_json.to_string().as_bytes(),
-        )?;
+            receipt_json.to_string().into_bytes(),
+        ));
         log_index_offset = log_index_offset.saturating_add(receipt.logs.len() as u32);
     }
 
-    Ok(())
+    db.write_transaction_artifacts(&tx_index_writes, &receipt_writes)
 }
 
 async fn submit_raw_cchain_transaction(
@@ -11015,6 +11724,7 @@ struct LogFilter {
     addresses: Vec<[u8; 20]>,
     topics: Vec<Option<Vec<[u8; 32]>>>,
     last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
 }
 
 #[allow(dead_code)]
@@ -11025,11 +11735,13 @@ struct PendingTransactionFilter {
 #[allow(dead_code)]
 struct BlockHashFilter {
     last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
 }
 
 #[allow(dead_code)]
 struct AcceptedTransactionFilter {
     last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
     full_tx: bool,
 }
 
@@ -11147,6 +11859,20 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_address(addr_str) {
                 Some(addr) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(1).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return match load_historical_account_state(node, addr, query.block_height) {
+                            Ok(Some(state)) => rpc_ok(&format!("\"0x{:x}\"", state.balance), id),
+                            Ok(None) => rpc_ok("\"0x0\"", id),
+                            Err(message) => rpc_error(-32000, &message, id),
+                        };
+                    }
                     // In light client mode, serve from proof cache first
                     if node.config.light_client {
                         let lc = node.light_client.read().await;
@@ -11170,6 +11896,20 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_address(addr_str) {
                 Some(addr) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(1).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return match load_historical_account_state(node, addr, query.block_height) {
+                            Ok(Some(state)) => rpc_ok(&format!("\"0x{:x}\"", state.nonce), id),
+                            Ok(None) => rpc_ok("\"0x0\"", id),
+                            Err(message) => rpc_error(-32000, &message, id),
+                        };
+                    }
                     let evm = node.evm.read().await;
                     let nonce = evm.get_nonce(addr);
                     rpc_ok(&format!("\"0x{:x}\"", nonce), id)
@@ -11185,6 +11925,38 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_address(addr_str) {
                 Some(addr) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(1).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return match load_historical_account_state(node, addr, query.block_height) {
+                            Ok(Some(state)) => {
+                                if is_empty_code_hash(&state.code_hash) {
+                                    rpc_ok("\"0x\"", id)
+                                } else {
+                                    match node.db.get_code(&state.code_hash) {
+                                        Ok(Some(code)) => {
+                                            rpc_ok(&format!("\"0x{}\"", hex::encode(code)), id)
+                                        }
+                                        Ok(None) => {
+                                            rpc_error(-32000, "historical code not found", id)
+                                        }
+                                        Err(err) => rpc_error(
+                                            -32000,
+                                            &format!("failed to load historical code: {}", err),
+                                            id,
+                                        ),
+                                    }
+                                }
+                            }
+                            Ok(None) => rpc_ok("\"0x\"", id),
+                            Err(message) => rpc_error(-32000, &message, id),
+                        };
+                    }
                     let evm = node.evm.read().await;
                     let code = evm.get_code(addr);
                     rpc_ok(&format!("\"0x{}\"", hex::encode(&code)), id)
@@ -11201,6 +11973,24 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let slot_str = params.get(1).and_then(|v| v.as_str()).unwrap_or("0x0");
             match (parse_hex_address(addr_str), parse_hex_hash(slot_str)) {
                 (Some(addr), Some(slot)) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(2).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return match load_historical_storage_value(
+                            node,
+                            addr,
+                            slot,
+                            query.block_height,
+                        ) {
+                            Ok(value) => rpc_ok(&format!("\"0x{}\"", hex::encode(value)), id),
+                            Err(message) => rpc_error(-32000, &message, id),
+                        };
+                    }
                     let evm = node.evm.read().await;
                     let value = evm.get_storage_at(addr, slot);
                     rpc_ok(&format!("\"0x{}\"", hex::encode(value)), id)
@@ -11219,16 +12009,13 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let current_height = current_cchain_height(node);
-            let allow_current = match params.get(2) {
-                None => true,
-                Some(serde_json::Value::Null) => true,
-                Some(serde_json::Value::String(tag)) if tag == "latest" || tag == "pending" => true,
-                Some(value) => parse_block_number(value, node) == current_height,
+            let query = match resolve_cchain_state_query(
+                params.get(2).unwrap_or(&serde_json::Value::Null),
+                node,
+            ) {
+                Ok(query) => query,
+                Err(message) => return rpc_error(-32000, &message, id),
             };
-            if !allow_current {
-                return rpc_error(-32000, "historical proof query not allowed", id);
-            }
             let Some(address) = parse_hex_address(addr_str) else {
                 return rpc_error(-32602, "invalid address", id);
             };
@@ -11242,7 +12029,15 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 };
                 parsed_keys.push((slot, key_str.to_string()));
             }
-            let proof = node.evm.read().await.get_proof(address, &parsed_keys);
+            let proof = if query.is_current {
+                node.evm.read().await.get_proof(address, &parsed_keys)
+            } else {
+                let historical_evm = match historical_evm_at_height(node, query.block_height) {
+                    Ok(evm) => evm,
+                    Err(message) => return rpc_error(-32000, &message, id),
+                };
+                historical_evm.get_proof(address, &parsed_keys)
+            };
             rpc_ok(
                 &serde_json::to_value(proof)
                     .unwrap_or(serde_json::Value::Null)
@@ -11259,8 +12054,30 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             if tx_obj.is_none() {
                 return rpc_error(-32602, "missing transaction object", id);
             }
-            let evm = node.evm.read().await;
-            let block_ctx = rpc_simulation_block_context(node);
+            let query = match resolve_cchain_state_query(
+                params.get(1).unwrap_or(&serde_json::Value::Null),
+                node,
+            ) {
+                Ok(query) => query,
+                Err(message) => return rpc_error(-32000, &message, id),
+            };
+            let (evm, block_ctx) = if query.is_current {
+                (
+                    node.evm.read().await.snapshot(),
+                    rpc_simulation_block_context(node),
+                )
+            } else {
+                let historical_evm = match historical_evm_at_height(node, query.block_height) {
+                    Ok(evm) => evm,
+                    Err(message) => return rpc_error(-32000, &message, id),
+                };
+                let historical_block_ctx =
+                    match historical_rpc_simulation_block_context(node, query.block_height) {
+                        Ok(block_ctx) => block_ctx,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                (historical_evm, historical_block_ctx)
+            };
             let parsed = parse_rpc_simulation_tx(tx_obj.unwrap(), &evm, &block_ctx);
             match evm.execute_call(&parsed.tx, &block_ctx) {
                 Ok(output) => rpc_ok(&format!("\"0x{}\"", hex::encode(&output)), id),
@@ -11484,32 +12301,22 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(tx_hash_str) {
                 Some(tx_hash) => {
+                    let current_height = current_cchain_height(node);
                     if let Some(tx) = node.txpool.read().await.get(&tx_hash).cloned() {
                         let result = rpc_transaction_from_pool(&tx_hash, &tx, None, None, None);
                         return rpc_ok(&result.to_string(), id);
                     }
-                    match node.db.get_tx_index(&tx_hash) {
-                        Ok(Some((block_height, tx_index))) => {
-                            if let Some((block_hash, tx)) =
-                                load_mined_cchain_transaction(&node.db, block_height, tx_index)
-                            {
-                                let result = rpc_transaction_from_pool(
-                                    &tx_hash,
-                                    &tx,
-                                    Some(block_hash),
-                                    Some(block_height),
-                                    Some(tx_index),
-                                );
-                                rpc_ok(&result.to_string(), id)
-                            } else {
-                                rpc_ok(
-                                    &format!(
-                                        "{{\"hash\":\"0x{}\",\"blockNumber\":\"0x{:x}\",\"transactionIndex\":\"0x{:x}\"}}",
-                                        hex::encode(tx_hash), block_height, tx_index
-                                    ),
-                                    id,
-                                )
-                            }
+                    match load_indexed_mined_cchain_transaction(&node.db, &tx_hash, current_height)
+                    {
+                        Some((block_height, tx_index, block_hash, tx)) => {
+                            let result = rpc_transaction_from_pool(
+                                &tx_hash,
+                                &tx,
+                                Some(block_hash),
+                                Some(block_height),
+                                Some(tx_index),
+                            );
+                            rpc_ok(&result.to_string(), id)
                         }
                         _ => rpc_ok("null", id),
                     }
@@ -11546,8 +12353,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
                 return rpc_error(-32602, "invalid transaction index", id);
             };
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => {
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => {
                     match rpc_transaction_from_cchain_block_index(&block_data, tx_index) {
                         Some(result) => rpc_ok(&result.to_string(), id),
                         None => rpc_ok("null", id),
@@ -11564,24 +12375,17 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(tx_hash_str) {
                 Some(tx_hash) => {
+                    let current_height = current_cchain_height(node);
                     if let Some(tx) = node.txpool.read().await.get(&tx_hash).cloned() {
                         if let Some(raw) = tx.raw {
                             return rpc_ok(&format!("\"0x{}\"", hex::encode(raw)), id);
                         }
                     }
-                    match node.db.get_tx_index(&tx_hash) {
-                        Ok(Some((block_height, tx_index))) => match node.db.get_block(block_height)
-                        {
-                            Ok(Some(block_data)) => {
-                                match raw_transaction_hex_from_cchain_block_index(
-                                    &block_data,
-                                    tx_index as u64,
-                                ) {
-                                    Some(result) => rpc_ok(&format!("\"{}\"", result), id),
-                                    None => rpc_ok("null", id),
-                                }
-                            }
-                            _ => rpc_ok("null", id),
+                    match load_indexed_mined_cchain_transaction(&node.db, &tx_hash, current_height)
+                    {
+                        Some((_, _, _, tx)) => match tx.raw {
+                            Some(raw) => rpc_ok(&format!("\"0x{}\"", hex::encode(raw)), id),
+                            None => rpc_ok("null", id),
                         },
                         _ => rpc_ok("null", id),
                     }
@@ -11615,8 +12419,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let Some(tx_index) = params.get(1).and_then(parse_quantity_u64) else {
                 return rpc_error(-32602, "invalid transaction index", id);
             };
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => {
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => {
                     match raw_transaction_hex_from_cchain_block_index(&block_data, tx_index) {
                         Some(result) => rpc_ok(&format!("\"{}\"", result), id),
                         None => rpc_ok("null", id),
@@ -11633,23 +12441,18 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(tx_hash_str) {
                 Some(tx_hash) => {
-                    match node.db.get_tx_index(&tx_hash) {
-                        Ok(Some((block_height, tx_index))) => {
+                    match load_indexed_mined_cchain_transaction(
+                        &node.db,
+                        &tx_hash,
+                        current_cchain_height(node),
+                    ) {
+                        Some((block_height, tx_index, _, _)) => {
                             match node.db.get_receipt(block_height, tx_index) {
                                 Ok(Some(receipt_data)) => {
                                     let receipt_json = String::from_utf8_lossy(&receipt_data);
                                     rpc_ok(&receipt_json, id)
                                 }
-                                _ => {
-                                    // Return minimal receipt from index data
-                                    rpc_ok(
-                                        &format!(
-                                            "{{\"transactionHash\":\"0x{}\",\"blockNumber\":\"0x{:x}\",\"transactionIndex\":\"0x{:x}\",\"status\":\"0x1\"}}",
-                                            hex::encode(tx_hash), block_height, tx_index
-                                        ),
-                                        id,
-                                    )
-                                }
+                                _ => rpc_ok("null", id),
                             }
                         }
                         _ => rpc_ok("null", id),
@@ -11666,13 +12469,16 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
             let include_full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => {
-                    match rpc_block_from_cchain_data(&block_data, include_full_txs) {
-                        Some(result) => rpc_ok(&result.to_string(), id),
-                        None => rpc_ok("null", id),
-                    }
-                }
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => match rpc_block_from_cchain_data(&block_data, include_full_txs)
+                {
+                    Some(result) => rpc_ok(&result.to_string(), id),
+                    None => rpc_ok("null", id),
+                },
                 _ => rpc_ok("null", id),
             }
         }
@@ -11709,8 +12515,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         "eth_getBlockTransactionCountByNumber" => {
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
-            match node.db.get_block(block_num) {
-                Ok(Some(block_data)) => rpc_ok(
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(block_data) => rpc_ok(
                     &format!("\"0x{:x}\"", cchain_transaction_count(&block_data)),
                     id,
                 ),
@@ -11789,6 +12599,10 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 filter_id,
                 RpcFilter::AcceptedTransactions(AcceptedTransactionFilter {
                     last_polled_block: current_cchain_height(node),
+                    last_polled_hash: canonical_cchain_block_hash_at_height(
+                        &node.db,
+                        current_cchain_height(node),
+                    ),
                     full_tx,
                 }),
             );
@@ -11801,6 +12615,10 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 filter_id,
                 RpcFilter::Blocks(BlockHashFilter {
                     last_polled_block: current_cchain_height(node),
+                    last_polled_hash: canonical_cchain_block_hash_at_height(
+                        &node.db,
+                        current_cchain_height(node),
+                    ),
                 }),
             );
             rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
@@ -11819,12 +12637,18 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         .to_block
                         .unwrap_or(current_height)
                         .min(current_height);
-                    let start_block = filter
-                        .last_polled_block
-                        .saturating_add(1)
-                        .max(filter.from_block);
+                    let start_block = canonical_filter_start_block(
+                        &node.db,
+                        filter.last_polled_block,
+                        filter.last_polled_hash,
+                        current_height,
+                    )
+                    .map(|block| block.max(filter.from_block))
+                    .unwrap_or(end_block.saturating_add(1));
                     let logs = collect_logs_for_range(&node.db, filter, start_block, end_block);
                     filter.last_polled_block = current_height;
+                    filter.last_polled_hash =
+                        canonical_cchain_block_hash_at_height(&node.db, current_height);
                     rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
                 }
                 Some(RpcFilter::PendingTransactions(filter)) => {
@@ -11833,14 +12657,28 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 }
                 Some(RpcFilter::Blocks(filter)) => {
                     let current_height = current_cchain_height(node);
-                    let start_block = filter.last_polled_block.saturating_add(1);
+                    let start_block = canonical_filter_start_block(
+                        &node.db,
+                        filter.last_polled_block,
+                        filter.last_polled_hash,
+                        current_height,
+                    )
+                    .unwrap_or(current_height.saturating_add(1));
                     let changes = block_hash_changes(&node.db, start_block, current_height);
                     filter.last_polled_block = current_height;
+                    filter.last_polled_hash =
+                        canonical_cchain_block_hash_at_height(&node.db, current_height);
                     rpc_ok(&serde_json::Value::Array(changes).to_string(), id)
                 }
                 Some(RpcFilter::AcceptedTransactions(filter)) => {
                     let current_height = current_cchain_height(node);
-                    let start_block = filter.last_polled_block.saturating_add(1);
+                    let start_block = canonical_filter_start_block(
+                        &node.db,
+                        filter.last_polled_block,
+                        filter.last_polled_hash,
+                        current_height,
+                    )
+                    .unwrap_or(current_height.saturating_add(1));
                     let changes = accepted_transaction_changes(
                         &node.db,
                         start_block,
@@ -11848,6 +12686,8 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         filter.full_tx,
                     );
                     filter.last_polled_block = current_height;
+                    filter.last_polled_hash =
+                        canonical_cchain_block_hash_at_height(&node.db, current_height);
                     rpc_ok(&serde_json::Value::Array(changes).to_string(), id)
                 }
                 None => rpc_error(-32000, "filter not found", id),
@@ -12874,19 +13714,21 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         let result = trace_pending_transaction(&evm, &tx, &block_ctx, &config);
                         rpc_ok(&result.to_string(), id)
                     } else {
-                        match node.db.get_tx_index(&hash) {
-                            Ok(Some((block_height, tx_index))) => {
-                                match trace_mined_transaction(
-                                    &node.db,
-                                    node.config.chain_id,
-                                    block_height,
-                                    tx_index,
-                                    &config,
-                                ) {
-                                    Ok(result) => rpc_ok(&result.to_string(), id),
-                                    Err(msg) => rpc_error(-32000, &msg, id),
-                                }
-                            }
+                        match load_indexed_mined_cchain_transaction(
+                            &node.db,
+                            &hash,
+                            current_cchain_height(node),
+                        ) {
+                            Some((block_height, tx_index, _, _)) => match trace_mined_transaction(
+                                &node.db,
+                                node.config.chain_id,
+                                block_height,
+                                tx_index,
+                                &config,
+                            ) {
+                                Ok(result) => rpc_ok(&result.to_string(), id),
+                                Err(msg) => rpc_error(-32000, &msg, id),
+                            },
                             _ => rpc_error(-32000, "transaction not found", id),
                         }
                     }
@@ -12899,6 +13741,15 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
             let config = TraceConfig::from_json(params.get(1).unwrap_or(&serde_json::Value::Null));
+            if load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            )
+            .is_none()
+            {
+                return rpc_error(-32000, &format!("block #{} not found", block_num), id);
+            }
             match trace_mined_block(&node.db, node.config.chain_id, block_num, &config) {
                 Ok(result) => rpc_ok(&result.to_string(), id),
                 Err(msg) => rpc_error(-32000, &msg, id),
@@ -12908,8 +13759,12 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         "debug_getBlockByNumber" => {
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
-            match node.db.get_block(block_num) {
-                Ok(Some(data)) => rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id),
+            match load_canonical_cchain_block_by_number(
+                &node.db,
+                block_num,
+                current_cchain_height(node),
+            ) {
+                Some(data) => rpc_ok(&format!("\"0x{}\"", hex::encode(&data)), id),
                 _ => rpc_ok("null", id),
             }
         }
@@ -12964,12 +13819,19 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 params.get(0).unwrap_or(&serde_json::Value::Null),
                 node,
             ) {
-                Ok(Some(block_num)) => match node.db.get_block_receipts(block_num) {
-                    Ok(Some(data)) => {
-                        let receipts_json = String::from_utf8_lossy(&data);
-                        rpc_ok(&receipts_json, id)
-                    }
-                    _ => rpc_ok("[]", id),
+                Ok(Some(block_num)) => match load_canonical_cchain_block_by_number(
+                    &node.db,
+                    block_num,
+                    current_cchain_height(node),
+                ) {
+                    Some(_) => match node.db.get_block_receipts(block_num) {
+                        Ok(Some(data)) => {
+                            let receipts_json = String::from_utf8_lossy(&data);
+                            rpc_ok(&receipts_json, id)
+                        }
+                        _ => rpc_ok("[]", id),
+                    },
+                    None => rpc_ok("null", id),
                 },
                 Ok(None) => rpc_ok("null", id),
                 Err(msg) => rpc_error(-32602, &msg, id),
@@ -13284,17 +14146,14 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
         "info.getNodeVersion" => rpc_ok(&info_get_node_version_result().to_string(), id),
 
         "info.peers" => {
-            let pm = node.peer_manager.read().await;
             let requested_node_ids = info_node_ids_param(params);
             let requested = requested_node_ids
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>();
-            let peers = pm
-                .connected_peers()
+            let peers = cached_connected_peers(node)
                 .into_iter()
-                .filter_map(|node_id| pm.get_peer(&node_id))
                 .filter(|peer| requested.is_empty() || requested.contains(&peer.node_id.0))
-                .map(info_peer_json)
+                .map(|peer| info_peer_json(&peer))
                 .collect::<Vec<_>>();
             rpc_ok(
                 &serde_json::json!({
@@ -13600,9 +14459,8 @@ mod integration_tests {
 
     static FILTER_TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn make_test_node(network_id: u32) -> Arc<NodeState> {
+    fn make_test_node_with_db(network_id: u32, db: Database, archive: bool) -> Arc<NodeState> {
         let identity = NodeIdentity::generate().expect("generate node identity");
-        let (db, _dir) = Database::open_temp().expect("open temp db");
         let evm = Arc::new(RwLock::new(EvmExecutor::new(43114)));
 
         let net_config = NetworkConfig {
@@ -13627,6 +14485,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id,
                 data_dir: PathBuf::from("./data/test-rpc"),
@@ -13643,7 +14502,7 @@ mod integration_tests {
                 validator: false,
                 state_pruning_depth: 256,
                 light_client: false,
-                archive: false,
+                archive,
                 blob_retention_epochs: 4096,
                 txpool_size: 4096,
                 block_cache_size: 1024,
@@ -13673,7 +14532,7 @@ mod integration_tests {
             rpc_wallets: Arc::new(StdHashMap::new()),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
-            archive_store: Arc::new(ArchiveStore::new(false)),
+            archive_store: Arc::new(ArchiveStore::new(archive)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
             ws_subscriptions: Arc::new(RwLock::new(SubscriptionManager::new(1024))),
@@ -13686,6 +14545,36 @@ mod integration_tests {
             #[cfg(feature = "indexer")]
             indexer: None,
         })
+    }
+
+    fn make_test_node(network_id: u32) -> Arc<NodeState> {
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        make_test_node_with_db(network_id, db, false)
+    }
+
+    fn reconfigure_test_node(
+        node: Arc<NodeState>,
+        configure: impl FnOnce(&mut Cli),
+    ) -> Arc<NodeState> {
+        let mut base = Arc::into_inner(node).expect("single test node ref");
+        configure(&mut base.config);
+        Arc::new(base)
+    }
+
+    fn make_test_node_with_bootstrap_ips(
+        network_id: u32,
+        bootstrap_ips: Vec<String>,
+        connection_pool_size: usize,
+    ) -> Arc<NodeState> {
+        reconfigure_test_node(make_test_node(network_id), |config| {
+            config.bootstrap_ips = bootstrap_ips;
+            config.connection_pool_size = connection_pool_size;
+        })
+    }
+
+    fn make_test_archive_node(network_id: u32) -> Arc<NodeState> {
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        make_test_node_with_db(network_id, db, true)
     }
 
     fn make_test_node_with_rpc_wallets(network_id: u32, wallets: Vec<Wallet>) -> Arc<NodeState> {
@@ -13734,6 +14623,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id,
                 data_dir: PathBuf::from("./data/test-rpc"),
@@ -13795,6 +14685,116 @@ mod integration_tests {
         })
     }
 
+    async fn spawn_test_bootstrap_peer(
+        network_id: u32,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let node = make_test_node(network_id);
+        let (handshake_tx, handshake_rx) = tokio::sync::oneshot::channel();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test bootstrap peer");
+        let addr = listener.local_addr().expect("test bootstrap local addr");
+        let handle = tokio::spawn(async move {
+            let mut handshake_tx = Some(handshake_tx);
+            while let Ok((stream, peer_addr)) = listener.accept().await {
+                let node = node.clone();
+                let advertised_addr = addr;
+                let handshake_tx = handshake_tx.take();
+                tokio::spawn(async move {
+                    let tls_config = node
+                        .identity
+                        .tls_server_config()
+                        .expect("test bootstrap tls server config");
+                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+                    let mut tls_stream = acceptor
+                        .accept(stream)
+                        .await
+                        .expect("accept test bootstrap tls");
+                    read_one_decoded_message(&mut tls_stream, peer_addr, 5)
+                        .await
+                        .expect("read bootstrap handshake");
+
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let version = NetworkMessage::Version {
+                        network_id,
+                        node_id: node.identity.node_id.clone(),
+                        my_time: now,
+                        ip_addr: vec![127, 0, 0, 1],
+                        ip_port: advertised_addr.port(),
+                        my_version: "avalanchego/1.14.1".to_string(),
+                        my_version_time: 0,
+                        sig: Vec::new(),
+                        tracked_subnets: Vec::new(),
+                        supported_acps: local_supported_acps(network_id, now),
+                        objected_acps: Vec::new(),
+                    };
+                    let peer_list = NetworkMessage::PeerList { peers: vec![] };
+                    let version_encoded = version.encode_proto().expect("encode test version");
+                    let peer_list_encoded = peer_list.encode_proto().expect("encode test peerlist");
+                    tls_stream
+                        .write_all(&version_encoded)
+                        .await
+                        .expect("write test version");
+                    tls_stream.flush().await.expect("flush test version");
+                    tls_stream
+                        .write_all(&peer_list_encoded)
+                        .await
+                        .expect("write test peerlist");
+                    tls_stream.flush().await.expect("flush test peerlist");
+                    let peer_list_from_client =
+                        read_one_decoded_message(&mut tls_stream, peer_addr, 5)
+                            .await
+                            .expect("read client peerlist");
+                    if matches!(
+                        peer_list_from_client.message,
+                        NetworkMessage::PeerList { .. }
+                    ) {
+                        if let Some(handshake_tx) = handshake_tx {
+                            let _ = handshake_tx.send(());
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (addr, handshake_rx, handle)
+    }
+
+    async fn spawn_hanging_bootstrap_peer() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging bootstrap peer");
+        let addr = listener.local_addr().expect("hanging bootstrap local addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _stream = stream;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        (addr, handle)
+    }
+
+    async fn spawn_non_tls_bootstrap_peer() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind non-tls bootstrap peer");
+        let addr = listener.local_addr().expect("non-tls bootstrap local addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(b"not tls").await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, handle)
+    }
+
     fn make_banff_std_with_timestamp(parent: [u8; 32], height: u64, timestamp: u64) -> Vec<u8> {
         let mut raw = vec![0u8; 54];
         raw[2..6].copy_from_slice(&32u32.to_be_bytes());
@@ -13806,6 +14806,18 @@ mod integration_tests {
 
     fn make_banff_std(parent: [u8; 32], height: u64) -> Vec<u8> {
         make_banff_std_with_timestamp(parent, height, 1_700_000_000)
+    }
+
+    fn encode_coreth_block_response(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut encoded =
+            Vec::with_capacity(6 + blocks.iter().map(|block| 4 + block.len()).sum::<usize>());
+        encoded.extend_from_slice(&0u16.to_be_bytes());
+        encoded.extend_from_slice(&(blocks.len() as u32).to_be_bytes());
+        for block in blocks {
+            encoded.extend_from_slice(&(block.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(block);
+        }
+        encoded
     }
 
     fn make_signed_platform_base_tx_bytes() -> Vec<u8> {
@@ -14348,6 +15360,54 @@ mod integration_tests {
         outer_payload.push(0xc0); // uncles = empty
         outer_payload.push(0x80); // version = 0
         outer_payload.extend_from_slice(&rlp_bytes_for_test(extdata));
+        rlp_list_for_test(outer_payload)
+    }
+
+    fn make_cchain_coreth_block_with_transactions(
+        parent: [u8; 32],
+        number: u64,
+        timestamp: u64,
+        txs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut header_payload = Vec::new();
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&parent);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0x1d; 32]);
+        header_payload.push(0x94);
+        header_payload.extend_from_slice(&[0u8; 20]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xb9);
+        header_payload.push(0x01);
+        header_payload.push(0x00);
+        header_payload.extend_from_slice(&[0u8; 256]);
+        header_payload.push(0x80);
+        encode_rlp_u64_for_test(&mut header_payload, number);
+        encode_rlp_u64_for_test(&mut header_payload, 30_000_000);
+        header_payload.push(0x80);
+        encode_rlp_u64_for_test(&mut header_payload, timestamp);
+        header_payload.push(0x80);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]);
+        encode_rlp_u64_for_test(&mut header_payload, 25_000_000_000);
+
+        let txs_payload = txs
+            .iter()
+            .flat_map(|tx| tx.iter().copied())
+            .collect::<Vec<_>>();
+
+        let mut outer_payload = Vec::new();
+        outer_payload.extend_from_slice(&rlp_list_for_test(header_payload));
+        outer_payload.extend_from_slice(&rlp_list_for_test(txs_payload));
+        outer_payload.push(0xc0); // uncles = empty
+        outer_payload.push(0x80); // version = 0
+        outer_payload.extend_from_slice(&rlp_bytes_for_test(&[]));
         rlp_list_for_test(outer_payload)
     }
 
@@ -15480,6 +16540,27 @@ mod integration_tests {
             min_stake_json["result"]["minDelegatorStake"],
             MIN_DELEGATOR_STAKE.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn test_platform_get_height_ignores_mismatched_block_keys() {
+        let node = make_test_node(1);
+
+        let canonical_block = make_banff_std([0x11; 32], 42);
+        let canonical_id = sha256_bytes(&canonical_block);
+        node.db
+            .put_cf(CF_BLOCKS, &canonical_id, &canonical_block)
+            .unwrap();
+
+        let bogus_high_block = make_banff_std([0x22; 32], 9_999);
+        node.db
+            .put_cf(CF_BLOCKS, &[0xAB; 32], &bogus_high_block)
+            .unwrap();
+
+        let height_req = r#"{"jsonrpc":"2.0","method":"platform.getHeight","params":{},"id":9}"#;
+        let height_response = handle_rpc_request(height_req, &node).await;
+        let height_json: serde_json::Value = serde_json::from_str(&height_response).unwrap();
+        assert_eq!(height_json["result"]["height"], "42");
     }
 
     #[tokio::test]
@@ -17779,6 +18860,12 @@ mod integration_tests {
     async fn test_info_endpoints_return_avalanchego_shapes() {
         let node = make_test_node(1);
         node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        {
+            let mut c_metrics = node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 34;
+            c_metrics.blocks_synced = 1;
+        }
         *node.resolved_public_ip.write().await = Some("198.51.100.8:9651".parse().unwrap());
 
         let peer_id = NodeId([0x11; 20]);
@@ -18147,6 +19234,12 @@ mod integration_tests {
     async fn test_admin_alias_chain_updates_chain_alias_resolution() {
         let node = make_test_node(1);
         node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        {
+            let mut c_metrics = node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 34;
+            c_metrics.blocks_synced = 1;
+        }
 
         let alias_req = r#"{"jsonrpc":"2.0","method":"admin.aliasChain","params":{"chain":"C","alias":"myc"},"id":37}"#;
         let alias_response = handle_rpc_request(alias_req, &node).await;
@@ -18224,6 +19317,7 @@ mod integration_tests {
             let mut c = node.c_chain_metrics.write().await;
             c.tip_height = 34;
             c.tip_hash = [0xCC; 32];
+            c.blocks_synced = 1;
         }
 
         let mut peer = Peer::new(NodeId([0x42; 20]), "127.0.0.1:9651".parse().unwrap());
@@ -18262,6 +19356,149 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_bootstrap_truthfulness_requires_cchain_progress_for_global_readiness() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+
+        let p_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"P"},"id":30}"#;
+        let p_response = handle_rpc_request(p_req, &node).await;
+        let p_json: serde_json::Value = serde_json::from_str(&p_response).unwrap();
+        assert_eq!(p_json["result"]["isBootstrapped"], true);
+
+        let c_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"C"},"id":31}"#;
+        let c_response = handle_rpc_request(c_req, &node).await;
+        let c_json: serde_json::Value = serde_json::from_str(&c_response).unwrap();
+        assert_eq!(c_json["result"]["isBootstrapped"], false);
+
+        let readiness_req = r#"{"jsonrpc":"2.0","method":"health.readiness","params":{},"id":32}"#;
+        let readiness_response = handle_rpc_request(readiness_req, &node).await;
+        let readiness_json: serde_json::Value = serde_json::from_str(&readiness_response).unwrap();
+        assert_eq!(readiness_json["result"]["healthy"], false);
+        assert_eq!(
+            readiness_json["result"]["checks"]["bootstrapped"]["error"],
+            "node is bootstrapping"
+        );
+
+        let p_readiness_req =
+            r#"{"jsonrpc":"2.0","method":"health.readiness","params":{"tags":["P"]},"id":33}"#;
+        let p_readiness_response = handle_rpc_request(p_readiness_req, &node).await;
+        let p_readiness_json: serde_json::Value =
+            serde_json::from_str(&p_readiness_response).unwrap();
+        assert_eq!(p_readiness_json["result"]["healthy"], true);
+    }
+
+    #[tokio::test]
+    async fn test_headers_only_cchain_progress_does_not_mark_node_bootstrapped() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        {
+            let mut c_metrics = node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 34;
+            c_metrics.blocks_synced = 1;
+            c_metrics.headers_only = true;
+        }
+        node.db.set_last_accepted_height(34).unwrap();
+
+        let c_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"C"},"id":34}"#;
+        let c_response = handle_rpc_request(c_req, &node).await;
+        let c_json: serde_json::Value = serde_json::from_str(&c_response).unwrap();
+        assert_eq!(c_json["result"]["isBootstrapped"], false);
+
+        let readiness_req = r#"{"jsonrpc":"2.0","method":"health.readiness","params":{},"id":35}"#;
+        let readiness_response = handle_rpc_request(readiness_req, &node).await;
+        let readiness_json: serde_json::Value = serde_json::from_str(&readiness_response).unwrap();
+        assert_eq!(readiness_json["result"]["healthy"], false);
+        assert_eq!(
+            readiness_json["result"]["checks"]["bootstrapped"]["error"],
+            "node is bootstrapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_snapshot_serves_info_and_health_when_peer_manager_is_locked() {
+        let node = make_test_node(1);
+        node.sync_engine.mark_following().await;
+        node.p_chain_metrics.write().await.tip_height = 12;
+        node.c_chain_metrics.write().await.tip_height = 34;
+        node.c_chain_metrics.write().await.blocks_synced = 1;
+        node.db.set_last_accepted_height(34).unwrap();
+
+        let mut peer = Peer::new(NodeId([0x42; 20]), "127.0.0.1:9651".parse().unwrap());
+        peer.state = PeerState::Connected;
+        peer.last_ping_sent = Some(Instant::now());
+        peer.public_ip = Some("203.0.113.10:9651".parse().unwrap());
+        {
+            let mut pm = node.peer_manager.write().await;
+            pm.add_peer(peer).unwrap();
+            refresh_peer_snapshot_from_manager(&pm, &node.peer_snapshot);
+        }
+
+        let _peer_manager_guard = node.peer_manager.write().await;
+
+        let peers_req = r#"{"jsonrpc":"2.0","method":"info.peers","params":{},"id":34}"#;
+        let peers_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            handle_rpc_request(peers_req, &node),
+        )
+        .await
+        .expect("info.peers should not block on peer manager lock");
+        let peers_json: serde_json::Value = serde_json::from_str(&peers_response).unwrap();
+        assert_eq!(peers_json["result"]["numPeers"], "1");
+        assert_eq!(peers_json["result"]["peers"].as_array().unwrap().len(), 1);
+
+        let health_req =
+            r#"{"jsonrpc":"2.0","method":"health.health","params":{"tags":["C"]},"id":35}"#;
+        let health_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            handle_rpc_request(health_req, &node),
+        )
+        .await
+        .expect("health.health should not block on peer manager lock");
+        let health_json: serde_json::Value = serde_json::from_str(&health_response).unwrap();
+        assert_eq!(health_json["result"]["healthy"], true);
+        assert_eq!(
+            health_json["result"]["checks"]["network"]["message"]["connectedPeers"],
+            1
+        );
+    }
+
+    #[test]
+    fn test_expand_cchain_ancestor_containers_decodes_coreth_block_response() {
+        let genesis = encode_cchain_block_rlp(
+            &[0u8; 32],
+            &[0u8; 20],
+            &[1u8; 32],
+            0,
+            DEFAULT_CCHAIN_GAS_LIMIT,
+            0,
+            1_700_000_000,
+            DEFAULT_BASE_FEE_PER_GAS,
+            &[],
+        );
+        let genesis_hash = cchain_block_hash(&genesis);
+        let child = encode_cchain_block_rlp(
+            &genesis_hash,
+            &[0u8; 20],
+            &[2u8; 32],
+            1,
+            DEFAULT_CCHAIN_GAS_LIMIT,
+            0,
+            1_700_000_002,
+            DEFAULT_BASE_FEE_PER_GAS,
+            &[],
+        );
+
+        let wrapped = encode_coreth_block_response(&[child.clone(), genesis.clone()]);
+        let expanded = expand_cchain_ancestor_containers(&[wrapped]);
+        assert_eq!(expanded, vec![child, genesis]);
+    }
+
+    #[tokio::test]
     async fn test_http_ext_health_status_codes_and_paths() {
         let unhealthy_node = make_test_node(1);
         let unhealthy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -18284,7 +19521,11 @@ mod integration_tests {
         let healthy_node = make_test_node(1);
         healthy_node.sync_engine.mark_following().await;
         healthy_node.p_chain_metrics.write().await.tip_height = 7;
-        healthy_node.c_chain_metrics.write().await.tip_height = 8;
+        {
+            let mut c_metrics = healthy_node.c_chain_metrics.write().await;
+            c_metrics.tip_height = 8;
+            c_metrics.blocks_synced = 1;
+        }
         let mut peer = Peer::new(NodeId([0x24; 20]), "127.0.0.1:9651".parse().unwrap());
         peer.state = PeerState::Connected;
         healthy_node
@@ -18862,6 +20103,377 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_hash_based_transaction_lookups_reject_stale_tx_indexes() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 50_000,
+            to: Some([0x8B; 20]),
+            value: 7,
+            data: vec![0xCA, 0xFE],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let real_tx_hash = keccak_tx_hash(&signed.raw);
+        let fake_tx_hash = [0xEE; 32];
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":21}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert_eq!(
+            submit_json["result"],
+            format!("0x{}", hex::encode(real_tx_hash))
+        );
+
+        let pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let block = build_cchain_block(&node, 1, pool_txs.clone())
+            .await
+            .expect("block should build");
+
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&block.id);
+        node.db.put_cf(CF_BLOCKS, &key, &block.raw).unwrap();
+        node.db.put_block(block.number, &block.raw).unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &block, &pool_txs).unwrap();
+        node.db.set_last_accepted_height(block.number).unwrap();
+        reconcile_mined_pool_transactions(&node, &pool_txs).await;
+
+        node.db.put_tx_index(&fake_tx_hash, 1, 0).unwrap();
+
+        let tx_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":22}}"#,
+            hex::encode(fake_tx_hash)
+        );
+        let tx_lookup_response = handle_rpc_request(&tx_lookup_req, &node).await;
+        let tx_lookup_json: serde_json::Value = serde_json::from_str(&tx_lookup_response).unwrap();
+        assert_eq!(tx_lookup_json["result"], serde_json::Value::Null);
+
+        let raw_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getRawTransactionByHash","params":["0x{}"],"id":23}}"#,
+            hex::encode(fake_tx_hash)
+        );
+        let raw_lookup_response = handle_rpc_request(&raw_lookup_req, &node).await;
+        let raw_lookup_json: serde_json::Value =
+            serde_json::from_str(&raw_lookup_response).unwrap();
+        assert_eq!(raw_lookup_json["result"], serde_json::Value::Null);
+
+        let receipt_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":24}}"#,
+            hex::encode(fake_tx_hash)
+        );
+        let receipt_lookup_response = handle_rpc_request(&receipt_lookup_req, &node).await;
+        let receipt_lookup_json: serde_json::Value =
+            serde_json::from_str(&receipt_lookup_response).unwrap();
+        assert_eq!(receipt_lookup_json["result"], serde_json::Value::Null);
+
+        let trace_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"debug_traceTransaction","params":["0x{}",{{}}],"id":25}}"#,
+            hex::encode(fake_tx_hash)
+        );
+        let trace_lookup_response = handle_rpc_request(&trace_lookup_req, &node).await;
+        let trace_lookup_json: serde_json::Value =
+            serde_json::from_str(&trace_lookup_response).unwrap();
+        assert_eq!(
+            trace_lookup_json["error"]["message"],
+            "transaction not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hash_based_transaction_lookups_reject_orphaned_blocks_above_tip() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let first_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x81; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let first_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":26}}"#,
+            first_signed.raw_hex()
+        );
+        let first_submit_response = handle_rpc_request(&first_submit_req, &node).await;
+        let first_submit_json: serde_json::Value =
+            serde_json::from_str(&first_submit_response).unwrap();
+        assert!(first_submit_json.get("result").is_some());
+
+        let first_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let first_block = build_cchain_block(&node, 1, first_pool_txs.clone())
+            .await
+            .expect("first block should build");
+        let mut first_key = Vec::with_capacity(34);
+        first_key.extend_from_slice(b"c:");
+        first_key.extend_from_slice(&first_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &first_key, &first_block.raw)
+            .unwrap();
+        node.db
+            .put_block(first_block.number, &first_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &first_block, &first_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(first_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &first_pool_txs).await;
+
+        let second_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x82; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let second_tx_hash = keccak_tx_hash(&second_signed.raw);
+        let second_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":27}}"#,
+            second_signed.raw_hex()
+        );
+        let second_submit_response = handle_rpc_request(&second_submit_req, &node).await;
+        let second_submit_json: serde_json::Value =
+            serde_json::from_str(&second_submit_response).unwrap();
+        assert_eq!(
+            second_submit_json["result"],
+            format!("0x{}", hex::encode(second_tx_hash))
+        );
+
+        let second_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let second_block = build_cchain_block(&node, 2, second_pool_txs.clone())
+            .await
+            .expect("second block should build");
+        let mut second_key = Vec::with_capacity(34);
+        second_key.extend_from_slice(b"c:");
+        second_key.extend_from_slice(&second_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &second_key, &second_block.raw)
+            .unwrap();
+        node.db
+            .put_block(second_block.number, &second_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &second_block, &second_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(second_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &second_pool_txs).await;
+
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let tx_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":28}}"#,
+            hex::encode(second_tx_hash)
+        );
+        let tx_lookup_response = handle_rpc_request(&tx_lookup_req, &node).await;
+        let tx_lookup_json: serde_json::Value = serde_json::from_str(&tx_lookup_response).unwrap();
+        assert_eq!(tx_lookup_json["result"], serde_json::Value::Null);
+
+        let raw_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getRawTransactionByHash","params":["0x{}"],"id":29}}"#,
+            hex::encode(second_tx_hash)
+        );
+        let raw_lookup_response = handle_rpc_request(&raw_lookup_req, &node).await;
+        let raw_lookup_json: serde_json::Value =
+            serde_json::from_str(&raw_lookup_response).unwrap();
+        assert_eq!(raw_lookup_json["result"], serde_json::Value::Null);
+
+        let receipt_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":30}}"#,
+            hex::encode(second_tx_hash)
+        );
+        let receipt_lookup_response = handle_rpc_request(&receipt_lookup_req, &node).await;
+        let receipt_lookup_json: serde_json::Value =
+            serde_json::from_str(&receipt_lookup_response).unwrap();
+        assert_eq!(receipt_lookup_json["result"], serde_json::Value::Null);
+
+        let trace_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"debug_traceTransaction","params":["0x{}",{{}}],"id":31}}"#,
+            hex::encode(second_tx_hash)
+        );
+        let trace_lookup_response = handle_rpc_request(&trace_lookup_req, &node).await;
+        let trace_lookup_json: serde_json::Value =
+            serde_json::from_str(&trace_lookup_response).unwrap();
+        assert_eq!(
+            trace_lookup_json["error"]["message"],
+            "transaction not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_number_based_cchain_lookups_reject_orphaned_blocks_above_tip() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let first_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x91; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let first_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":32}}"#,
+            first_signed.raw_hex()
+        );
+        let first_submit_response = handle_rpc_request(&first_submit_req, &node).await;
+        let first_submit_json: serde_json::Value =
+            serde_json::from_str(&first_submit_response).unwrap();
+        assert!(first_submit_json.get("result").is_some());
+
+        let first_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let first_block = build_cchain_block(&node, 1, first_pool_txs.clone())
+            .await
+            .expect("first block should build");
+        let mut first_key = Vec::with_capacity(34);
+        first_key.extend_from_slice(b"c:");
+        first_key.extend_from_slice(&first_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &first_key, &first_block.raw)
+            .unwrap();
+        node.db
+            .put_block(first_block.number, &first_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &first_block, &first_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(first_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &first_pool_txs).await;
+
+        let second_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x92; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let second_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":33}}"#,
+            second_signed.raw_hex()
+        );
+        let second_submit_response = handle_rpc_request(&second_submit_req, &node).await;
+        let second_submit_json: serde_json::Value =
+            serde_json::from_str(&second_submit_response).unwrap();
+        assert!(second_submit_json.get("result").is_some());
+
+        let second_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let second_block = build_cchain_block(&node, 2, second_pool_txs.clone())
+            .await
+            .expect("second block should build");
+        let mut second_key = Vec::with_capacity(34);
+        second_key.extend_from_slice(b"c:");
+        second_key.extend_from_slice(&second_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &second_key, &second_block.raw)
+            .unwrap();
+        node.db
+            .put_block(second_block.number, &second_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &second_block, &second_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(second_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &second_pool_txs).await;
+
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let block_by_number_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x2",true],"id":34}"#;
+        let block_by_number_response = handle_rpc_request(block_by_number_req, &node).await;
+        let block_by_number_json: serde_json::Value =
+            serde_json::from_str(&block_by_number_response).unwrap();
+        assert_eq!(block_by_number_json["result"], serde_json::Value::Null);
+
+        let count_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getBlockTransactionCountByNumber","params":["0x2"],"id":35}"#;
+        let count_by_number_response = handle_rpc_request(count_by_number_req, &node).await;
+        let count_by_number_json: serde_json::Value =
+            serde_json::from_str(&count_by_number_response).unwrap();
+        assert_eq!(count_by_number_json["result"], serde_json::Value::Null);
+
+        let tx_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getTransactionByBlockNumberAndIndex","params":["0x2","0x0"],"id":36}"#;
+        let tx_by_number_response = handle_rpc_request(tx_by_number_req, &node).await;
+        let tx_by_number_json: serde_json::Value =
+            serde_json::from_str(&tx_by_number_response).unwrap();
+        assert_eq!(tx_by_number_json["result"], serde_json::Value::Null);
+
+        let raw_by_number_req = r#"{"jsonrpc":"2.0","method":"eth_getRawTransactionByBlockNumberAndIndex","params":["0x2","0x0"],"id":37}"#;
+        let raw_by_number_response = handle_rpc_request(raw_by_number_req, &node).await;
+        let raw_by_number_json: serde_json::Value =
+            serde_json::from_str(&raw_by_number_response).unwrap();
+        assert_eq!(raw_by_number_json["result"], serde_json::Value::Null);
+
+        let debug_block_req =
+            r#"{"jsonrpc":"2.0","method":"debug_getBlockByNumber","params":["0x2"],"id":38}"#;
+        let debug_block_response = handle_rpc_request(debug_block_req, &node).await;
+        let debug_block_json: serde_json::Value =
+            serde_json::from_str(&debug_block_response).unwrap();
+        assert_eq!(debug_block_json["result"], serde_json::Value::Null);
+
+        let debug_trace_block_req =
+            r#"{"jsonrpc":"2.0","method":"debug_traceBlockByNumber","params":["0x2",{}],"id":39}"#;
+        let debug_trace_block_response = handle_rpc_request(debug_trace_block_req, &node).await;
+        let debug_trace_block_json: serde_json::Value =
+            serde_json::from_str(&debug_trace_block_response).unwrap();
+        assert_eq!(
+            debug_trace_block_json["error"]["message"],
+            "block #2 not found"
+        );
+
+        let block_receipts_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockReceipts","params":["0x2"],"id":40}"#;
+        let block_receipts_response = handle_rpc_request(block_receipts_req, &node).await;
+        let block_receipts_json: serde_json::Value =
+            serde_json::from_str(&block_receipts_response).unwrap();
+        assert_eq!(block_receipts_json["result"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn test_eth_block_transaction_count_and_raw_index_lookups() {
         let node = make_test_node(1);
         let wallet = avalanche_rs::tx::Wallet::random(43114);
@@ -19007,7 +20619,7 @@ mod integration_tests {
             .expect("block should build");
 
         let importer_node = make_test_node(1);
-        execute_cchain_block_and_store(&block.raw, &importer_node).await;
+        execute_cchain_block_and_store(&block.raw, &importer_node, CChainImportMode::Strict).await;
 
         let imported_block = importer_node
             .db
@@ -19106,6 +20718,140 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_bootstrap_import_falls_back_to_headers_only_when_state_is_missing() {
+        let builder_node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 1,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0x97; 20]),
+            value: 5,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = builder_node.evm.write().await;
+            evm.set_account(*wallet.address(), u128::MAX / 2, 1, vec![]);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":27}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &builder_node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let block = build_cchain_block(
+            &builder_node,
+            1,
+            builder_node.txpool.read().await.pending_sorted_cloned(),
+        )
+        .await
+        .expect("block should build");
+
+        let importer_node = make_test_node(1);
+        let imported = execute_cchain_block_and_store(
+            &block.raw,
+            &importer_node,
+            CChainImportMode::BootstrapAllowHeaderOnly,
+        )
+        .await;
+        assert!(
+            imported,
+            "bootstrap import should fall back to header-only mode"
+        );
+        assert_eq!(importer_node.db.last_accepted_height().unwrap(), Some(1));
+        assert_eq!(importer_node.c_chain_metrics.read().await.tip_height, 1);
+        assert!(importer_node.c_chain_metrics.read().await.headers_only);
+
+        let receipt_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":28}}"#,
+            hex::encode(tx_hash)
+        );
+        let receipt_response = handle_rpc_request(&receipt_req, &importer_node).await;
+        let receipt_json: serde_json::Value = serde_json::from_str(&receipt_response).unwrap();
+        assert!(
+            receipt_json["result"].is_null(),
+            "header-only import should not fabricate receipts"
+        );
+
+        importer_node.sync_engine.mark_following().await;
+        importer_node.p_chain_metrics.write().await.tip_height = 12;
+        let boot_req =
+            r#"{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"C"},"id":29}"#;
+        let boot_response = handle_rpc_request(boot_req, &importer_node).await;
+        let boot_json: serde_json::Value = serde_json::from_str(&boot_response).unwrap();
+        assert_eq!(boot_json["result"]["isBootstrapped"], false);
+    }
+
+    #[tokio::test]
+    async fn test_missing_receipt_row_returns_null_after_restart() {
+        let (db, dir) = Database::open_temp().unwrap();
+        let builder_node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let tx = avalanche_rs::tx::LegacyTx {
+            nonce: 0,
+            gas_price: 25_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0x98; 20]),
+            value: 5,
+            data: vec![],
+        };
+        let signed = wallet.sign_legacy(&tx).expect("legacy tx should sign");
+        let tx_hash = keccak_tx_hash(&signed.raw);
+
+        {
+            let mut evm = builder_node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":27}}"#,
+            signed.raw_hex()
+        );
+        let submit_response = handle_rpc_request(&submit_req, &builder_node).await;
+        let submit_json: serde_json::Value = serde_json::from_str(&submit_response).unwrap();
+        assert!(submit_json.get("result").is_some());
+
+        let block = build_cchain_block(
+            &builder_node,
+            1,
+            builder_node.txpool.read().await.pending_sorted_cloned(),
+        )
+        .await
+        .expect("block should build");
+
+        db.put_block(1, &block.raw).unwrap();
+        db.put_tx_index(&tx_hash, 1, 0).unwrap();
+        db.set_last_accepted_height(1).unwrap();
+        drop(db);
+
+        let reopened_db = Database::open(dir.path()).unwrap();
+        let reopened_node = make_test_node_with_db(1, reopened_db, false);
+        reopened_node.c_chain_metrics.write().await.tip_height = 1;
+
+        let receipt_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":28}}"#,
+            hex::encode(tx_hash)
+        );
+        let receipt_response = handle_rpc_request(&receipt_req, &reopened_node).await;
+        let receipt_json: serde_json::Value = serde_json::from_str(&receipt_response).unwrap();
+        assert!(receipt_json["result"].is_null());
+
+        let tx_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":29}}"#,
+            hex::encode(tx_hash)
+        );
+        let tx_lookup_response = handle_rpc_request(&tx_lookup_req, &reopened_node).await;
+        let tx_lookup_json: serde_json::Value = serde_json::from_str(&tx_lookup_response).unwrap();
+        assert_eq!(tx_lookup_json["result"]["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
     async fn test_eth_get_bad_blocks_returns_recorded_import_failures() {
         let builder_node = make_test_node(1);
         let wallet = avalanche_rs::tx::Wallet::random(43114);
@@ -19154,7 +20900,7 @@ mod integration_tests {
         bad_raw[state_root_offset] ^= 0x01;
 
         let importer_node = make_test_node(1);
-        execute_cchain_block_and_store(&bad_raw, &importer_node).await;
+        execute_cchain_block_and_store(&bad_raw, &importer_node, CChainImportMode::Strict).await;
         assert!(
             importer_node.db.get_block(1).unwrap().is_none(),
             "bad block should not be stored as accepted"
@@ -19474,6 +21220,390 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_filters_detect_same_height_canonical_replacement() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        FILTERS.write().await.clear();
+
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let log_address = [0xCC; 20];
+        let log_topic = [0x33; 32];
+
+        let tx_a = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x41; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_b = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 30_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x42; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+
+        let old_raw = make_cchain_coreth_block_with_transactions(
+            [0x11; 32],
+            1,
+            1_700_000_000,
+            std::slice::from_ref(&tx_a.raw),
+        );
+        let new_raw = make_cchain_coreth_block_with_transactions(
+            [0x22; 32],
+            1,
+            1_700_000_010,
+            std::slice::from_ref(&tx_b.raw),
+        );
+        let old_block_hash = cchain_block_hash(&old_raw);
+        let new_block_hash = cchain_block_hash(&new_raw);
+        let old_tx_hash = keccak_tx_hash(&tx_a.raw);
+        let new_tx_hash = keccak_tx_hash(&tx_b.raw);
+        let old_parsed = vec![parse_raw_cchain_transaction(&tx_a.raw).unwrap()];
+        let new_parsed = vec![parse_raw_cchain_transaction(&tx_b.raw).unwrap()];
+        let receipt_with_log = |gas_used| TxReceipt {
+            success: true,
+            gas_used,
+            output: vec![],
+            contract_address: None,
+            logs: vec![EvmLog {
+                address: log_address,
+                topics: vec![log_topic],
+                data: vec![],
+            }],
+        };
+
+        node.db.put_block(1, &old_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &old_block_hash,
+            &old_parsed,
+            &[receipt_with_log(21_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let log_filter_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_newFilter","params":[{{"address":"0x{}","topics":["0x{}"]}}],"id":36}}"#,
+            hex::encode(log_address),
+            hex::encode(log_topic)
+        );
+        let log_filter_response = handle_rpc_request(&log_filter_req, &node).await;
+        let log_filter_json: serde_json::Value =
+            serde_json::from_str(&log_filter_response).unwrap();
+        let log_filter_id = log_filter_json["result"].as_str().unwrap().to_string();
+
+        let new_block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_newBlockFilter","params":[],"id":37}"#;
+        let new_block_response = handle_rpc_request(new_block_req, &node).await;
+        let new_block_json: serde_json::Value = serde_json::from_str(&new_block_response).unwrap();
+        let block_filter_id = new_block_json["result"].as_str().unwrap().to_string();
+
+        let new_accepted_req = r#"{"jsonrpc":"2.0","method":"eth_newAcceptedTransactions","params":[{"fullTx":true}],"id":38}"#;
+        let new_accepted_response = handle_rpc_request(new_accepted_req, &node).await;
+        let new_accepted_json: serde_json::Value =
+            serde_json::from_str(&new_accepted_response).unwrap();
+        let accepted_filter_id = new_accepted_json["result"].as_str().unwrap().to_string();
+
+        let log_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":39}}"#,
+            log_filter_id
+        );
+        let first_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let first_log_json: serde_json::Value = serde_json::from_str(&first_log_changes).unwrap();
+        assert!(first_log_json["result"].as_array().unwrap().is_empty());
+
+        let block_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":40}}"#,
+            block_filter_id
+        );
+        let first_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let first_block_json: serde_json::Value =
+            serde_json::from_str(&first_block_changes).unwrap();
+        assert!(first_block_json["result"].as_array().unwrap().is_empty());
+
+        let accepted_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":41}}"#,
+            accepted_filter_id
+        );
+        let first_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let first_accepted_json: serde_json::Value =
+            serde_json::from_str(&first_accepted_changes).unwrap();
+        assert!(first_accepted_json["result"].as_array().unwrap().is_empty());
+
+        clear_canonical_cchain_tx_artifacts(&node.db, 1).unwrap();
+        node.db.put_block(1, &new_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &new_block_hash,
+            &new_parsed,
+            &[receipt_with_log(30_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let second_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let second_log_json: serde_json::Value = serde_json::from_str(&second_log_changes).unwrap();
+        let second_logs = second_log_json["result"].as_array().unwrap();
+        assert_eq!(second_logs.len(), 1);
+        assert_eq!(
+            second_logs[0]["transactionHash"],
+            format!("0x{}", hex::encode(new_tx_hash))
+        );
+        assert_eq!(
+            second_logs[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_hash))
+        );
+
+        let second_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let second_block_json: serde_json::Value =
+            serde_json::from_str(&second_block_changes).unwrap();
+        let second_blocks = second_block_json["result"].as_array().unwrap();
+        assert_eq!(second_blocks.len(), 1);
+        assert_eq!(
+            second_blocks[0],
+            format!("0x{}", hex::encode(new_block_hash))
+        );
+
+        let second_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let second_accepted_json: serde_json::Value =
+            serde_json::from_str(&second_accepted_changes).unwrap();
+        let second_accepted = second_accepted_json["result"].as_array().unwrap();
+        assert_eq!(second_accepted.len(), 1);
+        assert_eq!(
+            second_accepted[0]["hash"],
+            format!("0x{}", hex::encode(new_tx_hash))
+        );
+        assert_eq!(
+            second_accepted[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_hash))
+        );
+
+        let third_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let third_log_json: serde_json::Value = serde_json::from_str(&third_log_changes).unwrap();
+        assert!(third_log_json["result"].as_array().unwrap().is_empty());
+
+        let third_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let third_block_json: serde_json::Value =
+            serde_json::from_str(&third_block_changes).unwrap();
+        assert!(third_block_json["result"].as_array().unwrap().is_empty());
+
+        let third_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let third_accepted_json: serde_json::Value =
+            serde_json::from_str(&third_accepted_changes).unwrap();
+        assert!(third_accepted_json["result"].as_array().unwrap().is_empty());
+
+        assert_ne!(old_block_hash, new_block_hash);
+        assert_ne!(old_tx_hash, new_tx_hash);
+    }
+
+    #[tokio::test]
+    async fn test_filters_detect_rollback_below_last_polled_tip() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        FILTERS.write().await.clear();
+
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let log_address = [0xCD; 20];
+        let log_topic = [0x44; 32];
+
+        let tx_a = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x51; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_b = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x52; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let replacement_tx = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 30_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x53; 20]),
+                value: 3,
+                data: vec![],
+            })
+            .unwrap();
+
+        let old_block_1 = make_cchain_coreth_block_with_transactions(
+            [0x31; 32],
+            1,
+            1_700_000_000,
+            std::slice::from_ref(&tx_a.raw),
+        );
+        let old_block_2 = make_cchain_coreth_block_with_transactions(
+            cchain_block_hash(&old_block_1),
+            2,
+            1_700_000_010,
+            std::slice::from_ref(&tx_b.raw),
+        );
+        let new_block_1 = make_cchain_coreth_block_with_transactions(
+            [0x41; 32],
+            1,
+            1_700_000_020,
+            std::slice::from_ref(&replacement_tx.raw),
+        );
+
+        let old_block_1_hash = cchain_block_hash(&old_block_1);
+        let new_block_1_hash = cchain_block_hash(&new_block_1);
+        let replacement_tx_hash = keccak_tx_hash(&replacement_tx.raw);
+        let old_parsed_1 = vec![parse_raw_cchain_transaction(&tx_a.raw).unwrap()];
+        let old_parsed_2 = vec![parse_raw_cchain_transaction(&tx_b.raw).unwrap()];
+        let new_parsed_1 = vec![parse_raw_cchain_transaction(&replacement_tx.raw).unwrap()];
+        let receipt_with_log = |gas_used| TxReceipt {
+            success: true,
+            gas_used,
+            output: vec![],
+            contract_address: None,
+            logs: vec![EvmLog {
+                address: log_address,
+                topics: vec![log_topic],
+                data: vec![],
+            }],
+        };
+
+        node.db.put_block(1, &old_block_1).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &old_block_1_hash,
+            &old_parsed_1,
+            &[receipt_with_log(21_000)],
+        )
+        .unwrap();
+        node.db.put_block(2, &old_block_2).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            2,
+            &cchain_block_hash(&old_block_2),
+            &old_parsed_2,
+            &[receipt_with_log(22_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let log_filter_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_newFilter","params":[{{"fromBlock":"0x1","address":"0x{}","topics":["0x{}"]}}],"id":41}}"#,
+            hex::encode(log_address),
+            hex::encode(log_topic)
+        );
+        let log_filter_response = handle_rpc_request(&log_filter_req, &node).await;
+        let log_filter_json: serde_json::Value =
+            serde_json::from_str(&log_filter_response).unwrap();
+        let log_filter_id = log_filter_json["result"].as_str().unwrap().to_string();
+
+        let new_block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_newBlockFilter","params":[],"id":42}"#;
+        let new_block_response = handle_rpc_request(new_block_req, &node).await;
+        let new_block_json: serde_json::Value = serde_json::from_str(&new_block_response).unwrap();
+        let block_filter_id = new_block_json["result"].as_str().unwrap().to_string();
+
+        let new_accepted_req = r#"{"jsonrpc":"2.0","method":"eth_newAcceptedTransactions","params":[{"fullTx":true}],"id":43}"#;
+        let new_accepted_response = handle_rpc_request(new_accepted_req, &node).await;
+        let new_accepted_json: serde_json::Value =
+            serde_json::from_str(&new_accepted_response).unwrap();
+        let accepted_filter_id = new_accepted_json["result"].as_str().unwrap().to_string();
+
+        let log_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":44}}"#,
+            log_filter_id
+        );
+        let first_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let first_log_json: serde_json::Value = serde_json::from_str(&first_log_changes).unwrap();
+        assert_eq!(first_log_json["result"].as_array().unwrap().len(), 2);
+
+        let block_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":45}}"#,
+            block_filter_id
+        );
+        let first_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let first_block_json: serde_json::Value =
+            serde_json::from_str(&first_block_changes).unwrap();
+        assert!(first_block_json["result"].as_array().unwrap().is_empty());
+
+        let accepted_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":46}}"#,
+            accepted_filter_id
+        );
+        let first_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let first_accepted_json: serde_json::Value =
+            serde_json::from_str(&first_accepted_changes).unwrap();
+        assert!(first_accepted_json["result"].as_array().unwrap().is_empty());
+
+        clear_canonical_cchain_tx_artifacts(&node.db, 2).unwrap();
+        clear_canonical_cchain_tx_artifacts(&node.db, 1).unwrap();
+        node.db.put_block(1, &new_block_1).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &new_block_1_hash,
+            &new_parsed_1,
+            &[receipt_with_log(30_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let second_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let second_log_json: serde_json::Value = serde_json::from_str(&second_log_changes).unwrap();
+        let second_logs = second_log_json["result"].as_array().unwrap();
+        assert_eq!(second_logs.len(), 1);
+        assert_eq!(
+            second_logs[0]["transactionHash"],
+            format!("0x{}", hex::encode(replacement_tx_hash))
+        );
+        assert_eq!(
+            second_logs[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_1_hash))
+        );
+
+        let second_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let second_block_json: serde_json::Value =
+            serde_json::from_str(&second_block_changes).unwrap();
+        let second_blocks = second_block_json["result"].as_array().unwrap();
+        assert_eq!(second_blocks.len(), 1);
+        assert_eq!(
+            second_blocks[0],
+            format!("0x{}", hex::encode(new_block_1_hash))
+        );
+
+        let second_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let second_accepted_json: serde_json::Value =
+            serde_json::from_str(&second_accepted_changes).unwrap();
+        let second_accepted = second_accepted_json["result"].as_array().unwrap();
+        assert_eq!(second_accepted.len(), 1);
+        assert_eq!(
+            second_accepted[0]["hash"],
+            format!("0x{}", hex::encode(replacement_tx_hash))
+        );
+        assert_eq!(
+            second_accepted[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_1_hash))
+        );
+    }
+
+    #[tokio::test]
     async fn test_eth_accounts_sign_and_send_transaction_use_managed_wallets() {
         let _guard = FILTER_TEST_GUARD.lock().await;
         PENDING_FILTER_EVENTS.write().await.clear();
@@ -19678,9 +21808,13 @@ mod integration_tests {
         );
         assert_eq!(parsed["result"]["storageProof"][0]["value"], "0x5");
 
-        node.db.set_last_accepted_height(1).unwrap();
+        let block_1 = make_cchain_coreth_block_with_transactions([0x10; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x11; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
         let historical_req = format!(
-            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x0"],"id":44}}"#,
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":44}}"#,
             hex::encode(account),
             hex::encode(slot)
         );
@@ -19689,8 +21823,844 @@ mod integration_tests {
             serde_json::from_str(&historical_response).unwrap();
         assert_eq!(
             historical_json["error"]["message"],
-            "historical proof query not allowed"
+            "historical state query not allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_eth_balance_and_transaction_count_support_archive_history() {
+        let node = make_test_archive_node(1);
+        let account = [0x71; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x01; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x02; 32], 2, 1_700_000_010, &[]);
+
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 3,
+                    balance: 111,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 4,
+                    balance: 222,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 333, 5, vec![]);
+        }
+
+        let historical_balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0x1"],"id":45}}"#,
+            hex::encode(account)
+        );
+        let historical_balance_response = handle_rpc_request(&historical_balance_req, &node).await;
+        let historical_balance_json: serde_json::Value =
+            serde_json::from_str(&historical_balance_response).unwrap();
+        assert_eq!(historical_balance_json["result"], "0x6f");
+
+        let historical_nonce_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["0x{}","0x1"],"id":46}}"#,
+            hex::encode(account)
+        );
+        let historical_nonce_response = handle_rpc_request(&historical_nonce_req, &node).await;
+        let historical_nonce_json: serde_json::Value =
+            serde_json::from_str(&historical_nonce_response).unwrap();
+        assert_eq!(historical_nonce_json["result"], "0x3");
+
+        let latest_balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","latest"],"id":47}}"#,
+            hex::encode(account)
+        );
+        let latest_balance_response = handle_rpc_request(&latest_balance_req, &node).await;
+        let latest_balance_json: serde_json::Value =
+            serde_json::from_str(&latest_balance_response).unwrap();
+        assert_eq!(latest_balance_json["result"], "0x14d");
+
+        let missing_block_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0xa"],"id":48}}"#,
+            hex::encode(account)
+        );
+        let missing_block_response = handle_rpc_request(&missing_block_req, &node).await;
+        let missing_block_json: serde_json::Value =
+            serde_json::from_str(&missing_block_response).unwrap();
+        assert_eq!(
+            missing_block_json["error"]["message"],
+            "block #10 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_snapshots_follow_local_cchain_blocks() {
+        let node = make_test_archive_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let first_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x91; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let first_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":53}}"#,
+            first_signed.raw_hex()
+        );
+        let first_submit_response = handle_rpc_request(&first_submit_req, &node).await;
+        let first_submit_json: serde_json::Value =
+            serde_json::from_str(&first_submit_response).unwrap();
+        assert!(first_submit_json.get("result").is_some());
+
+        let first_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let first_block = build_cchain_block(&node, 1, first_pool_txs.clone())
+            .await
+            .expect("first block should build");
+        let mut first_key = Vec::with_capacity(34);
+        first_key.extend_from_slice(b"c:");
+        first_key.extend_from_slice(&first_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &first_key, &first_block.raw)
+            .unwrap();
+        node.db
+            .put_block(first_block.number, &first_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &first_block, &first_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(first_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &first_pool_txs).await;
+
+        let second_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x92; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let second_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":54}}"#,
+            second_signed.raw_hex()
+        );
+        let second_submit_response = handle_rpc_request(&second_submit_req, &node).await;
+        let second_submit_json: serde_json::Value =
+            serde_json::from_str(&second_submit_response).unwrap();
+        assert!(second_submit_json.get("result").is_some());
+
+        let second_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let second_block = build_cchain_block(&node, 2, second_pool_txs.clone())
+            .await
+            .expect("second block should build");
+        let mut second_key = Vec::with_capacity(34);
+        second_key.extend_from_slice(b"c:");
+        second_key.extend_from_slice(&second_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &second_key, &second_block.raw)
+            .unwrap();
+        node.db
+            .put_block(second_block.number, &second_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &second_block, &second_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(second_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &second_pool_txs).await;
+
+        let historical_nonce_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["{}","0x1"],"id":55}}"#,
+            wallet.address_hex()
+        );
+        let historical_nonce_response = handle_rpc_request(&historical_nonce_req, &node).await;
+        let historical_nonce_json: serde_json::Value =
+            serde_json::from_str(&historical_nonce_response).unwrap();
+        assert_eq!(historical_nonce_json["result"], "0x1");
+
+        let latest_nonce_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["{}","latest"],"id":56}}"#,
+            wallet.address_hex()
+        );
+        let latest_nonce_response = handle_rpc_request(&latest_nonce_req, &node).await;
+        let latest_nonce_json: serde_json::Value =
+            serde_json::from_str(&latest_nonce_response).unwrap();
+        assert_eq!(latest_nonce_json["result"], "0x2");
+    }
+
+    #[test]
+    fn test_persist_archive_state_changes_stores_code_bytes() {
+        let node = make_test_archive_node(1);
+        let address = [0x74; 20];
+        let code = vec![0x60, 0x01, 0x60, 0x00, 0x52];
+        let code_hash: [u8; 32] = revm::primitives::keccak256(&code).into();
+        let slot = [0x11; 32];
+        let mut storage_value = [0u8; 32];
+        storage_value[31] = 0x07;
+
+        persist_archive_state_changes(
+            &node,
+            7,
+            &[0xAB; 32],
+            &[ArchivedAccountDiff {
+                address,
+                state: AccountState {
+                    nonce: 1,
+                    balance: 2,
+                    storage_root: [0u8; 32],
+                    code_hash,
+                },
+                code: Some(code.clone()),
+                storage: vec![(slot, storage_value)],
+            }],
+        );
+
+        let snapshot = node
+            .archive_store
+            .get_account_at_height(&node.db, &address, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.code_hash, code_hash);
+        assert_eq!(node.db.get_code(&code_hash).unwrap().unwrap(), code);
+        assert_eq!(
+            node.archive_store
+                .get_storage_at_height(&node.db, &address, &slot, 7)
+                .unwrap()
+                .unwrap(),
+            storage_value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eth_get_code_supports_archive_history() {
+        let node = make_test_archive_node(1);
+        let account = [0x72; 20];
+        let code = vec![0x60, 0x42, 0x60, 0x00, 0x52];
+        let code_hash: [u8; 32] = revm::primitives::keccak256(&code).into();
+        let block_1 = make_cchain_coreth_block_with_transactions([0x03; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x04; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+        node.db.put_code(&code_hash, &code).unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 0,
+                    balance: 0,
+                    storage_root: [0u8; 32],
+                    code_hash,
+                },
+            )
+            .unwrap();
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 0, 0, vec![]);
+        }
+
+        let historical_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getCode","params":["0x{}","0x1"],"id":57}}"#,
+            hex::encode(account)
+        );
+        let historical_response = handle_rpc_request(&historical_req, &node).await;
+        let historical_json: serde_json::Value =
+            serde_json::from_str(&historical_response).unwrap();
+        assert_eq!(
+            historical_json["result"],
+            format!("0x{}", hex::encode(&code))
+        );
+
+        let latest_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getCode","params":["0x{}","latest"],"id":58}}"#,
+            hex::encode(account)
+        );
+        let latest_response = handle_rpc_request(&latest_req, &node).await;
+        let latest_json: serde_json::Value = serde_json::from_str(&latest_response).unwrap();
+        assert_eq!(latest_json["result"], "0x");
+
+        let missing_block_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getCode","params":["0x{}","0xa"],"id":59}}"#,
+            hex::encode(account)
+        );
+        let missing_block_response = handle_rpc_request(&missing_block_req, &node).await;
+        let missing_block_json: serde_json::Value =
+            serde_json::from_str(&missing_block_response).unwrap();
+        assert_eq!(
+            missing_block_json["error"]["message"],
+            "block #10 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eth_get_code_rejects_historical_queries_without_archive() {
+        let node = make_test_node(1);
+        let account = [0x73; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x05; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x06; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let historical_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getCode","params":["0x{}","0x1"],"id":60}}"#,
+            hex::encode(account)
+        );
+        let historical_response = handle_rpc_request(&historical_req, &node).await;
+        let historical_json: serde_json::Value =
+            serde_json::from_str(&historical_response).unwrap();
+        assert_eq!(
+            historical_json["error"]["message"],
+            "historical state query not allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eth_get_storage_at_supports_archive_history() {
+        let node = make_test_archive_node(1);
+        let account = [0x75; 20];
+        let slot = [0x01; 32];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x03; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x04; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let mut historical_value = [0u8; 32];
+        historical_value[31] = 0x0a;
+        node.archive_store
+            .put_storage_snapshot(&node.db, 1, &account, &slot, &historical_value)
+            .unwrap();
+
+        let mut latest_value = [0u8; 32];
+        latest_value[31] = 0x0b;
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_storage(account, slot, latest_value);
+        }
+
+        let historical_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["0x{}","0x{}","0x1"],"id":61}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let historical_response = handle_rpc_request(&historical_req, &node).await;
+        let historical_json: serde_json::Value =
+            serde_json::from_str(&historical_response).unwrap();
+        assert_eq!(
+            historical_json["result"],
+            format!("0x{}", hex::encode(historical_value))
+        );
+
+        let latest_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["0x{}","0x{}","latest"],"id":62}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let latest_response = handle_rpc_request(&latest_req, &node).await;
+        let latest_json: serde_json::Value = serde_json::from_str(&latest_response).unwrap();
+        assert_eq!(
+            latest_json["result"],
+            format!("0x{}", hex::encode(latest_value))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eth_get_storage_at_rejects_historical_queries_without_archive() {
+        let node = make_test_node(1);
+        let account = [0x76; 20];
+        let slot = [0x02; 32];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x05; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x06; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let historical_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["0x{}","0x{}","0x1"],"id":63}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let historical_response = handle_rpc_request(&historical_req, &node).await;
+        let historical_json: serde_json::Value =
+            serde_json::from_str(&historical_response).unwrap();
+        assert_eq!(
+            historical_json["error"]["message"],
+            "historical state query not allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_historical_eth_call_supports_archive_history() {
+        let node = make_test_archive_node(1);
+        let account = [0x72; 20];
+        let caller = [0x79; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x03; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x04; 32], 2, 1_700_000_010, &[]);
+        let block_3 = make_cchain_coreth_block_with_transactions([0x05; 32], 3, 1_700_000_020, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.put_block(3, &block_3).unwrap();
+        node.db.set_last_accepted_height(3).unwrap();
+
+        let code_v1 = vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_v2 = vec![0x60, 0x2b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let latest_code = vec![0x60, 0x2c, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_hash_v1: [u8; 32] = revm::primitives::keccak256(&code_v1).into();
+        let code_hash_v2: [u8; 32] = revm::primitives::keccak256(&code_v2).into();
+        node.db.put_code(&code_hash_v1, &code_v1).unwrap();
+        node.db.put_code(&code_hash_v2, &code_v2).unwrap();
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 1,
+                    balance: 0,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v1,
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 2,
+                    balance: 0,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v2,
+                },
+            )
+            .unwrap();
+        for height in [1, 2] {
+            node.archive_store
+                .put_account_snapshot(
+                    &node.db,
+                    height,
+                    &caller,
+                    &AccountState {
+                        nonce: 0,
+                        balance: 10_000_000_000_000_000_000u128,
+                        storage_root: [0u8; 32],
+                        code_hash: [0u8; 32],
+                    },
+                )
+                .unwrap();
+        }
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 0, 3, latest_code);
+            evm.set_balance(caller, 10_000_000_000_000_000_000u128);
+        }
+
+        let historical_block_1_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"0x1"],"id":51}}"#,
+            hex::encode(caller),
+            hex::encode(account)
+        );
+        let historical_block_1_response = handle_rpc_request(&historical_block_1_req, &node).await;
+        let historical_block_1_json: serde_json::Value =
+            serde_json::from_str(&historical_block_1_response).unwrap();
+        let mut expected_v1 = [0u8; 32];
+        expected_v1[31] = 0x2a;
+        assert_eq!(
+            historical_block_1_json["result"],
+            format!("0x{}", hex::encode(expected_v1))
+        );
+
+        let historical_block_2_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"0x2"],"id":52}}"#,
+            hex::encode(caller),
+            hex::encode(account)
+        );
+        let historical_block_2_response = handle_rpc_request(&historical_block_2_req, &node).await;
+        let historical_block_2_json: serde_json::Value =
+            serde_json::from_str(&historical_block_2_response).unwrap();
+        let mut expected_v2 = [0u8; 32];
+        expected_v2[31] = 0x2b;
+        assert_eq!(
+            historical_block_2_json["result"],
+            format!("0x{}", hex::encode(expected_v2))
+        );
+
+        let latest_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"latest"],"id":53}}"#,
+            hex::encode(caller),
+            hex::encode(account)
+        );
+        let latest_response = handle_rpc_request(&latest_req, &node).await;
+        let latest_json: serde_json::Value = serde_json::from_str(&latest_response).unwrap();
+        let mut expected_latest = [0u8; 32];
+        expected_latest[31] = 0x2c;
+        assert_eq!(
+            latest_json["result"],
+            format!("0x{}", hex::encode(expected_latest))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_historical_eth_get_proof_supports_archive_history() {
+        let node = make_test_archive_node(1);
+        let account = [0x77; 20];
+        let slot = [0x01; 32];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x07; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x08; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let code_v1 = vec![0x60, 0x01];
+        let code_v2 = vec![0x60, 0x02];
+        let latest_code = vec![0x60, 0x03];
+        let code_hash_v1: [u8; 32] = revm::primitives::keccak256(&code_v1).into();
+        let code_hash_v2: [u8; 32] = revm::primitives::keccak256(&code_v2).into();
+        node.db.put_code(&code_hash_v1, &code_v1).unwrap();
+        node.db.put_code(&code_hash_v2, &code_v2).unwrap();
+
+        let mut storage_v1 = [0u8; 32];
+        storage_v1[31] = 0x0a;
+        let mut storage_v2 = [0u8; 32];
+        storage_v2[31] = 0x0b;
+        let mut latest_storage = [0u8; 32];
+        latest_storage[31] = 0x0c;
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 3,
+                    balance: 111,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v1,
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 4,
+                    balance: 222,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v2,
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_storage_snapshot(&node.db, 1, &account, &slot, &storage_v1)
+            .unwrap();
+        node.archive_store
+            .put_storage_snapshot(&node.db, 2, &account, &slot, &storage_v2)
+            .unwrap();
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 333, 5, latest_code);
+            evm.set_storage(account, slot, latest_storage);
+        }
+
+        let historical_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":54}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let historical_response = handle_rpc_request(&historical_req, &node).await;
+        let historical_json: serde_json::Value =
+            serde_json::from_str(&historical_response).unwrap();
+        assert_eq!(historical_json["result"]["balance"], "0x6f");
+        assert_eq!(historical_json["result"]["nonce"], "0x3");
+        assert_eq!(
+            historical_json["result"]["codeHash"],
+            format!("0x{}", hex::encode(code_hash_v1))
+        );
+        assert_eq!(historical_json["result"]["storageProof"][0]["value"], "0xa");
+        assert!(!historical_json["result"]["accountProof"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let latest_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"latest"],"id":55}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let latest_response = handle_rpc_request(&latest_req, &node).await;
+        let latest_json: serde_json::Value = serde_json::from_str(&latest_response).unwrap();
+        assert_eq!(latest_json["result"]["balance"], "0x14d");
+        assert_eq!(latest_json["result"]["nonce"], "0x5");
+        assert_eq!(latest_json["result"]["storageProof"][0]["value"], "0xc");
+    }
+
+    #[tokio::test]
+    async fn test_historical_eth_call_rejects_without_archive() {
+        let node = make_test_node(1);
+        let account = [0x72; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x03; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x04; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let call_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"to":"0x{}","data":"0x"}},"0x1"],"id":56}}"#,
+            hex::encode(account)
+        );
+        let call_response = handle_rpc_request(&call_req, &node).await;
+        let call_json: serde_json::Value = serde_json::from_str(&call_response).unwrap();
+        assert_eq!(
+            call_json["error"]["message"],
+            "historical state query not allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_historical_state_queries_reject_orphaned_blocks_above_tip() {
+        let node = make_test_archive_node(1);
+        let account = [0x7C; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x0C; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x0D; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 1,
+                    balance: 111,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 2,
+                    balance: 222,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0x2"],"id":57}}"#,
+            hex::encode(account)
+        );
+        let balance_response = handle_rpc_request(&balance_req, &node).await;
+        let balance_json: serde_json::Value = serde_json::from_str(&balance_response).unwrap();
+        assert_eq!(balance_json["error"]["message"], "block #2 not found");
+    }
+
+    #[tokio::test]
+    async fn test_historical_archive_queries_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let account = [0x7Au8; 20];
+        let caller = [0x7Bu8; 20];
+        let slot = [0x03u8; 32];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x09; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x0A; 32], 2, 1_700_000_010, &[]);
+        let block_3 = make_cchain_coreth_block_with_transactions([0x0B; 32], 3, 1_700_000_020, &[]);
+        let code_v1 = vec![0x60, 0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_v2 = vec![0x60, 0x32, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_hash_v1: [u8; 32] = revm::primitives::keccak256(&code_v1).into();
+        let code_hash_v2: [u8; 32] = revm::primitives::keccak256(&code_v2).into();
+        let mut storage_v1 = [0u8; 32];
+        storage_v1[31] = 0x0d;
+        let mut storage_v2 = [0u8; 32];
+        storage_v2[31] = 0x0e;
+
+        let requests = vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0x1"],"id":60}}"#,
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["0x{}","0x1"],"id":61}}"#,
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getCode","params":["0x{}","0x1"],"id":62}}"#,
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["0x{}","0x{}","0x1"],"id":63}}"#,
+                hex::encode(account),
+                hex::encode(slot)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"0x1"],"id":64}}"#,
+                hex::encode(caller),
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":65}}"#,
+                hex::encode(account),
+                hex::encode(slot)
+            ),
+        ];
+
+        let initial_node = {
+            let db = Database::open(&db_path).unwrap();
+            let node = make_test_node_with_db(1, db, true);
+            node.db.put_block(1, &block_1).unwrap();
+            node.db.put_block(2, &block_2).unwrap();
+            node.db.put_block(3, &block_3).unwrap();
+            node.db.set_last_accepted_height(3).unwrap();
+            node.db.put_code(&code_hash_v1, &code_v1).unwrap();
+            node.db.put_code(&code_hash_v2, &code_v2).unwrap();
+            node.archive_store
+                .put_account_snapshot(
+                    &node.db,
+                    1,
+                    &account,
+                    &AccountState {
+                        nonce: 7,
+                        balance: 777,
+                        storage_root: [0u8; 32],
+                        code_hash: code_hash_v1,
+                    },
+                )
+                .unwrap();
+            node.archive_store
+                .put_account_snapshot(
+                    &node.db,
+                    2,
+                    &account,
+                    &AccountState {
+                        nonce: 8,
+                        balance: 888,
+                        storage_root: [0u8; 32],
+                        code_hash: code_hash_v2,
+                    },
+                )
+                .unwrap();
+            for height in [1, 2] {
+                node.archive_store
+                    .put_account_snapshot(
+                        &node.db,
+                        height,
+                        &caller,
+                        &AccountState {
+                            nonce: 0,
+                            balance: 10_000_000_000_000_000_000u128,
+                            storage_root: [0u8; 32],
+                            code_hash: [0u8; 32],
+                        },
+                    )
+                    .unwrap();
+            }
+            node.archive_store
+                .put_storage_snapshot(&node.db, 1, &account, &slot, &storage_v1)
+                .unwrap();
+            node.archive_store
+                .put_storage_snapshot(&node.db, 2, &account, &slot, &storage_v2)
+                .unwrap();
+            node.archive_store
+                .put_state_root(
+                    &node.db,
+                    1,
+                    &historical_evm_at_height(&node, 1)
+                        .unwrap()
+                        .compute_state_root_mpt(),
+                )
+                .unwrap();
+            node.archive_store
+                .put_state_root(
+                    &node.db,
+                    2,
+                    &historical_evm_at_height(&node, 2)
+                        .unwrap()
+                        .compute_state_root_mpt(),
+                )
+                .unwrap();
+            node
+        };
+
+        let before_restart = {
+            let mut results = Vec::new();
+            for req in &requests {
+                let response = handle_rpc_request(req, &initial_node).await;
+                results.push(serde_json::from_str::<serde_json::Value>(&response).unwrap());
+            }
+            results
+        };
+
+        drop(initial_node);
+
+        let reopened_node = {
+            let db = Database::open(&db_path).unwrap();
+            make_test_node_with_db(1, db, true)
+        };
+
+        let after_restart = {
+            let mut results = Vec::new();
+            for req in &requests {
+                let response = handle_rpc_request(req, &reopened_node).await;
+                results.push(serde_json::from_str::<serde_json::Value>(&response).unwrap());
+            }
+            results
+        };
+
+        assert_eq!(after_restart, before_restart);
     }
 
     #[tokio::test]
@@ -19757,7 +22727,7 @@ mod integration_tests {
         let block = build_cchain_block(&node, 1, vec![])
             .await
             .expect("empty block should build");
-        execute_cchain_block_and_store(&block.raw, &node).await;
+        execute_cchain_block_and_store(&block.raw, &node, CChainImportMode::Strict).await;
 
         let notification = read_ws_text_frame(&mut stream).await;
         assert_eq!(notification["method"], "eth_subscription");
@@ -19812,7 +22782,7 @@ mod integration_tests {
         let block = build_cchain_block(&builder_node, 1, vec![pool_tx_from_cchain_raw(&parsed_tx)])
             .await
             .expect("block should build");
-        execute_cchain_block_and_store(&block.raw, &node).await;
+        execute_cchain_block_and_store(&block.raw, &node, CChainImportMode::Strict).await;
         assert!(
             node.db.get_block(1).unwrap().is_some(),
             "accepted block should be stored before websocket notification"
@@ -20380,9 +23350,142 @@ mod integration_tests {
         assert!(metrics.contains("peer_count"));
         assert!(metrics.contains("block_height_p_chain"));
         assert!(metrics.contains("block_height_c_chain"));
+        assert!(metrics.contains("c_chain_canonical_switches_total"));
+        assert!(metrics.contains("c_chain_last_canonical_switch_height"));
         assert!(metrics.contains("memory_rss_bytes"));
         assert!(metrics.contains("uptime_seconds"));
         assert!(metrics.contains("handshake_latency_ms"));
+    }
+
+    #[tokio::test]
+    async fn test_same_height_canonical_replacement_updates_cchain_metrics_and_prometheus() {
+        let node = make_test_node(1);
+        let first_block =
+            make_cchain_coreth_block_with_transactions([0x11; 32], 1, 1_700_000_000, &[]);
+        let second_block =
+            make_cchain_coreth_block_with_transactions([0x22; 32], 1, 1_700_000_010, &[]);
+        let first_hash = cchain_block_hash(&first_block);
+        let second_hash = cchain_block_hash(&second_block);
+
+        node.db.put_block(1, &first_block).unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+        {
+            let mut metrics = node.c_chain_metrics.write().await;
+            metrics.tip_height = 1;
+            metrics.tip_hash = first_hash;
+        }
+
+        node.db.put_block(1, &second_block).unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let metrics = render_prometheus_metrics(&node).await;
+        {
+            let metrics_state = node.c_chain_metrics.read().await.clone();
+            assert_eq!(metrics_state.tip_height, 1);
+            assert_eq!(metrics_state.tip_hash, second_hash);
+            assert_eq!(metrics_state.canonical_switches, 1);
+            assert_eq!(metrics_state.last_canonical_switch_height, 1);
+        }
+
+        let block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",false],"id":53}"#;
+        let block_response = handle_rpc_request(block_req, &node).await;
+        let block_json: serde_json::Value = serde_json::from_str(&block_response).unwrap();
+        assert_eq!(
+            block_json["result"]["hash"],
+            format!("0x{}", hex::encode(second_hash))
+        );
+
+        assert!(metrics.contains("c_chain_canonical_switches_total 1"));
+        assert!(metrics.contains("c_chain_last_canonical_switch_height 1"));
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_connects_to_reachable_peer_after_tls_timeout() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (hanging_addr, hanging_handle) = spawn_hanging_bootstrap_peer().await;
+        let (good_addr, good_handshake, good_handle) = spawn_test_bootstrap_peer(1).await;
+        let node = make_test_node_with_bootstrap_ips(
+            1,
+            vec![hanging_addr.to_string(), good_addr.to_string()],
+            2,
+        );
+        let bad_record = PersistentPeerRecord::new(
+            [0x91; 20],
+            socket_addr_to_ip_bytes(hanging_addr),
+            hanging_addr.port(),
+        );
+        node.db
+            .put_peer(&bad_record.node_id, &bad_record.encode())
+            .expect("persist bad peer record");
+
+        connect_to_bootstrap_nodes_with_timeouts(
+            node.clone(),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), good_handshake)
+            .await
+            .expect("good bootstrap peer should be reached despite timeout peer")
+            .expect("good bootstrap handshake signal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let Some(raw) = node
+                    .db
+                    .get_peer(&bad_record.node_id)
+                    .expect("read bad peer record")
+                else {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                };
+                let record = PersistentPeerRecord::decode(&raw).expect("decode bad peer record");
+                if record.failure_count == 1 {
+                    assert_eq!(record.reliability_score, 400);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("bad peer penalty should persist");
+
+        good_handle.abort();
+        let _ = good_handle.await;
+        hanging_handle.abort();
+        let _ = hanging_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_connects_to_reachable_peer_after_non_tls_failure() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (bad_addr, bad_handle) = spawn_non_tls_bootstrap_peer().await;
+        let (good_addr, good_handshake, good_handle) = spawn_test_bootstrap_peer(1).await;
+        let node = make_test_node_with_bootstrap_ips(
+            1,
+            vec![bad_addr.to_string(), good_addr.to_string()],
+            2,
+        );
+
+        connect_to_bootstrap_nodes_with_timeouts(
+            node.clone(),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), good_handshake)
+            .await
+            .expect("good bootstrap peer should be reached despite non-tls peer")
+            .expect("good bootstrap handshake signal");
+
+        good_handle.abort();
+        let _ = good_handle.await;
+        bad_handle.abort();
+        let _ = bad_handle.await;
     }
 
     #[tokio::test]
@@ -20416,6 +23519,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id: 1,
                 data_dir: PathBuf::from("./data/test-mainnet-sync"),
@@ -20572,6 +23676,7 @@ mod integration_tests {
             evm,
             sync_engine,
             peer_manager,
+            peer_snapshot: Arc::new(StdRwLock::new(Vec::new())),
             config: Cli {
                 network_id: 5,
                 data_dir: PathBuf::from("./data/test-fuji-sync"),
@@ -20802,6 +23907,123 @@ mod integration_tests {
         let (db, _dir) = Database::open_temp().unwrap();
         let result = db.get_block_receipts(999).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_replacing_canonical_cchain_block_clears_stale_tx_indexes_and_receipts() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let wallet = Wallet::random(43114);
+
+        let tx_a = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x41; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_b = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x42; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_c = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 30_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x43; 20]),
+                value: 3,
+                data: vec![],
+            })
+            .unwrap();
+
+        let old_raw = make_cchain_coreth_block_with_transactions(
+            [0x11; 32],
+            1,
+            1_700_000_000,
+            &[tx_a.raw.clone(), tx_b.raw.clone()],
+        );
+        let new_raw = make_cchain_coreth_block_with_transactions(
+            [0x22; 32],
+            1,
+            1_700_000_010,
+            std::slice::from_ref(&tx_c.raw),
+        );
+
+        let old_parsed = vec![
+            parse_raw_cchain_transaction(&tx_a.raw).unwrap(),
+            parse_raw_cchain_transaction(&tx_b.raw).unwrap(),
+        ];
+        let new_parsed = vec![parse_raw_cchain_transaction(&tx_c.raw).unwrap()];
+        let success_receipt = |gas_used| TxReceipt {
+            success: true,
+            gas_used,
+            output: vec![],
+            contract_address: None,
+            logs: vec![],
+        };
+
+        db.put_block(1, &old_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &db,
+            1,
+            &cchain_block_hash(&old_raw),
+            &old_parsed,
+            &[success_receipt(21_000), success_receipt(42_000)],
+        )
+        .unwrap();
+
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_a.raw))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_b.raw))
+            .unwrap()
+            .is_some());
+        assert!(db.get_receipt(1, 1).unwrap().is_some());
+
+        clear_canonical_cchain_tx_artifacts(&db, 1).unwrap();
+        db.put_block(1, &new_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &db,
+            1,
+            &cchain_block_hash(&new_raw),
+            &new_parsed,
+            &[success_receipt(30_000)],
+        )
+        .unwrap();
+
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_a.raw))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_b.raw))
+            .unwrap()
+            .is_none());
+        let (height, idx) = db
+            .get_tx_index(&keccak_tx_hash(&tx_c.raw))
+            .unwrap()
+            .unwrap();
+        assert_eq!((height, idx), (1, 0));
+        assert!(db.get_receipt(1, 1).unwrap().is_none());
+
+        let receipts = db.get_block_receipts(1).unwrap().unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&receipts).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0]["transactionHash"],
+            format!("0x{}", hex::encode(keccak_tx_hash(&tx_c.raw)))
+        );
     }
 
     #[test]

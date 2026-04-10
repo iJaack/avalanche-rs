@@ -1,6 +1,37 @@
-# Benchmark: avalanche-rs vs AvalancheGo 1.14.1
+# Benchmark: avalanche-rs vs AvalancheGo
 
-## Latest Results (2026-03-08, Post Phase 12)
+## Latest Results (2026-04-10, 5-minute Fuji production run)
+
+> This is the current real-world benchmark for the shared Fuji production surface.
+> The full dated write-up is in [docs/benchmarks/2026-04-10-fuji-300s.md](docs/benchmarks/2026-04-10-fuji-300s.md).
+
+**Network:** Fuji testnet
+**Duration:** 5 minutes per implementation
+**Hardware:** Darwin arm64
+**avalanche-rs revision:** local M7 working tree based on `09b5bb8`
+**AvalancheGo version:** `v1.14.2`
+
+| Metric | avalanche-rs | AvalancheGo v1.14.2 |
+|--------|-------------|----------------------|
+| Binary size | 10,272 KB | 88,968 KB |
+| Final RSS | 12,848 KB | 75,696 KB |
+| Peak RSS | 121,936 KB | 91,264 KB |
+| First peer handshake | 330,258 ms | NA |
+| P-Chain height RPC | `273056` | `null` |
+| C-Chain block number | `0x336e5ac` | `null` |
+| Peer count | `1` | `42` |
+| P-Chain bootstrapped | `true` | `false` |
+| Health endpoint healthy | `false` | `false` |
+
+What matters more than the raw table:
+
+- `avalanche-rs` now reports sane P-Chain height, usable `info.peers`, usable `/ext/health`, and a non-zero C-Chain canonical head inside the 5-minute cold-start window.
+- AvalancheGo exposed the healthier peer fanout in the same window: 42 peers, working health and metrics endpoints, but no completed P-Chain bootstrap and no usable P/C chain RPC values.
+- `avalanche-rs` still correctly reports unhealthy readiness because the C-Chain head is imported in header-only mode. Full C-Chain state sync is still required before account/storage/receipt correctness can be called AvalancheGo-parity.
+
+So this benchmark is materially better than the previous run, but still not a “victory” benchmark. The current gap is full C-Chain state sync, not public RPC surface or cold-start header progress.
+
+## Historical Snapshot (2026-03-08, Post Phase 12)
 
 > Network sync benchmark below was run on a **Mac mini M4**.
 > A fresh **Mac mini M1** indexer validation benchmark was added on **2026-03-10**; see the dedicated section below for current DB-backed indexer numbers.
