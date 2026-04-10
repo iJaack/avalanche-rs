@@ -91,6 +91,7 @@ const AVAX_ASSET_ID_MAINNET: &str = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDG
 const AVAX_ASSET_ID_FUJI: &str = "U8iRqJoiJm8xZHAacmvYyZVwqQx6uDNtQeP3CQ6fcgQk3JqnK";
 const BAD_BLOCK_LIMIT: usize = 10;
 const PENDING_FILTER_EVENT_LIMIT: usize = 4096;
+const PERSISTENT_PEER_MAX_FAILURES: u64 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformDynamicFeeConfig {
@@ -1496,6 +1497,19 @@ async fn handle_inbound_connection(
 // ---------------------------------------------------------------------------
 
 async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
+    connect_to_bootstrap_nodes_with_timeouts(
+        node,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await;
+}
+
+async fn connect_to_bootstrap_nodes_with_timeouts(
+    node: Arc<NodeState>,
+    tcp_connect_timeout: Duration,
+    tls_handshake_timeout: Duration,
+) {
     let bootstrap_ips: Vec<String> = if node.config.bootstrap_ips.is_empty() {
         match node.config.network_id {
             1 => MAINNET_BOOTSTRAP_IPS
@@ -1552,7 +1566,15 @@ async fn connect_to_bootstrap_nodes(node: Arc<NodeState>) {
         let addr = target.addr;
         let node = node.clone();
         tokio::spawn(async move {
-            if let Err(e) = connect_and_handshake(addr, node).await {
+            if let Err(e) = connect_and_handshake_with_timeouts(
+                addr,
+                node.clone(),
+                tcp_connect_timeout,
+                tls_handshake_timeout,
+            )
+            .await
+            {
+                persist_failed_peer(&node, addr);
                 warn!("Startup peer {} failed: {}", addr, e);
             }
         });
@@ -1599,6 +1621,28 @@ fn persist_connected_peer(
     record.latency_ms = latency_ms;
     if let Err(e) = node.db.put_peer(&node_id.0, &record.encode()) {
         debug!("Failed to persist peer {}: {}", node_id, e);
+    }
+}
+
+fn persist_failed_peer(node: &NodeState, addr: SocketAddr) {
+    for (_key, value) in node.db.load_all_peers() {
+        let Some(mut record) = PersistentPeerRecord::decode(&value) else {
+            continue;
+        };
+        if record.socket_addr() != Some(addr) {
+            continue;
+        }
+
+        record.record_failure();
+        let result = if record.should_evict(PERSISTENT_PEER_MAX_FAILURES) {
+            node.db.delete_peer(&record.node_id)
+        } else {
+            node.db.put_peer(&record.node_id, &record.encode())
+        };
+        if let Err(e) = result {
+            debug!("Failed to persist peer failure for {}: {}", addr, e);
+        }
+        return;
     }
 }
 
@@ -1687,7 +1731,8 @@ fn dial_new_peers(new_peers: Vec<PeerInfo>, node: Arc<NodeState>) {
         let node = node.clone();
         tokio::spawn(async move {
             info!("Dialing discovered peer {}", addr);
-            if let Err(e) = connect_and_handshake(addr, node).await {
+            if let Err(e) = connect_and_handshake(addr, node.clone()).await {
+                persist_failed_peer(&node, addr);
                 debug!("Discovered peer {} failed: {}", addr, e);
             }
         });
@@ -1792,17 +1837,30 @@ async fn connect_and_handshake(
     addr: SocketAddr,
     node: Arc<NodeState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_and_handshake_with_timeouts(
+        addr,
+        node,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn connect_and_handshake_with_timeouts(
+    addr: SocketAddr,
+    node: Arc<NodeState>,
+    tcp_connect_timeout: Duration,
+    tls_handshake_timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Connecting to bootstrap node {}", addr);
     let dial_started = Instant::now();
 
     // 1. TCP connect with timeout
-    let tcp_stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| format!("TCP connect timeout to {}", addr))?
-    .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
+    let tcp_stream =
+        tokio::time::timeout(tcp_connect_timeout, tokio::net::TcpStream::connect(addr))
+            .await
+            .map_err(|_| format!("TCP connect timeout to {}", addr))?
+            .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
 
     tcp_stream.set_nodelay(true).ok();
     info!("TCP connected to {}", addr);
@@ -1818,7 +1876,7 @@ async fn connect_and_handshake(
         .map_err(|e| format!("server name: {}", e))?;
 
     let mut tls_stream = tokio::time::timeout(
-        Duration::from_secs(10),
+        tls_handshake_timeout,
         connector.connect(server_name.to_owned(), tcp_stream),
     )
     .await
@@ -14206,6 +14264,26 @@ mod integration_tests {
         make_test_node_with_db(network_id, db, false)
     }
 
+    fn reconfigure_test_node(
+        node: Arc<NodeState>,
+        configure: impl FnOnce(&mut Cli),
+    ) -> Arc<NodeState> {
+        let mut base = Arc::into_inner(node).expect("single test node ref");
+        configure(&mut base.config);
+        Arc::new(base)
+    }
+
+    fn make_test_node_with_bootstrap_ips(
+        network_id: u32,
+        bootstrap_ips: Vec<String>,
+        connection_pool_size: usize,
+    ) -> Arc<NodeState> {
+        reconfigure_test_node(make_test_node(network_id), |config| {
+            config.bootstrap_ips = bootstrap_ips;
+            config.connection_pool_size = connection_pool_size;
+        })
+    }
+
     fn make_test_archive_node(network_id: u32) -> Arc<NodeState> {
         let (db, _dir) = Database::open_temp().expect("open temp db");
         make_test_node_with_db(network_id, db, true)
@@ -14316,6 +14394,116 @@ mod integration_tests {
             #[cfg(feature = "indexer")]
             indexer: None,
         })
+    }
+
+    async fn spawn_test_bootstrap_peer(
+        network_id: u32,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let node = make_test_node(network_id);
+        let (handshake_tx, handshake_rx) = tokio::sync::oneshot::channel();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test bootstrap peer");
+        let addr = listener.local_addr().expect("test bootstrap local addr");
+        let handle = tokio::spawn(async move {
+            let mut handshake_tx = Some(handshake_tx);
+            while let Ok((stream, peer_addr)) = listener.accept().await {
+                let node = node.clone();
+                let advertised_addr = addr;
+                let handshake_tx = handshake_tx.take();
+                tokio::spawn(async move {
+                    let tls_config = node
+                        .identity
+                        .tls_server_config()
+                        .expect("test bootstrap tls server config");
+                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+                    let mut tls_stream = acceptor
+                        .accept(stream)
+                        .await
+                        .expect("accept test bootstrap tls");
+                    read_one_decoded_message(&mut tls_stream, peer_addr, 5)
+                        .await
+                        .expect("read bootstrap handshake");
+
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let version = NetworkMessage::Version {
+                        network_id,
+                        node_id: node.identity.node_id.clone(),
+                        my_time: now,
+                        ip_addr: vec![127, 0, 0, 1],
+                        ip_port: advertised_addr.port(),
+                        my_version: "avalanchego/1.14.1".to_string(),
+                        my_version_time: 0,
+                        sig: Vec::new(),
+                        tracked_subnets: Vec::new(),
+                        supported_acps: local_supported_acps(network_id, now),
+                        objected_acps: Vec::new(),
+                    };
+                    let peer_list = NetworkMessage::PeerList { peers: vec![] };
+                    let version_encoded = version.encode_proto().expect("encode test version");
+                    let peer_list_encoded = peer_list.encode_proto().expect("encode test peerlist");
+                    tls_stream
+                        .write_all(&version_encoded)
+                        .await
+                        .expect("write test version");
+                    tls_stream.flush().await.expect("flush test version");
+                    tls_stream
+                        .write_all(&peer_list_encoded)
+                        .await
+                        .expect("write test peerlist");
+                    tls_stream.flush().await.expect("flush test peerlist");
+                    let peer_list_from_client =
+                        read_one_decoded_message(&mut tls_stream, peer_addr, 5)
+                            .await
+                            .expect("read client peerlist");
+                    if matches!(
+                        peer_list_from_client.message,
+                        NetworkMessage::PeerList { .. }
+                    ) {
+                        if let Some(handshake_tx) = handshake_tx {
+                            let _ = handshake_tx.send(());
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (addr, handshake_rx, handle)
+    }
+
+    async fn spawn_hanging_bootstrap_peer() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging bootstrap peer");
+        let addr = listener.local_addr().expect("hanging bootstrap local addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _stream = stream;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        (addr, handle)
+    }
+
+    async fn spawn_non_tls_bootstrap_peer() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind non-tls bootstrap peer");
+        let addr = listener.local_addr().expect("non-tls bootstrap local addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(b"not tls").await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, handle)
     }
 
     fn make_banff_std_with_timestamp(parent: [u8; 32], height: u64, timestamp: u64) -> Vec<u8> {
@@ -22549,6 +22737,94 @@ mod integration_tests {
         assert!(metrics.contains("memory_rss_bytes"));
         assert!(metrics.contains("uptime_seconds"));
         assert!(metrics.contains("handshake_latency_ms"));
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_connects_to_reachable_peer_after_tls_timeout() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (hanging_addr, hanging_handle) = spawn_hanging_bootstrap_peer().await;
+        let (good_addr, good_handshake, good_handle) = spawn_test_bootstrap_peer(1).await;
+        let node = make_test_node_with_bootstrap_ips(
+            1,
+            vec![hanging_addr.to_string(), good_addr.to_string()],
+            2,
+        );
+        let bad_record = PersistentPeerRecord::new(
+            [0x91; 20],
+            socket_addr_to_ip_bytes(hanging_addr),
+            hanging_addr.port(),
+        );
+        node.db
+            .put_peer(&bad_record.node_id, &bad_record.encode())
+            .expect("persist bad peer record");
+
+        connect_to_bootstrap_nodes_with_timeouts(
+            node.clone(),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), good_handshake)
+            .await
+            .expect("good bootstrap peer should be reached despite timeout peer")
+            .expect("good bootstrap handshake signal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let Some(raw) = node
+                    .db
+                    .get_peer(&bad_record.node_id)
+                    .expect("read bad peer record")
+                else {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                };
+                let record = PersistentPeerRecord::decode(&raw).expect("decode bad peer record");
+                if record.failure_count == 1 {
+                    assert_eq!(record.reliability_score, 400);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("bad peer penalty should persist");
+
+        good_handle.abort();
+        let _ = good_handle.await;
+        hanging_handle.abort();
+        let _ = hanging_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_connects_to_reachable_peer_after_non_tls_failure() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (bad_addr, bad_handle) = spawn_non_tls_bootstrap_peer().await;
+        let (good_addr, good_handshake, good_handle) = spawn_test_bootstrap_peer(1).await;
+        let node = make_test_node_with_bootstrap_ips(
+            1,
+            vec![bad_addr.to_string(), good_addr.to_string()],
+            2,
+        );
+
+        connect_to_bootstrap_nodes_with_timeouts(
+            node.clone(),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), good_handshake)
+            .await
+            .expect("good bootstrap peer should be reached despite non-tls peer")
+            .expect("good bootstrap handshake signal");
+
+        good_handle.abort();
+        let _ = good_handle.await;
+        bad_handle.abort();
+        let _ = bad_handle.await;
     }
 
     #[tokio::test]
