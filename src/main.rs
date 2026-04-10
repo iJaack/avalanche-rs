@@ -51,7 +51,7 @@ use avalanche_rs::block::{
 use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
 use avalanche_rs::debug::{EvmTracer, TraceConfig, TracerType};
-use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmTransaction, TxReceipt};
+use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmLog, EvmTransaction, TxReceipt};
 use avalanche_rs::hardening::get_rss_bytes;
 use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
@@ -9802,17 +9802,19 @@ fn parse_log_filter(filter_obj: &serde_json::Value, node: &NodeState) -> LogFilt
             .collect(),
         _ => vec![],
     };
+    let last_polled_block = if filter_obj.get("fromBlock").is_some() {
+        from_block.saturating_sub(1)
+    } else {
+        current_height
+    };
 
     LogFilter {
         from_block,
         to_block,
         addresses,
         topics: parse_filter_topics(filter_obj),
-        last_polled_block: if filter_obj.get("fromBlock").is_some() {
-            from_block.saturating_sub(1)
-        } else {
-            current_height
-        },
+        last_polled_block,
+        last_polled_hash: canonical_cchain_block_hash_at_height(&node.db, last_polled_block),
     }
 }
 
@@ -9828,6 +9830,38 @@ fn load_cchain_block_by_hash(db: &Database, block_hash: &[u8; 32]) -> Option<Vec
     key.extend_from_slice(b"c:");
     key.extend_from_slice(block_hash);
     db.get_cf(avalanche_rs::db::CF_BLOCKS, &key).ok().flatten()
+}
+
+fn canonical_cchain_block_hash_at_height(db: &Database, block_height: u64) -> Option<[u8; 32]> {
+    db.get_block(block_height)
+        .ok()
+        .flatten()
+        .map(|block_data| cchain_block_hash(&block_data))
+}
+
+fn canonical_filter_start_block(
+    db: &Database,
+    last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
+    current_height: u64,
+) -> Option<u64> {
+    if last_polled_block <= current_height {
+        if let Some(previous_hash) = last_polled_hash {
+            match canonical_cchain_block_hash_at_height(db, last_polled_block) {
+                Some(current_hash) if current_hash != previous_hash => {
+                    return Some(last_polled_block);
+                }
+                None => return Some(last_polled_block),
+                _ => {}
+            }
+        }
+    }
+
+    if current_height > last_polled_block {
+        Some(last_polled_block.saturating_add(1))
+    } else {
+        None
+    }
 }
 
 fn cchain_transaction_count(block_data: &[u8]) -> u64 {
@@ -11041,6 +11075,7 @@ struct LogFilter {
     addresses: Vec<[u8; 20]>,
     topics: Vec<Option<Vec<[u8; 32]>>>,
     last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
 }
 
 #[allow(dead_code)]
@@ -11051,11 +11086,13 @@ struct PendingTransactionFilter {
 #[allow(dead_code)]
 struct BlockHashFilter {
     last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
 }
 
 #[allow(dead_code)]
 struct AcceptedTransactionFilter {
     last_polled_block: u64,
+    last_polled_hash: Option<[u8; 32]>,
     full_tx: bool,
 }
 
@@ -11815,6 +11852,10 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 filter_id,
                 RpcFilter::AcceptedTransactions(AcceptedTransactionFilter {
                     last_polled_block: current_cchain_height(node),
+                    last_polled_hash: canonical_cchain_block_hash_at_height(
+                        &node.db,
+                        current_cchain_height(node),
+                    ),
                     full_tx,
                 }),
             );
@@ -11827,6 +11868,10 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 filter_id,
                 RpcFilter::Blocks(BlockHashFilter {
                     last_polled_block: current_cchain_height(node),
+                    last_polled_hash: canonical_cchain_block_hash_at_height(
+                        &node.db,
+                        current_cchain_height(node),
+                    ),
                 }),
             );
             rpc_ok(&format!("\"0x{:x}\"", filter_id), id)
@@ -11845,12 +11890,18 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         .to_block
                         .unwrap_or(current_height)
                         .min(current_height);
-                    let start_block = filter
-                        .last_polled_block
-                        .saturating_add(1)
-                        .max(filter.from_block);
+                    let start_block = canonical_filter_start_block(
+                        &node.db,
+                        filter.last_polled_block,
+                        filter.last_polled_hash,
+                        current_height,
+                    )
+                    .map(|block| block.max(filter.from_block))
+                    .unwrap_or(end_block.saturating_add(1));
                     let logs = collect_logs_for_range(&node.db, filter, start_block, end_block);
                     filter.last_polled_block = current_height;
+                    filter.last_polled_hash =
+                        canonical_cchain_block_hash_at_height(&node.db, current_height);
                     rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
                 }
                 Some(RpcFilter::PendingTransactions(filter)) => {
@@ -11859,14 +11910,28 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 }
                 Some(RpcFilter::Blocks(filter)) => {
                     let current_height = current_cchain_height(node);
-                    let start_block = filter.last_polled_block.saturating_add(1);
+                    let start_block = canonical_filter_start_block(
+                        &node.db,
+                        filter.last_polled_block,
+                        filter.last_polled_hash,
+                        current_height,
+                    )
+                    .unwrap_or(current_height.saturating_add(1));
                     let changes = block_hash_changes(&node.db, start_block, current_height);
                     filter.last_polled_block = current_height;
+                    filter.last_polled_hash =
+                        canonical_cchain_block_hash_at_height(&node.db, current_height);
                     rpc_ok(&serde_json::Value::Array(changes).to_string(), id)
                 }
                 Some(RpcFilter::AcceptedTransactions(filter)) => {
                     let current_height = current_cchain_height(node);
-                    let start_block = filter.last_polled_block.saturating_add(1);
+                    let start_block = canonical_filter_start_block(
+                        &node.db,
+                        filter.last_polled_block,
+                        filter.last_polled_hash,
+                        current_height,
+                    )
+                    .unwrap_or(current_height.saturating_add(1));
                     let changes = accepted_transaction_changes(
                         &node.db,
                         start_block,
@@ -11874,6 +11939,8 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         filter.full_tx,
                     );
                     filter.last_polled_block = current_height;
+                    filter.last_polled_hash =
+                        canonical_cchain_block_hash_at_height(&node.db, current_height);
                     rpc_ok(&serde_json::Value::Array(changes).to_string(), id)
                 }
                 None => rpc_error(-32000, "filter not found", id),
@@ -19545,6 +19612,193 @@ mod integration_tests {
             accepted_changes_json["result"][0]["blockHash"],
             format!("0x{}", hex::encode(block.id))
         );
+    }
+
+    #[tokio::test]
+    async fn test_filters_detect_same_height_canonical_replacement() {
+        let _guard = FILTER_TEST_GUARD.lock().await;
+        FILTERS.write().await.clear();
+
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+        let log_address = [0xCC; 20];
+        let log_topic = [0x33; 32];
+
+        let tx_a = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x41; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_b = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 30_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x42; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+
+        let old_raw = make_cchain_coreth_block_with_transactions(
+            [0x11; 32],
+            1,
+            1_700_000_000,
+            std::slice::from_ref(&tx_a.raw),
+        );
+        let new_raw = make_cchain_coreth_block_with_transactions(
+            [0x22; 32],
+            1,
+            1_700_000_010,
+            std::slice::from_ref(&tx_b.raw),
+        );
+        let old_block_hash = cchain_block_hash(&old_raw);
+        let new_block_hash = cchain_block_hash(&new_raw);
+        let old_tx_hash = keccak_tx_hash(&tx_a.raw);
+        let new_tx_hash = keccak_tx_hash(&tx_b.raw);
+        let old_parsed = vec![parse_raw_cchain_transaction(&tx_a.raw).unwrap()];
+        let new_parsed = vec![parse_raw_cchain_transaction(&tx_b.raw).unwrap()];
+        let receipt_with_log = |gas_used| TxReceipt {
+            success: true,
+            gas_used,
+            output: vec![],
+            contract_address: None,
+            logs: vec![EvmLog {
+                address: log_address,
+                topics: vec![log_topic],
+                data: vec![],
+            }],
+        };
+
+        node.db.put_block(1, &old_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &old_block_hash,
+            &old_parsed,
+            &[receipt_with_log(21_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let log_filter_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_newFilter","params":[{{"address":"0x{}","topics":["0x{}"]}}],"id":36}}"#,
+            hex::encode(log_address),
+            hex::encode(log_topic)
+        );
+        let log_filter_response = handle_rpc_request(&log_filter_req, &node).await;
+        let log_filter_json: serde_json::Value =
+            serde_json::from_str(&log_filter_response).unwrap();
+        let log_filter_id = log_filter_json["result"].as_str().unwrap().to_string();
+
+        let new_block_req =
+            r#"{"jsonrpc":"2.0","method":"eth_newBlockFilter","params":[],"id":37}"#;
+        let new_block_response = handle_rpc_request(new_block_req, &node).await;
+        let new_block_json: serde_json::Value = serde_json::from_str(&new_block_response).unwrap();
+        let block_filter_id = new_block_json["result"].as_str().unwrap().to_string();
+
+        let new_accepted_req = r#"{"jsonrpc":"2.0","method":"eth_newAcceptedTransactions","params":[{"fullTx":true}],"id":38}"#;
+        let new_accepted_response = handle_rpc_request(new_accepted_req, &node).await;
+        let new_accepted_json: serde_json::Value =
+            serde_json::from_str(&new_accepted_response).unwrap();
+        let accepted_filter_id = new_accepted_json["result"].as_str().unwrap().to_string();
+
+        let log_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":39}}"#,
+            log_filter_id
+        );
+        let first_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let first_log_json: serde_json::Value = serde_json::from_str(&first_log_changes).unwrap();
+        assert!(first_log_json["result"].as_array().unwrap().is_empty());
+
+        let block_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":40}}"#,
+            block_filter_id
+        );
+        let first_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let first_block_json: serde_json::Value =
+            serde_json::from_str(&first_block_changes).unwrap();
+        assert!(first_block_json["result"].as_array().unwrap().is_empty());
+
+        let accepted_changes_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getFilterChanges","params":["{}"],"id":41}}"#,
+            accepted_filter_id
+        );
+        let first_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let first_accepted_json: serde_json::Value =
+            serde_json::from_str(&first_accepted_changes).unwrap();
+        assert!(first_accepted_json["result"].as_array().unwrap().is_empty());
+
+        clear_canonical_cchain_tx_artifacts(&node.db, 1).unwrap();
+        node.db.put_block(1, &new_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &node.db,
+            1,
+            &new_block_hash,
+            &new_parsed,
+            &[receipt_with_log(30_000)],
+        )
+        .unwrap();
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let second_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let second_log_json: serde_json::Value = serde_json::from_str(&second_log_changes).unwrap();
+        let second_logs = second_log_json["result"].as_array().unwrap();
+        assert_eq!(second_logs.len(), 1);
+        assert_eq!(
+            second_logs[0]["transactionHash"],
+            format!("0x{}", hex::encode(new_tx_hash))
+        );
+        assert_eq!(
+            second_logs[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_hash))
+        );
+
+        let second_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let second_block_json: serde_json::Value =
+            serde_json::from_str(&second_block_changes).unwrap();
+        let second_blocks = second_block_json["result"].as_array().unwrap();
+        assert_eq!(second_blocks.len(), 1);
+        assert_eq!(
+            second_blocks[0],
+            format!("0x{}", hex::encode(new_block_hash))
+        );
+
+        let second_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let second_accepted_json: serde_json::Value =
+            serde_json::from_str(&second_accepted_changes).unwrap();
+        let second_accepted = second_accepted_json["result"].as_array().unwrap();
+        assert_eq!(second_accepted.len(), 1);
+        assert_eq!(
+            second_accepted[0]["hash"],
+            format!("0x{}", hex::encode(new_tx_hash))
+        );
+        assert_eq!(
+            second_accepted[0]["blockHash"],
+            format!("0x{}", hex::encode(new_block_hash))
+        );
+
+        let third_log_changes = handle_rpc_request(&log_changes_req, &node).await;
+        let third_log_json: serde_json::Value = serde_json::from_str(&third_log_changes).unwrap();
+        assert!(third_log_json["result"].as_array().unwrap().is_empty());
+
+        let third_block_changes = handle_rpc_request(&block_changes_req, &node).await;
+        let third_block_json: serde_json::Value =
+            serde_json::from_str(&third_block_changes).unwrap();
+        assert!(third_block_json["result"].as_array().unwrap().is_empty());
+
+        let third_accepted_changes = handle_rpc_request(&accepted_changes_req, &node).await;
+        let third_accepted_json: serde_json::Value =
+            serde_json::from_str(&third_accepted_changes).unwrap();
+        assert!(third_accepted_json["result"].as_array().unwrap().is_empty());
+
+        assert_ne!(old_block_hash, new_block_hash);
+        assert_ne!(old_tx_hash, new_tx_hash);
     }
 
     #[tokio::test]
