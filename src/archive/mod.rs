@@ -84,7 +84,8 @@ impl ArchiveStore {
             return Ok(Some(crate::db::decode_account_state_rlp(&data)));
         }
 
-        // Walk backward from height to find most recent snapshot
+        // Walk backward from height to find most recent snapshot.
+        // This favors correctness over performance until the archive index is upgraded.
         for h in (0..height).rev() {
             let mut scan_key = Vec::with_capacity(28);
             scan_key.extend_from_slice(&h.to_be_bytes());
@@ -92,11 +93,6 @@ impl ArchiveStore {
 
             if let Some(data) = db.get_cf(CF_ARCHIVE_STATE, &scan_key)? {
                 return Ok(Some(crate::db::decode_account_state_rlp(&data)));
-            }
-
-            // Don't scan more than 1000 blocks back for performance
-            if height - h > 1000 {
-                break;
             }
         }
 
@@ -226,6 +222,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(at_150.balance, 1000);
+    }
+
+    #[test]
+    fn test_archive_query_walks_back_more_than_1000_blocks() {
+        let store = ArchiveStore::new(true);
+        let (db, _dir) = Database::open_temp().unwrap();
+        let addr = [0x22u8; 20];
+        let state = AccountState {
+            nonce: 9,
+            balance: 1234,
+            storage_root: [0u8; 32],
+            code_hash: [0u8; 32],
+        };
+
+        store.put_account_snapshot(&db, 1, &addr, &state).unwrap();
+
+        let at_2000 = store
+            .get_account_at_height(&db, &addr, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_2000.balance, 1234);
+        assert_eq!(at_2000.nonce, 9);
     }
 
     #[test]

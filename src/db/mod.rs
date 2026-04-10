@@ -429,7 +429,7 @@ pub struct StateTrie {
 }
 
 /// RLP-encoded account state (balance, nonce, storage_root, code_hash).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountState {
     pub nonce: u64,
     pub balance: u128,

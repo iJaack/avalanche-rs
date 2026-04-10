@@ -6,6 +6,7 @@
 //! - Standard precompiles (ecrecover, sha256, ripemd160, identity, etc.)
 //! - Gas accounting and receipt generation
 
+use alloy_primitives::keccak256;
 use revm::{
     db::CacheDB,
     inspector_handle_register,
@@ -234,6 +235,49 @@ pub struct EvmExecutor {
 }
 
 impl EvmExecutor {
+    fn account_state_from_db_account(account: &revm::db::DbAccount) -> crate::db::AccountState {
+        use alloy_trie::{root::storage_root_unhashed, EMPTY_ROOT_HASH};
+
+        let storage_root = if account.storage.is_empty() {
+            *EMPTY_ROOT_HASH.as_ref()
+        } else {
+            let storage_iter = account
+                .storage
+                .iter()
+                .map(|(slot, value)| (B256::from(slot.to_be_bytes::<32>()), *value));
+            let root = storage_root_unhashed(storage_iter);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(root.as_slice());
+            out
+        };
+
+        let code_hash = match &account.info.code {
+            Some(code) if !code.is_empty() => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(keccak256(code.bytes()).as_slice());
+                out
+            }
+            _ if account.info.code_hash != KECCAK_EMPTY => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(account.info.code_hash.as_slice());
+                out
+            }
+            _ => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(KECCAK_EMPTY.as_slice());
+                out
+            }
+        };
+
+        let balance_bytes = account.info.balance.to_le_bytes::<32>();
+        crate::db::AccountState {
+            nonce: account.info.nonce,
+            balance: u128::from_le_bytes(balance_bytes[..16].try_into().unwrap()),
+            storage_root,
+            code_hash,
+        }
+    }
+
     /// Create a new executor with an empty in-memory state.
     pub fn new(chain_id: u64) -> Self {
         Self {
@@ -328,6 +372,45 @@ impl EvmExecutor {
             .and_then(|a| a.storage.get(&slot_u256))
             .map(|v| v.to_be_bytes())
             .unwrap_or([0u8; 32])
+    }
+
+    /// Export the current account state map in a portable form.
+    pub fn archived_account_states(&self) -> BTreeMap<[u8; 20], crate::db::AccountState> {
+        self.db
+            .accounts
+            .iter()
+            .map(|(addr, account)| {
+                let mut raw = [0u8; 20];
+                raw.copy_from_slice(addr.as_slice());
+                (raw, Self::account_state_from_db_account(account))
+            })
+            .collect()
+    }
+
+    /// Return the account states that changed compared with a previous snapshot.
+    pub fn changed_account_states_since(
+        &self,
+        previous: &Self,
+    ) -> Vec<([u8; 20], crate::db::AccountState)> {
+        let current = self.archived_account_states();
+        let previous = previous.archived_account_states();
+        let addresses = current
+            .keys()
+            .chain(previous.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        addresses
+            .into_iter()
+            .filter_map(|address| {
+                let current_state = current.get(&address).cloned().unwrap_or_default();
+                if previous.get(&address) == Some(&current_state) {
+                    None
+                } else {
+                    Some((address, current_state))
+                }
+            })
+            .collect()
     }
 
     /// Execute a call without committing state changes (eth_call).

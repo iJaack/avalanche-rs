@@ -49,7 +49,7 @@ use avalanche_rs::block::{
     parse_raw_cchain_transaction, BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
 };
 use avalanche_rs::consensus::SnowmanConsensus;
-use avalanche_rs::db::{Database, CF_BLOCKS, CF_STATE_ROOTS};
+use avalanche_rs::db::{AccountState, Database, CF_BLOCKS, CF_STATE_ROOTS};
 use avalanche_rs::debug::{EvmTracer, TraceConfig, TracerType};
 use avalanche_rs::evm::{BlockContext, EvmExecutor, EvmLog, EvmTransaction, TxReceipt};
 use avalanche_rs::hardening::get_rss_bytes;
@@ -216,7 +216,7 @@ struct Cli {
     light_client: bool,
 
     /// Enable archive mode: keep ALL historical state, never prune.
-    /// Allows eth_getBalance/eth_call at any historical block number.
+    /// Enables supported historical state queries against canonical blocks.
     #[arg(long, default_value = "false", env = "AVAX_ARCHIVE")]
     archive: bool,
 
@@ -3290,14 +3290,20 @@ async fn build_cchain_block(
 
     let evm_txs: Vec<EvmTransaction> = txs.iter().map(pool_tx_to_evm_tx).collect();
 
-    let (block_result, state_root) = {
+    let (block_result, state_root, archive_changes) = {
         let mut evm = node.evm.write().await;
+        let before = node.archive_store.enabled.then(|| evm.snapshot());
         let result = evm
             .execute_block(&evm_txs, &ctx)
             .map_err(|e| format!("EVM execution: {}", e))?;
         let state_root = result.state_root;
-        (result, state_root)
+        let archive_changes = before
+            .as_ref()
+            .map(|snapshot| evm.changed_account_states_since(snapshot))
+            .unwrap_or_default();
+        (result, state_root, archive_changes)
     };
+    persist_archive_state_changes(node, block_number, &state_root, &archive_changes);
 
     // Build RLP block
     let raw = encode_cchain_block_rlp(
@@ -3655,6 +3661,9 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 fields.number, e
             );
         }
+        if let Some(state_root) = expected_state_root {
+            persist_archive_state_changes(node, fields.number, &state_root, &[]);
+        }
 
         let current_height = current_cchain_height(node);
         if fields.number > current_height {
@@ -3691,6 +3700,7 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
     // Recover sender addresses from ECDSA signatures, falling back to zero address
     let result = {
         let mut evm = node.evm.write().await;
+        let before = node.archive_store.enabled.then(|| evm.snapshot());
         let evm_txs: Vec<EvmTransaction> = raw_txs
             .iter()
             .map(|t| {
@@ -3708,10 +3718,15 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                 }
             })
             .collect();
-        evm.execute_block(&evm_txs, &ctx)
+        let result = evm.execute_block(&evm_txs, &ctx);
+        let archive_changes = before
+            .as_ref()
+            .map(|snapshot| evm.changed_account_states_since(snapshot))
+            .unwrap_or_default();
+        (result, archive_changes)
     };
 
-    match result {
+    match result.0 {
         Ok(block_result) => {
             if let Some(expected) = expected_state_root {
                 if block_result.state_root != expected {
@@ -3737,6 +3752,7 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
                     return;
                 }
             }
+            persist_archive_state_changes(node, fields.number, &block_result.state_root, &result.1);
 
             debug!(
                 "C-Chain #{}: executed {} txs, {} gas used, state_root=0x{}",
@@ -5043,6 +5059,58 @@ fn parse_block_number(val: &serde_json::Value, node: &NodeState) -> u64 {
             u64::from_str_radix(s, 16).unwrap_or(0)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CchainStateQuery {
+    block_height: u64,
+    is_current: bool,
+}
+
+fn resolve_cchain_state_query(
+    selector: &serde_json::Value,
+    node: &NodeState,
+) -> Result<CchainStateQuery, String> {
+    let current_height = current_cchain_height(node);
+    let block_height = parse_block_number(selector, node);
+    let is_current = match selector.as_str() {
+        Some("latest") | Some("pending") | None => true,
+        _ => block_height == current_height,
+    };
+
+    if is_current {
+        return Ok(CchainStateQuery {
+            block_height,
+            is_current: true,
+        });
+    }
+
+    match node.db.get_block(block_height) {
+        Ok(Some(_)) => Ok(CchainStateQuery {
+            block_height,
+            is_current: false,
+        }),
+        Ok(None) => Err(format!("block #{} not found", block_height)),
+        Err(err) => Err(format!("failed to load block #{}: {}", block_height, err)),
+    }
+}
+
+fn load_historical_account_state(
+    node: &NodeState,
+    address: [u8; 20],
+    block_height: u64,
+) -> Result<Option<AccountState>, String> {
+    if !node.archive_store.enabled {
+        return Err("historical state query not allowed".to_string());
+    }
+
+    node.archive_store
+        .get_account_at_height(&node.db, &address, block_height)
+        .map_err(|err| format!("failed to load historical state: {}", err))
+}
+
+fn reject_unsupported_historical_query(id: &serde_json::Value) -> String {
+    rpc_error(-32000, "historical query not supported for this method", id)
 }
 
 fn resolve_cchain_block_height(
@@ -10948,6 +11016,41 @@ fn record_bad_cchain_block(
     );
 }
 
+fn persist_archive_state_changes(
+    node: &NodeState,
+    block_height: u64,
+    state_root: &[u8; 32],
+    changes: &[([u8; 20], AccountState)],
+) {
+    if !node.archive_store.enabled {
+        return;
+    }
+
+    if let Err(err) = node
+        .archive_store
+        .put_state_root(&node.db, block_height, state_root)
+    {
+        debug!(
+            "failed to persist archive state root for block #{}: {}",
+            block_height, err
+        );
+    }
+
+    for (address, state) in changes {
+        if let Err(err) =
+            node.archive_store
+                .put_account_snapshot(&node.db, block_height, address, state)
+        {
+            debug!(
+                "failed to persist archive snapshot for block #{} account 0x{}: {}",
+                block_height,
+                hex::encode(address),
+                err
+            );
+        }
+    }
+}
+
 fn persist_local_cchain_tx_artifacts(
     db: &Database,
     block: &BuiltBlock,
@@ -11222,6 +11325,20 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_address(addr_str) {
                 Some(addr) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(1).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return match load_historical_account_state(node, addr, query.block_height) {
+                            Ok(Some(state)) => rpc_ok(&format!("\"0x{:x}\"", state.balance), id),
+                            Ok(None) => rpc_ok("\"0x0\"", id),
+                            Err(message) => rpc_error(-32000, &message, id),
+                        };
+                    }
                     // In light client mode, serve from proof cache first
                     if node.config.light_client {
                         let lc = node.light_client.read().await;
@@ -11245,6 +11362,20 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_address(addr_str) {
                 Some(addr) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(1).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return match load_historical_account_state(node, addr, query.block_height) {
+                            Ok(Some(state)) => rpc_ok(&format!("\"0x{:x}\"", state.nonce), id),
+                            Ok(None) => rpc_ok("\"0x0\"", id),
+                            Err(message) => rpc_error(-32000, &message, id),
+                        };
+                    }
                     let evm = node.evm.read().await;
                     let nonce = evm.get_nonce(addr);
                     rpc_ok(&format!("\"0x{:x}\"", nonce), id)
@@ -11260,6 +11391,16 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let addr_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_address(addr_str) {
                 Some(addr) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(1).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return reject_unsupported_historical_query(id);
+                    }
                     let evm = node.evm.read().await;
                     let code = evm.get_code(addr);
                     rpc_ok(&format!("\"0x{}\"", hex::encode(&code)), id)
@@ -11276,6 +11417,16 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let slot_str = params.get(1).and_then(|v| v.as_str()).unwrap_or("0x0");
             match (parse_hex_address(addr_str), parse_hex_hash(slot_str)) {
                 (Some(addr), Some(slot)) => {
+                    let query = match resolve_cchain_state_query(
+                        params.get(2).unwrap_or(&serde_json::Value::Null),
+                        node,
+                    ) {
+                        Ok(query) => query,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                    if !query.is_current {
+                        return reject_unsupported_historical_query(id);
+                    }
                     let evm = node.evm.read().await;
                     let value = evm.get_storage_at(addr, slot);
                     rpc_ok(&format!("\"0x{}\"", hex::encode(value)), id)
@@ -11294,15 +11445,19 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let current_height = current_cchain_height(node);
-            let allow_current = match params.get(2) {
-                None => true,
-                Some(serde_json::Value::Null) => true,
-                Some(serde_json::Value::String(tag)) if tag == "latest" || tag == "pending" => true,
-                Some(value) => parse_block_number(value, node) == current_height,
+            let query = match resolve_cchain_state_query(
+                params.get(2).unwrap_or(&serde_json::Value::Null),
+                node,
+            ) {
+                Ok(query) => query,
+                Err(message) => return rpc_error(-32000, &message, id),
             };
-            if !allow_current {
-                return rpc_error(-32000, "historical proof query not allowed", id);
+            if !query.is_current {
+                return if node.archive_store.enabled {
+                    reject_unsupported_historical_query(id)
+                } else {
+                    rpc_error(-32000, "historical state query not allowed", id)
+                };
             }
             let Some(address) = parse_hex_address(addr_str) else {
                 return rpc_error(-32602, "invalid address", id);
@@ -11333,6 +11488,20 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let tx_obj = params.get(0);
             if tx_obj.is_none() {
                 return rpc_error(-32602, "missing transaction object", id);
+            }
+            let query = match resolve_cchain_state_query(
+                params.get(1).unwrap_or(&serde_json::Value::Null),
+                node,
+            ) {
+                Ok(query) => query,
+                Err(message) => return rpc_error(-32000, &message, id),
+            };
+            if !query.is_current {
+                return if node.archive_store.enabled {
+                    reject_unsupported_historical_query(id)
+                } else {
+                    rpc_error(-32000, "historical state query not allowed", id)
+                };
             }
             let evm = node.evm.read().await;
             let block_ctx = rpc_simulation_block_context(node);
@@ -13767,6 +13936,19 @@ mod integration_tests {
             p_chain_recently_accepted: new_recently_accepted_pchain_blocks(),
             #[cfg(feature = "indexer")]
             indexer: None,
+        })
+    }
+
+    fn make_test_archive_node(network_id: u32) -> Arc<NodeState> {
+        let node = make_test_node(network_id);
+        let base = Arc::into_inner(node).expect("single test node ref");
+        Arc::new(NodeState {
+            config: Cli {
+                archive: true,
+                ..base.config
+            },
+            archive_store: Arc::new(ArchiveStore::new(true)),
+            ..base
         })
     }
 
@@ -20085,9 +20267,13 @@ mod integration_tests {
         );
         assert_eq!(parsed["result"]["storageProof"][0]["value"], "0x5");
 
-        node.db.set_last_accepted_height(1).unwrap();
+        let block_1 = make_cchain_coreth_block_with_transactions([0x10; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x11; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
         let historical_req = format!(
-            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x0"],"id":44}}"#,
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":44}}"#,
             hex::encode(account),
             hex::encode(slot)
         );
@@ -20096,7 +20282,260 @@ mod integration_tests {
             serde_json::from_str(&historical_response).unwrap();
         assert_eq!(
             historical_json["error"]["message"],
-            "historical proof query not allowed"
+            "historical state query not allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eth_balance_and_transaction_count_support_archive_history() {
+        let node = make_test_archive_node(1);
+        let account = [0x71; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x01; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x02; 32], 2, 1_700_000_010, &[]);
+
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 3,
+                    balance: 111,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 4,
+                    balance: 222,
+                    storage_root: [0u8; 32],
+                    code_hash: [0u8; 32],
+                },
+            )
+            .unwrap();
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 333, 5, vec![]);
+        }
+
+        let historical_balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0x1"],"id":45}}"#,
+            hex::encode(account)
+        );
+        let historical_balance_response = handle_rpc_request(&historical_balance_req, &node).await;
+        let historical_balance_json: serde_json::Value =
+            serde_json::from_str(&historical_balance_response).unwrap();
+        assert_eq!(historical_balance_json["result"], "0x6f");
+
+        let historical_nonce_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["0x{}","0x1"],"id":46}}"#,
+            hex::encode(account)
+        );
+        let historical_nonce_response = handle_rpc_request(&historical_nonce_req, &node).await;
+        let historical_nonce_json: serde_json::Value =
+            serde_json::from_str(&historical_nonce_response).unwrap();
+        assert_eq!(historical_nonce_json["result"], "0x3");
+
+        let latest_balance_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","latest"],"id":47}}"#,
+            hex::encode(account)
+        );
+        let latest_balance_response = handle_rpc_request(&latest_balance_req, &node).await;
+        let latest_balance_json: serde_json::Value =
+            serde_json::from_str(&latest_balance_response).unwrap();
+        assert_eq!(latest_balance_json["result"], "0x14d");
+
+        let missing_block_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0xa"],"id":48}}"#,
+            hex::encode(account)
+        );
+        let missing_block_response = handle_rpc_request(&missing_block_req, &node).await;
+        let missing_block_json: serde_json::Value =
+            serde_json::from_str(&missing_block_response).unwrap();
+        assert_eq!(
+            missing_block_json["error"]["message"],
+            "block #10 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_snapshots_follow_local_cchain_blocks() {
+        let node = make_test_archive_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), 10_000_000_000_000_000_000u128);
+        }
+
+        let first_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x91; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let first_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":53}}"#,
+            first_signed.raw_hex()
+        );
+        let first_submit_response = handle_rpc_request(&first_submit_req, &node).await;
+        let first_submit_json: serde_json::Value =
+            serde_json::from_str(&first_submit_response).unwrap();
+        assert!(first_submit_json.get("result").is_some());
+
+        let first_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let first_block = build_cchain_block(&node, 1, first_pool_txs.clone())
+            .await
+            .expect("first block should build");
+        let mut first_key = Vec::with_capacity(34);
+        first_key.extend_from_slice(b"c:");
+        first_key.extend_from_slice(&first_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &first_key, &first_block.raw)
+            .unwrap();
+        node.db
+            .put_block(first_block.number, &first_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &first_block, &first_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(first_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &first_pool_txs).await;
+
+        let second_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x92; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let second_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":54}}"#,
+            second_signed.raw_hex()
+        );
+        let second_submit_response = handle_rpc_request(&second_submit_req, &node).await;
+        let second_submit_json: serde_json::Value =
+            serde_json::from_str(&second_submit_response).unwrap();
+        assert!(second_submit_json.get("result").is_some());
+
+        let second_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let second_block = build_cchain_block(&node, 2, second_pool_txs.clone())
+            .await
+            .expect("second block should build");
+        let mut second_key = Vec::with_capacity(34);
+        second_key.extend_from_slice(b"c:");
+        second_key.extend_from_slice(&second_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &second_key, &second_block.raw)
+            .unwrap();
+        node.db
+            .put_block(second_block.number, &second_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &second_block, &second_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(second_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &second_pool_txs).await;
+
+        let historical_nonce_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["{}","0x1"],"id":55}}"#,
+            wallet.address_hex()
+        );
+        let historical_nonce_response = handle_rpc_request(&historical_nonce_req, &node).await;
+        let historical_nonce_json: serde_json::Value =
+            serde_json::from_str(&historical_nonce_response).unwrap();
+        assert_eq!(historical_nonce_json["result"], "0x1");
+
+        let latest_nonce_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["{}","latest"],"id":56}}"#,
+            wallet.address_hex()
+        );
+        let latest_nonce_response = handle_rpc_request(&latest_nonce_req, &node).await;
+        let latest_nonce_json: serde_json::Value =
+            serde_json::from_str(&latest_nonce_response).unwrap();
+        assert_eq!(latest_nonce_json["result"], "0x2");
+    }
+
+    #[tokio::test]
+    async fn test_historical_state_queries_reject_unsupported_methods() {
+        let node = make_test_archive_node(1);
+        let account = [0x72; 20];
+        let slot = [0x01; 32];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x03; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x04; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let get_code_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getCode","params":["0x{}","0x1"],"id":49}}"#,
+            hex::encode(account)
+        );
+        let get_code_response = handle_rpc_request(&get_code_req, &node).await;
+        let get_code_json: serde_json::Value = serde_json::from_str(&get_code_response).unwrap();
+        assert_eq!(
+            get_code_json["error"]["message"],
+            "historical query not supported for this method"
+        );
+
+        let get_storage_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["0x{}","0x{}","0x1"],"id":50}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let get_storage_response = handle_rpc_request(&get_storage_req, &node).await;
+        let get_storage_json: serde_json::Value =
+            serde_json::from_str(&get_storage_response).unwrap();
+        assert_eq!(
+            get_storage_json["error"]["message"],
+            "historical query not supported for this method"
+        );
+
+        let call_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"to":"0x{}","data":"0x"}},"0x1"],"id":51}}"#,
+            hex::encode(account)
+        );
+        let call_response = handle_rpc_request(&call_req, &node).await;
+        let call_json: serde_json::Value = serde_json::from_str(&call_response).unwrap();
+        assert_eq!(
+            call_json["error"]["message"],
+            "historical query not supported for this method"
+        );
+
+        let proof_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":52}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let proof_response = handle_rpc_request(&proof_req, &node).await;
+        let proof_json: serde_json::Value = serde_json::from_str(&proof_response).unwrap();
+        assert_eq!(
+            proof_json["error"]["message"],
+            "historical query not supported for this method"
         );
     }
 
