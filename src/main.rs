@@ -14049,9 +14049,8 @@ mod integration_tests {
 
     static FILTER_TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn make_test_node(network_id: u32) -> Arc<NodeState> {
+    fn make_test_node_with_db(network_id: u32, db: Database, archive: bool) -> Arc<NodeState> {
         let identity = NodeIdentity::generate().expect("generate node identity");
-        let (db, _dir) = Database::open_temp().expect("open temp db");
         let evm = Arc::new(RwLock::new(EvmExecutor::new(43114)));
 
         let net_config = NetworkConfig {
@@ -14092,7 +14091,7 @@ mod integration_tests {
                 validator: false,
                 state_pruning_depth: 256,
                 light_client: false,
-                archive: false,
+                archive,
                 blob_retention_epochs: 4096,
                 txpool_size: 4096,
                 block_cache_size: 1024,
@@ -14122,7 +14121,7 @@ mod integration_tests {
             rpc_wallets: Arc::new(StdHashMap::new()),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
-            archive_store: Arc::new(ArchiveStore::new(false)),
+            archive_store: Arc::new(ArchiveStore::new(archive)),
             subnet_tracker: Arc::new(RwLock::new(SubnetTracker::new())),
             persisted_sync_state: Arc::new(RwLock::new(None)),
             ws_subscriptions: Arc::new(RwLock::new(SubscriptionManager::new(1024))),
@@ -14137,17 +14136,14 @@ mod integration_tests {
         })
     }
 
+    fn make_test_node(network_id: u32) -> Arc<NodeState> {
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        make_test_node_with_db(network_id, db, false)
+    }
+
     fn make_test_archive_node(network_id: u32) -> Arc<NodeState> {
-        let node = make_test_node(network_id);
-        let base = Arc::into_inner(node).expect("single test node ref");
-        Arc::new(NodeState {
-            config: Cli {
-                archive: true,
-                ..base.config
-            },
-            archive_store: Arc::new(ArchiveStore::new(true)),
-            ..base
-        })
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        make_test_node_with_db(network_id, db, true)
     }
 
     fn make_test_node_with_rpc_wallets(network_id: u32, wallets: Vec<Wallet>) -> Arc<NodeState> {
@@ -21114,6 +21110,162 @@ mod integration_tests {
             call_json["error"]["message"],
             "historical state query not allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_historical_archive_queries_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let account = [0x7Au8; 20];
+        let caller = [0x7Bu8; 20];
+        let slot = [0x03u8; 32];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x09; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x0A; 32], 2, 1_700_000_010, &[]);
+        let block_3 = make_cchain_coreth_block_with_transactions([0x0B; 32], 3, 1_700_000_020, &[]);
+        let code_v1 = vec![0x60, 0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_v2 = vec![0x60, 0x32, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_hash_v1: [u8; 32] = revm::primitives::keccak256(&code_v1).into();
+        let code_hash_v2: [u8; 32] = revm::primitives::keccak256(&code_v2).into();
+        let mut storage_v1 = [0u8; 32];
+        storage_v1[31] = 0x0d;
+        let mut storage_v2 = [0u8; 32];
+        storage_v2[31] = 0x0e;
+
+        let requests = vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x{}","0x1"],"id":60}}"#,
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["0x{}","0x1"],"id":61}}"#,
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getCode","params":["0x{}","0x1"],"id":62}}"#,
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["0x{}","0x{}","0x1"],"id":63}}"#,
+                hex::encode(account),
+                hex::encode(slot)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"0x1"],"id":64}}"#,
+                hex::encode(caller),
+                hex::encode(account)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":65}}"#,
+                hex::encode(account),
+                hex::encode(slot)
+            ),
+        ];
+
+        let initial_node = {
+            let db = Database::open(&db_path).unwrap();
+            let node = make_test_node_with_db(1, db, true);
+            node.db.put_block(1, &block_1).unwrap();
+            node.db.put_block(2, &block_2).unwrap();
+            node.db.put_block(3, &block_3).unwrap();
+            node.db.set_last_accepted_height(3).unwrap();
+            node.db.put_code(&code_hash_v1, &code_v1).unwrap();
+            node.db.put_code(&code_hash_v2, &code_v2).unwrap();
+            node.archive_store
+                .put_account_snapshot(
+                    &node.db,
+                    1,
+                    &account,
+                    &AccountState {
+                        nonce: 7,
+                        balance: 777,
+                        storage_root: [0u8; 32],
+                        code_hash: code_hash_v1,
+                    },
+                )
+                .unwrap();
+            node.archive_store
+                .put_account_snapshot(
+                    &node.db,
+                    2,
+                    &account,
+                    &AccountState {
+                        nonce: 8,
+                        balance: 888,
+                        storage_root: [0u8; 32],
+                        code_hash: code_hash_v2,
+                    },
+                )
+                .unwrap();
+            for height in [1, 2] {
+                node.archive_store
+                    .put_account_snapshot(
+                        &node.db,
+                        height,
+                        &caller,
+                        &AccountState {
+                            nonce: 0,
+                            balance: 10_000_000_000_000_000_000u128,
+                            storage_root: [0u8; 32],
+                            code_hash: [0u8; 32],
+                        },
+                    )
+                    .unwrap();
+            }
+            node.archive_store
+                .put_storage_snapshot(&node.db, 1, &account, &slot, &storage_v1)
+                .unwrap();
+            node.archive_store
+                .put_storage_snapshot(&node.db, 2, &account, &slot, &storage_v2)
+                .unwrap();
+            node.archive_store
+                .put_state_root(
+                    &node.db,
+                    1,
+                    &historical_evm_at_height(&node, 1)
+                        .unwrap()
+                        .compute_state_root_mpt(),
+                )
+                .unwrap();
+            node.archive_store
+                .put_state_root(
+                    &node.db,
+                    2,
+                    &historical_evm_at_height(&node, 2)
+                        .unwrap()
+                        .compute_state_root_mpt(),
+                )
+                .unwrap();
+            node
+        };
+
+        let before_restart = {
+            let mut results = Vec::new();
+            for req in &requests {
+                let response = handle_rpc_request(req, &initial_node).await;
+                results.push(serde_json::from_str::<serde_json::Value>(&response).unwrap());
+            }
+            results
+        };
+
+        drop(initial_node);
+
+        let reopened_node = {
+            let db = Database::open(&db_path).unwrap();
+            make_test_node_with_db(1, db, true)
+        };
+
+        let after_restart = {
+            let mut results = Vec::new();
+            for req in &requests {
+                let response = handle_rpc_request(req, &reopened_node).await;
+                results.push(serde_json::from_str::<serde_json::Value>(&response).unwrap());
+            }
+            results
+        };
+
+        assert_eq!(after_restart, before_restart);
     }
 
     #[tokio::test]
