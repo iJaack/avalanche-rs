@@ -3173,6 +3173,12 @@ async fn run_block_builder(node: Arc<NodeState>) {
                     );
                     continue;
                 }
+                if let Err(e) = clear_canonical_cchain_tx_artifacts(&node.db, block.number) {
+                    warn!(
+                        "Block builder: failed to clear old tx artifacts for block #{}: {}",
+                        block.number, e
+                    );
+                }
                 if let Err(e) = node.db.put_block(block.number, &block.raw) {
                     warn!(
                         "Block builder: failed to store block #{} by height: {}",
@@ -3746,6 +3752,13 @@ async fn execute_cchain_block_and_store(raw_block: &[u8], node: &NodeState) {
             if let Err(e) = node.db.put_cf(CF_BLOCKS, &key, raw_block) {
                 debug!(
                     "failed to store imported C-Chain block hash entry #{}: {}",
+                    fields.number, e
+                );
+            }
+
+            if let Err(e) = clear_canonical_cchain_tx_artifacts(&node.db, fields.number) {
+                debug!(
+                    "failed to clear canonical tx artifacts for imported C-Chain block #{}: {}",
                     fields.number, e
                 );
             }
@@ -10921,6 +10934,19 @@ fn persist_local_cchain_tx_artifacts(
     Ok(())
 }
 
+fn clear_canonical_cchain_tx_artifacts(
+    db: &Database,
+    block_height: u64,
+) -> Result<(), avalanche_rs::db::DbError> {
+    if let Some(existing_block) = db.get_block(block_height)? {
+        for tx in extract_cchain_transactions(&existing_block) {
+            db.delete_tx_index(&raw_tx_hash(&tx.raw))?;
+        }
+    }
+    db.clear_block_receipts(block_height)?;
+    Ok(())
+}
+
 fn persist_imported_cchain_tx_artifacts(
     db: &Database,
     block_number: u64,
@@ -14348,6 +14374,54 @@ mod integration_tests {
         outer_payload.push(0xc0); // uncles = empty
         outer_payload.push(0x80); // version = 0
         outer_payload.extend_from_slice(&rlp_bytes_for_test(extdata));
+        rlp_list_for_test(outer_payload)
+    }
+
+    fn make_cchain_coreth_block_with_transactions(
+        parent: [u8; 32],
+        number: u64,
+        timestamp: u64,
+        txs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut header_payload = Vec::new();
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&parent);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0x1d; 32]);
+        header_payload.push(0x94);
+        header_payload.extend_from_slice(&[0u8; 20]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.push(0xb9);
+        header_payload.push(0x01);
+        header_payload.push(0x00);
+        header_payload.extend_from_slice(&[0u8; 256]);
+        header_payload.push(0x80);
+        encode_rlp_u64_for_test(&mut header_payload, number);
+        encode_rlp_u64_for_test(&mut header_payload, 30_000_000);
+        header_payload.push(0x80);
+        encode_rlp_u64_for_test(&mut header_payload, timestamp);
+        header_payload.push(0x80);
+        header_payload.push(0xa0);
+        header_payload.extend_from_slice(&[0u8; 32]);
+        header_payload.extend_from_slice(&[0x88, 0, 0, 0, 0, 0, 0, 0, 0]);
+        encode_rlp_u64_for_test(&mut header_payload, 25_000_000_000);
+
+        let txs_payload = txs
+            .iter()
+            .flat_map(|tx| tx.iter().copied())
+            .collect::<Vec<_>>();
+
+        let mut outer_payload = Vec::new();
+        outer_payload.extend_from_slice(&rlp_list_for_test(header_payload));
+        outer_payload.extend_from_slice(&rlp_list_for_test(txs_payload));
+        outer_payload.push(0xc0); // uncles = empty
+        outer_payload.push(0x80); // version = 0
+        outer_payload.extend_from_slice(&rlp_bytes_for_test(&[]));
         rlp_list_for_test(outer_payload)
     }
 
@@ -20802,6 +20876,123 @@ mod integration_tests {
         let (db, _dir) = Database::open_temp().unwrap();
         let result = db.get_block_receipts(999).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_replacing_canonical_cchain_block_clears_stale_tx_indexes_and_receipts() {
+        let (db, _dir) = Database::open_temp().unwrap();
+        let wallet = Wallet::random(43114);
+
+        let tx_a = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x41; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_b = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x42; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let tx_c = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 30_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x43; 20]),
+                value: 3,
+                data: vec![],
+            })
+            .unwrap();
+
+        let old_raw = make_cchain_coreth_block_with_transactions(
+            [0x11; 32],
+            1,
+            1_700_000_000,
+            &[tx_a.raw.clone(), tx_b.raw.clone()],
+        );
+        let new_raw = make_cchain_coreth_block_with_transactions(
+            [0x22; 32],
+            1,
+            1_700_000_010,
+            std::slice::from_ref(&tx_c.raw),
+        );
+
+        let old_parsed = vec![
+            parse_raw_cchain_transaction(&tx_a.raw).unwrap(),
+            parse_raw_cchain_transaction(&tx_b.raw).unwrap(),
+        ];
+        let new_parsed = vec![parse_raw_cchain_transaction(&tx_c.raw).unwrap()];
+        let success_receipt = |gas_used| TxReceipt {
+            success: true,
+            gas_used,
+            output: vec![],
+            contract_address: None,
+            logs: vec![],
+        };
+
+        db.put_block(1, &old_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &db,
+            1,
+            &cchain_block_hash(&old_raw),
+            &old_parsed,
+            &[success_receipt(21_000), success_receipt(42_000)],
+        )
+        .unwrap();
+
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_a.raw))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_b.raw))
+            .unwrap()
+            .is_some());
+        assert!(db.get_receipt(1, 1).unwrap().is_some());
+
+        clear_canonical_cchain_tx_artifacts(&db, 1).unwrap();
+        db.put_block(1, &new_raw).unwrap();
+        persist_imported_cchain_tx_artifacts(
+            &db,
+            1,
+            &cchain_block_hash(&new_raw),
+            &new_parsed,
+            &[success_receipt(30_000)],
+        )
+        .unwrap();
+
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_a.raw))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_tx_index(&keccak_tx_hash(&tx_b.raw))
+            .unwrap()
+            .is_none());
+        let (height, idx) = db
+            .get_tx_index(&keccak_tx_hash(&tx_c.raw))
+            .unwrap()
+            .unwrap();
+        assert_eq!((height, idx), (1, 0));
+        assert!(db.get_receipt(1, 1).unwrap().is_none());
+
+        let receipts = db.get_block_receipts(1).unwrap().unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&receipts).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0]["transactionHash"],
+            format!("0x{}", hex::encode(keccak_tx_hash(&tx_c.raw)))
+        );
     }
 
     #[test]

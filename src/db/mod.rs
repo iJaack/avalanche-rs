@@ -255,6 +255,11 @@ impl Database {
         }
     }
 
+    /// Delete a transaction hash → (block_height, tx_index) mapping.
+    pub fn delete_tx_index(&self, tx_hash: &[u8; 32]) -> Result<(), DbError> {
+        self.delete_cf(CF_TX_INDEX, tx_hash)
+    }
+
     // -----------------------------------------------------------------------
     // Receipt storage
     // -----------------------------------------------------------------------
@@ -303,6 +308,18 @@ impl Database {
         } else {
             Ok(Some(format!("[{}]", receipts.join(",")).into_bytes()))
         }
+    }
+
+    /// Delete all receipt rows stored for a block height.
+    pub fn clear_block_receipts(&self, block_height: u64) -> Result<(), DbError> {
+        let prefix = block_height.to_be_bytes();
+        for tx_idx in 0u32..1000 {
+            let mut key = Vec::with_capacity(12);
+            key.extend_from_slice(&prefix);
+            key.extend_from_slice(&tx_idx.to_be_bytes());
+            self.delete_cf(CF_RECEIPTS, &key)?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
