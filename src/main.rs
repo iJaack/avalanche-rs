@@ -10874,8 +10874,12 @@ fn load_mined_cchain_transaction(
 fn load_indexed_mined_cchain_transaction(
     db: &Database,
     tx_hash: &[u8; 32],
+    max_canonical_height: u64,
 ) -> Option<(u64, u32, [u8; 32], PoolTransaction)> {
     let (block_height, tx_index) = db.get_tx_index(tx_hash).ok()??;
+    if block_height > max_canonical_height {
+        return None;
+    }
     let (block_hash, tx) = load_mined_cchain_transaction(db, block_height, tx_index)?;
     if tx.hash != *tx_hash {
         return None;
@@ -11926,11 +11930,13 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(tx_hash_str) {
                 Some(tx_hash) => {
+                    let current_height = current_cchain_height(node);
                     if let Some(tx) = node.txpool.read().await.get(&tx_hash).cloned() {
                         let result = rpc_transaction_from_pool(&tx_hash, &tx, None, None, None);
                         return rpc_ok(&result.to_string(), id);
                     }
-                    match load_indexed_mined_cchain_transaction(&node.db, &tx_hash) {
+                    match load_indexed_mined_cchain_transaction(&node.db, &tx_hash, current_height)
+                    {
                         Some((block_height, tx_index, block_hash, tx)) => {
                             let result = rpc_transaction_from_pool(
                                 &tx_hash,
@@ -11994,12 +12000,14 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(tx_hash_str) {
                 Some(tx_hash) => {
+                    let current_height = current_cchain_height(node);
                     if let Some(tx) = node.txpool.read().await.get(&tx_hash).cloned() {
                         if let Some(raw) = tx.raw {
                             return rpc_ok(&format!("\"0x{}\"", hex::encode(raw)), id);
                         }
                     }
-                    match load_indexed_mined_cchain_transaction(&node.db, &tx_hash) {
+                    match load_indexed_mined_cchain_transaction(&node.db, &tx_hash, current_height)
+                    {
                         Some((_, _, _, tx)) => match tx.raw {
                             Some(raw) => rpc_ok(&format!("\"0x{}\"", hex::encode(raw)), id),
                             None => rpc_ok("null", id),
@@ -12054,7 +12062,11 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
             let tx_hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
             match parse_hex_hash(tx_hash_str) {
                 Some(tx_hash) => {
-                    match load_indexed_mined_cchain_transaction(&node.db, &tx_hash) {
+                    match load_indexed_mined_cchain_transaction(
+                        &node.db,
+                        &tx_hash,
+                        current_cchain_height(node),
+                    ) {
                         Some((block_height, tx_index, _, _)) => {
                             match node.db.get_receipt(block_height, tx_index) {
                                 Ok(Some(receipt_data)) => {
@@ -13325,7 +13337,11 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         let result = trace_pending_transaction(&evm, &tx, &block_ctx, &config);
                         rpc_ok(&result.to_string(), id)
                     } else {
-                        match load_indexed_mined_cchain_transaction(&node.db, &hash) {
+                        match load_indexed_mined_cchain_transaction(
+                            &node.db,
+                            &hash,
+                            current_cchain_height(node),
+                        ) {
                             Some((block_height, tx_index, _, _)) => match trace_mined_transaction(
                                 &node.db,
                                 node.config.chain_id,
@@ -19447,6 +19463,143 @@ mod integration_tests {
         let trace_lookup_req = format!(
             r#"{{"jsonrpc":"2.0","method":"debug_traceTransaction","params":["0x{}",{{}}],"id":25}}"#,
             hex::encode(fake_tx_hash)
+        );
+        let trace_lookup_response = handle_rpc_request(&trace_lookup_req, &node).await;
+        let trace_lookup_json: serde_json::Value =
+            serde_json::from_str(&trace_lookup_response).unwrap();
+        assert_eq!(
+            trace_lookup_json["error"]["message"],
+            "transaction not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hash_based_transaction_lookups_reject_orphaned_blocks_above_tip() {
+        let node = make_test_node(1);
+        let wallet = avalanche_rs::tx::Wallet::random(43114);
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_balance(*wallet.address(), u128::MAX / 2);
+        }
+
+        let first_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 0,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x81; 20]),
+                value: 1,
+                data: vec![],
+            })
+            .unwrap();
+        let first_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":26}}"#,
+            first_signed.raw_hex()
+        );
+        let first_submit_response = handle_rpc_request(&first_submit_req, &node).await;
+        let first_submit_json: serde_json::Value =
+            serde_json::from_str(&first_submit_response).unwrap();
+        assert!(first_submit_json.get("result").is_some());
+
+        let first_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let first_block = build_cchain_block(&node, 1, first_pool_txs.clone())
+            .await
+            .expect("first block should build");
+        let mut first_key = Vec::with_capacity(34);
+        first_key.extend_from_slice(b"c:");
+        first_key.extend_from_slice(&first_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &first_key, &first_block.raw)
+            .unwrap();
+        node.db
+            .put_block(first_block.number, &first_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &first_block, &first_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(first_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &first_pool_txs).await;
+
+        let second_signed = wallet
+            .sign_legacy(&LegacyTx {
+                nonce: 1,
+                gas_price: 25_000_000_000,
+                gas_limit: 21_000,
+                to: Some([0x82; 20]),
+                value: 2,
+                data: vec![],
+            })
+            .unwrap();
+        let second_tx_hash = keccak_tx_hash(&second_signed.raw);
+        let second_submit_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{}"],"id":27}}"#,
+            second_signed.raw_hex()
+        );
+        let second_submit_response = handle_rpc_request(&second_submit_req, &node).await;
+        let second_submit_json: serde_json::Value =
+            serde_json::from_str(&second_submit_response).unwrap();
+        assert_eq!(
+            second_submit_json["result"],
+            format!("0x{}", hex::encode(second_tx_hash))
+        );
+
+        let second_pool_txs = {
+            let pool = node.txpool.read().await;
+            pool.pending_sorted_cloned()
+        };
+        let second_block = build_cchain_block(&node, 2, second_pool_txs.clone())
+            .await
+            .expect("second block should build");
+        let mut second_key = Vec::with_capacity(34);
+        second_key.extend_from_slice(b"c:");
+        second_key.extend_from_slice(&second_block.id);
+        node.db
+            .put_cf(CF_BLOCKS, &second_key, &second_block.raw)
+            .unwrap();
+        node.db
+            .put_block(second_block.number, &second_block.raw)
+            .unwrap();
+        persist_local_cchain_tx_artifacts(&node.db, &second_block, &second_pool_txs).unwrap();
+        node.db
+            .set_last_accepted_height(second_block.number)
+            .unwrap();
+        reconcile_mined_pool_transactions(&node, &second_pool_txs).await;
+
+        node.db.set_last_accepted_height(1).unwrap();
+
+        let tx_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x{}"],"id":28}}"#,
+            hex::encode(second_tx_hash)
+        );
+        let tx_lookup_response = handle_rpc_request(&tx_lookup_req, &node).await;
+        let tx_lookup_json: serde_json::Value = serde_json::from_str(&tx_lookup_response).unwrap();
+        assert_eq!(tx_lookup_json["result"], serde_json::Value::Null);
+
+        let raw_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getRawTransactionByHash","params":["0x{}"],"id":29}}"#,
+            hex::encode(second_tx_hash)
+        );
+        let raw_lookup_response = handle_rpc_request(&raw_lookup_req, &node).await;
+        let raw_lookup_json: serde_json::Value =
+            serde_json::from_str(&raw_lookup_response).unwrap();
+        assert_eq!(raw_lookup_json["result"], serde_json::Value::Null);
+
+        let receipt_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["0x{}"],"id":30}}"#,
+            hex::encode(second_tx_hash)
+        );
+        let receipt_lookup_response = handle_rpc_request(&receipt_lookup_req, &node).await;
+        let receipt_lookup_json: serde_json::Value =
+            serde_json::from_str(&receipt_lookup_response).unwrap();
+        assert_eq!(receipt_lookup_json["result"], serde_json::Value::Null);
+
+        let trace_lookup_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"debug_traceTransaction","params":["0x{}",{{}}],"id":31}}"#,
+            hex::encode(second_tx_hash)
         );
         let trace_lookup_response = handle_rpc_request(&trace_lookup_req, &node).await;
         let trace_lookup_json: serde_json::Value =
