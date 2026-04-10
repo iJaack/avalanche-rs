@@ -1,6 +1,37 @@
-# Benchmark: avalanche-rs vs AvalancheGo 1.14.1
+# Benchmark: avalanche-rs vs AvalancheGo
 
-## Latest Results (2026-03-08, Post Phase 12)
+## Latest Results (2026-04-10, 5-minute Fuji production run)
+
+> This is the current real-world benchmark for the shared Fuji production surface.
+> The full dated write-up is in [docs/benchmarks/2026-04-10-fuji-300s.md](docs/benchmarks/2026-04-10-fuji-300s.md).
+
+**Network:** Fuji testnet
+**Duration:** 5 minutes per implementation
+**Hardware:** Darwin arm64
+**avalanche-rs commit:** `8b4ae7b`
+**AvalancheGo version:** `v1.14.2`
+
+| Metric | avalanche-rs | AvalancheGo v1.14.2 |
+|--------|-------------|----------------------|
+| Binary size | 10,272 KB | 88,968 KB |
+| Final RSS | 21,584 KB | 39,008 KB |
+| Peak RSS | 22,896 KB | 77,040 KB |
+| First peer handshake | 330,249 ms | NA |
+| P-Chain height RPC | `8725724278057432` | `null` |
+| C-Chain block number | `0x0` | `null` |
+| Peer count | `null` | `42` |
+| P-Chain bootstrapped | `true` | `false` |
+| Health endpoint healthy | `null` | `false` |
+
+What matters more than the raw table:
+
+- `avalanche-rs` stayed materially smaller in memory.
+- AvalancheGo exposed the healthier networking surface in the same 5-minute window: 42 peers, working health and metrics endpoints, but no completed P-Chain bootstrap.
+- `avalanche-rs` exposed real parity bugs during the benchmark: `platform.getHeight` returned an impossible value, `info.peers` was not usable in-window, `/ext/health` did not yield a usable benchmark response, and C-Chain stayed at `0x0`.
+
+So this benchmark is useful as a production comparison, but not as a “victory” benchmark. The current gap is behavioral correctness and operational readiness, not binary size or raw RSS.
+
+## Historical Snapshot (2026-03-08, Post Phase 12)
 
 > Network sync benchmark below was run on a **Mac mini M4**.
 > A fresh **Mac mini M1** indexer validation benchmark was added on **2026-03-10**; see the dedicated section below for current DB-backed indexer numbers.
