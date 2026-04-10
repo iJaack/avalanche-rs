@@ -331,6 +331,27 @@ impl EvmExecutor {
         self.db.insert_account_info(addr, info);
     }
 
+    /// Import an exact account snapshot, preserving nonce/balance/code hash.
+    pub fn import_account_state(
+        &mut self,
+        address: [u8; 20],
+        state: &crate::db::AccountState,
+        code: Option<Vec<u8>>,
+    ) {
+        let addr = Address::from(address);
+        let info = AccountInfo {
+            balance: U256::from(state.balance),
+            nonce: state.nonce,
+            code_hash: if code.is_some() || state.code_hash == [0u8; 32] {
+                KECCAK_EMPTY
+            } else {
+                B256::from_slice(&state.code_hash)
+            },
+            code: code.map(|code| Bytecode::new_raw(Bytes::from(code))),
+        };
+        self.db.insert_account_info(addr, info);
+    }
+
     /// Set a storage slot in the state DB.
     pub fn set_storage(&mut self, address: [u8; 20], slot: [u8; 32], value: [u8; 32]) {
         let addr = Address::from(address);

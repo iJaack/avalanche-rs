@@ -49,7 +49,9 @@ use avalanche_rs::block::{
     parse_raw_cchain_transaction, BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
 };
 use avalanche_rs::consensus::SnowmanConsensus;
-use avalanche_rs::db::{AccountState, Database, CF_BLOCKS, CF_STATE_ROOTS};
+use avalanche_rs::db::{
+    AccountState, Database, CF_ARCHIVE_STATE, CF_ARCHIVE_STORAGE, CF_BLOCKS, CF_STATE_ROOTS,
+};
 use avalanche_rs::debug::{EvmTracer, TraceConfig, TracerType};
 use avalanche_rs::evm::{
     ArchivedAccountDiff, BlockContext, EvmExecutor, EvmLog, EvmTransaction, TxReceipt,
@@ -5127,8 +5129,110 @@ fn load_historical_storage_value(
         .map_err(|err| format!("failed to load historical storage: {}", err))
 }
 
-fn reject_unsupported_historical_query(id: &serde_json::Value) -> String {
-    rpc_error(-32000, "historical query not supported for this method", id)
+fn load_historical_state_root(
+    node: &NodeState,
+    block_height: u64,
+) -> Result<Option<[u8; 32]>, String> {
+    match node.db.get_cf(CF_STATE_ROOTS, &block_height.to_be_bytes()) {
+        Ok(Some(bytes)) if bytes.len() == 32 => {
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&bytes);
+            Ok(Some(root))
+        }
+        Ok(Some(_)) | Ok(None) => Ok(None),
+        Err(err) => Err(format!("failed to load historical state root: {}", err)),
+    }
+}
+
+fn historical_rpc_simulation_block_context(
+    node: &NodeState,
+    block_height: u64,
+) -> Result<BlockContext, String> {
+    let Some(fields) = load_cchain_block_fields(&node.db, block_height) else {
+        return Err(format!("block #{} not found", block_height));
+    };
+    Ok(BlockContext {
+        number: fields.number,
+        timestamp: fields.timestamp,
+        coinbase: fields.miner,
+        gas_limit: if fields.gas_limit == 0 {
+            DEFAULT_CCHAIN_GAS_LIMIT
+        } else {
+            fields.gas_limit
+        },
+        base_fee: fields.base_fee,
+        difficulty: 0,
+        chain_id: node.config.chain_id,
+    })
+}
+
+fn historical_evm_at_height(node: &NodeState, block_height: u64) -> Result<EvmExecutor, String> {
+    if !node.archive_store.enabled {
+        return Err("historical state query not allowed".to_string());
+    }
+
+    let mut evm = EvmExecutor::new(node.config.chain_id);
+    let mut accounts = std::collections::BTreeMap::<[u8; 20], AccountState>::new();
+    for (key, value) in node.db.iter_cf_owned(CF_ARCHIVE_STATE) {
+        if key.len() != 28 {
+            continue;
+        }
+        let entry_height = u64::from_be_bytes(key[..8].try_into().unwrap());
+        if entry_height > block_height {
+            continue;
+        }
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&key[8..28]);
+        accounts.insert(address, avalanche_rs::db::decode_account_state_rlp(&value));
+    }
+
+    for (address, state) in &accounts {
+        let code = if is_empty_code_hash(&state.code_hash) {
+            None
+        } else {
+            match node.db.get_code(&state.code_hash) {
+                Ok(Some(code)) => Some(code),
+                Ok(None) => return Err("historical code not found".to_string()),
+                Err(err) => return Err(format!("failed to load historical code: {}", err)),
+            }
+        };
+        evm.import_account_state(*address, state, code);
+    }
+
+    let mut storage = std::collections::BTreeMap::<([u8; 20], [u8; 32]), [u8; 32]>::new();
+    for (key, value) in node.db.iter_cf_owned(CF_ARCHIVE_STORAGE) {
+        if key.len() != 60 || value.len() != 32 {
+            continue;
+        }
+        let entry_height = u64::from_be_bytes(key[..8].try_into().unwrap());
+        if entry_height > block_height {
+            continue;
+        }
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&key[8..28]);
+        let mut slot = [0u8; 32];
+        slot.copy_from_slice(&key[28..60]);
+        let mut slot_value = [0u8; 32];
+        slot_value.copy_from_slice(&value);
+        storage.insert((address, slot), slot_value);
+    }
+
+    for ((address, slot), value) in storage {
+        if value != [0u8; 32] {
+            evm.set_storage(address, slot, value);
+        }
+    }
+
+    if let Some(expected_root) = load_historical_state_root(node, block_height)? {
+        if evm.compute_state_root_mpt() != expected_root {
+            return Err(format!(
+                "historical state root mismatch at block #{}",
+                block_height
+            ));
+        }
+    }
+
+    Ok(evm)
 }
 
 fn is_empty_code_hash(code_hash: &[u8; 32]) -> bool {
@@ -11537,13 +11641,6 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 Ok(query) => query,
                 Err(message) => return rpc_error(-32000, &message, id),
             };
-            if !query.is_current {
-                return if node.archive_store.enabled {
-                    reject_unsupported_historical_query(id)
-                } else {
-                    rpc_error(-32000, "historical state query not allowed", id)
-                };
-            }
             let Some(address) = parse_hex_address(addr_str) else {
                 return rpc_error(-32602, "invalid address", id);
             };
@@ -11557,7 +11654,15 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 };
                 parsed_keys.push((slot, key_str.to_string()));
             }
-            let proof = node.evm.read().await.get_proof(address, &parsed_keys);
+            let proof = if query.is_current {
+                node.evm.read().await.get_proof(address, &parsed_keys)
+            } else {
+                let historical_evm = match historical_evm_at_height(node, query.block_height) {
+                    Ok(evm) => evm,
+                    Err(message) => return rpc_error(-32000, &message, id),
+                };
+                historical_evm.get_proof(address, &parsed_keys)
+            };
             rpc_ok(
                 &serde_json::to_value(proof)
                     .unwrap_or(serde_json::Value::Null)
@@ -11581,15 +11686,23 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 Ok(query) => query,
                 Err(message) => return rpc_error(-32000, &message, id),
             };
-            if !query.is_current {
-                return if node.archive_store.enabled {
-                    reject_unsupported_historical_query(id)
-                } else {
-                    rpc_error(-32000, "historical state query not allowed", id)
+            let (evm, block_ctx) = if query.is_current {
+                (
+                    node.evm.read().await.snapshot(),
+                    rpc_simulation_block_context(node),
+                )
+            } else {
+                let historical_evm = match historical_evm_at_height(node, query.block_height) {
+                    Ok(evm) => evm,
+                    Err(message) => return rpc_error(-32000, &message, id),
                 };
-            }
-            let evm = node.evm.read().await;
-            let block_ctx = rpc_simulation_block_context(node);
+                let historical_block_ctx =
+                    match historical_rpc_simulation_block_context(node, query.block_height) {
+                        Ok(block_ctx) => block_ctx,
+                        Err(message) => return rpc_error(-32000, &message, id),
+                    };
+                (historical_evm, historical_block_ctx)
+            };
             let parsed = parse_rpc_simulation_tx(tx_obj.unwrap(), &evm, &block_ctx);
             match evm.execute_call(&parsed.tx, &block_ctx) {
                 Ok(output) => rpc_ok(&format!("\"0x{}\"", hex::encode(&output)), id),
@@ -20771,10 +20884,220 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_historical_state_queries_reject_unsupported_methods() {
+    async fn test_historical_eth_call_supports_archive_history() {
         let node = make_test_archive_node(1);
         let account = [0x72; 20];
+        let caller = [0x79; 20];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x03; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x04; 32], 2, 1_700_000_010, &[]);
+        let block_3 = make_cchain_coreth_block_with_transactions([0x05; 32], 3, 1_700_000_020, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.put_block(3, &block_3).unwrap();
+        node.db.set_last_accepted_height(3).unwrap();
+
+        let code_v1 = vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_v2 = vec![0x60, 0x2b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let latest_code = vec![0x60, 0x2c, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let code_hash_v1: [u8; 32] = revm::primitives::keccak256(&code_v1).into();
+        let code_hash_v2: [u8; 32] = revm::primitives::keccak256(&code_v2).into();
+        node.db.put_code(&code_hash_v1, &code_v1).unwrap();
+        node.db.put_code(&code_hash_v2, &code_v2).unwrap();
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 1,
+                    balance: 0,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v1,
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 2,
+                    balance: 0,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v2,
+                },
+            )
+            .unwrap();
+        for height in [1, 2] {
+            node.archive_store
+                .put_account_snapshot(
+                    &node.db,
+                    height,
+                    &caller,
+                    &AccountState {
+                        nonce: 0,
+                        balance: 10_000_000_000_000_000_000u128,
+                        storage_root: [0u8; 32],
+                        code_hash: [0u8; 32],
+                    },
+                )
+                .unwrap();
+        }
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 0, 3, latest_code);
+            evm.set_balance(caller, 10_000_000_000_000_000_000u128);
+        }
+
+        let historical_block_1_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"0x1"],"id":51}}"#,
+            hex::encode(caller),
+            hex::encode(account)
+        );
+        let historical_block_1_response = handle_rpc_request(&historical_block_1_req, &node).await;
+        let historical_block_1_json: serde_json::Value =
+            serde_json::from_str(&historical_block_1_response).unwrap();
+        let mut expected_v1 = [0u8; 32];
+        expected_v1[31] = 0x2a;
+        assert_eq!(
+            historical_block_1_json["result"],
+            format!("0x{}", hex::encode(expected_v1))
+        );
+
+        let historical_block_2_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"0x2"],"id":52}}"#,
+            hex::encode(caller),
+            hex::encode(account)
+        );
+        let historical_block_2_response = handle_rpc_request(&historical_block_2_req, &node).await;
+        let historical_block_2_json: serde_json::Value =
+            serde_json::from_str(&historical_block_2_response).unwrap();
+        let mut expected_v2 = [0u8; 32];
+        expected_v2[31] = 0x2b;
+        assert_eq!(
+            historical_block_2_json["result"],
+            format!("0x{}", hex::encode(expected_v2))
+        );
+
+        let latest_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"from":"0x{}","to":"0x{}","data":"0x"}},"latest"],"id":53}}"#,
+            hex::encode(caller),
+            hex::encode(account)
+        );
+        let latest_response = handle_rpc_request(&latest_req, &node).await;
+        let latest_json: serde_json::Value = serde_json::from_str(&latest_response).unwrap();
+        let mut expected_latest = [0u8; 32];
+        expected_latest[31] = 0x2c;
+        assert_eq!(
+            latest_json["result"],
+            format!("0x{}", hex::encode(expected_latest))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_historical_eth_get_proof_supports_archive_history() {
+        let node = make_test_archive_node(1);
+        let account = [0x77; 20];
         let slot = [0x01; 32];
+        let block_1 = make_cchain_coreth_block_with_transactions([0x07; 32], 1, 1_700_000_000, &[]);
+        let block_2 = make_cchain_coreth_block_with_transactions([0x08; 32], 2, 1_700_000_010, &[]);
+        node.db.put_block(1, &block_1).unwrap();
+        node.db.put_block(2, &block_2).unwrap();
+        node.db.set_last_accepted_height(2).unwrap();
+
+        let code_v1 = vec![0x60, 0x01];
+        let code_v2 = vec![0x60, 0x02];
+        let latest_code = vec![0x60, 0x03];
+        let code_hash_v1: [u8; 32] = revm::primitives::keccak256(&code_v1).into();
+        let code_hash_v2: [u8; 32] = revm::primitives::keccak256(&code_v2).into();
+        node.db.put_code(&code_hash_v1, &code_v1).unwrap();
+        node.db.put_code(&code_hash_v2, &code_v2).unwrap();
+
+        let mut storage_v1 = [0u8; 32];
+        storage_v1[31] = 0x0a;
+        let mut storage_v2 = [0u8; 32];
+        storage_v2[31] = 0x0b;
+        let mut latest_storage = [0u8; 32];
+        latest_storage[31] = 0x0c;
+
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                1,
+                &account,
+                &AccountState {
+                    nonce: 3,
+                    balance: 111,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v1,
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_account_snapshot(
+                &node.db,
+                2,
+                &account,
+                &AccountState {
+                    nonce: 4,
+                    balance: 222,
+                    storage_root: [0u8; 32],
+                    code_hash: code_hash_v2,
+                },
+            )
+            .unwrap();
+        node.archive_store
+            .put_storage_snapshot(&node.db, 1, &account, &slot, &storage_v1)
+            .unwrap();
+        node.archive_store
+            .put_storage_snapshot(&node.db, 2, &account, &slot, &storage_v2)
+            .unwrap();
+
+        {
+            let mut evm = node.evm.write().await;
+            evm.set_account(account, 333, 5, latest_code);
+            evm.set_storage(account, slot, latest_storage);
+        }
+
+        let historical_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":54}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let historical_response = handle_rpc_request(&historical_req, &node).await;
+        let historical_json: serde_json::Value =
+            serde_json::from_str(&historical_response).unwrap();
+        assert_eq!(historical_json["result"]["balance"], "0x6f");
+        assert_eq!(historical_json["result"]["nonce"], "0x3");
+        assert_eq!(
+            historical_json["result"]["codeHash"],
+            format!("0x{}", hex::encode(code_hash_v1))
+        );
+        assert_eq!(historical_json["result"]["storageProof"][0]["value"], "0xa");
+        assert!(!historical_json["result"]["accountProof"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let latest_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"latest"],"id":55}}"#,
+            hex::encode(account),
+            hex::encode(slot)
+        );
+        let latest_response = handle_rpc_request(&latest_req, &node).await;
+        let latest_json: serde_json::Value = serde_json::from_str(&latest_response).unwrap();
+        assert_eq!(latest_json["result"]["balance"], "0x14d");
+        assert_eq!(latest_json["result"]["nonce"], "0x5");
+        assert_eq!(latest_json["result"]["storageProof"][0]["value"], "0xc");
+    }
+
+    #[tokio::test]
+    async fn test_historical_eth_call_rejects_without_archive() {
+        let node = make_test_node(1);
+        let account = [0x72; 20];
         let block_1 = make_cchain_coreth_block_with_transactions([0x03; 32], 1, 1_700_000_000, &[]);
         let block_2 = make_cchain_coreth_block_with_transactions([0x04; 32], 2, 1_700_000_010, &[]);
         node.db.put_block(1, &block_1).unwrap();
@@ -20782,26 +21105,14 @@ mod integration_tests {
         node.db.set_last_accepted_height(2).unwrap();
 
         let call_req = format!(
-            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"to":"0x{}","data":"0x"}},"0x1"],"id":51}}"#,
+            r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"to":"0x{}","data":"0x"}},"0x1"],"id":56}}"#,
             hex::encode(account)
         );
         let call_response = handle_rpc_request(&call_req, &node).await;
         let call_json: serde_json::Value = serde_json::from_str(&call_response).unwrap();
         assert_eq!(
             call_json["error"]["message"],
-            "historical query not supported for this method"
-        );
-
-        let proof_req = format!(
-            r#"{{"jsonrpc":"2.0","method":"eth_getProof","params":["0x{}" ,["0x{}"],"0x1"],"id":52}}"#,
-            hex::encode(account),
-            hex::encode(slot)
-        );
-        let proof_response = handle_rpc_request(&proof_req, &node).await;
-        let proof_json: serde_json::Value = serde_json::from_str(&proof_response).unwrap();
-        assert_eq!(
-            proof_json["error"]["message"],
-            "historical query not supported for this method"
+            "historical state query not allowed"
         );
     }
 

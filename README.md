@@ -98,6 +98,19 @@ avalanche-rs completes full P-Chain + C-Chain bootstrap in **~12 seconds**, then
 - WASM build target (avalanche-core → wasm32)
 - `no_std` core library (avalanche-core crate)
 
+### Archive Historical RPC Support
+
+With `--archive` enabled, canonical historical block queries are supported for:
+- `eth_getBalance`
+- `eth_getTransactionCount`
+- `eth_getCode`
+- `eth_getStorageAt`
+- `eth_getProof`
+- `eth_call`
+
+Without `--archive`, historical state queries return `historical state query not allowed`.
+`latest` and `pending` always use the live in-memory state. Hex block heights below the current tip use archived canonical state snapshots when available.
+
 ## Quick Start
 
 ```bash
