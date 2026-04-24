@@ -25,6 +25,8 @@
 pub mod archive;
 pub mod codec;
 pub mod consensus;
+#[macro_use]
+mod fixed_bytes;
 pub mod mempool;
 pub mod mev;
 #[cfg(feature = "p2p")]

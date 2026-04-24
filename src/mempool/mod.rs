@@ -4,6 +4,7 @@
 //! to `newPendingTransactions` for real-time MEV opportunity detection.
 
 use crate::mev::{DecodedSwap, MempoolConfig, MempoolMonitor, MevOpportunity, PendingTx, U256};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,9 +93,6 @@ pub struct SubscriptionStats {
 /// 3. MempoolMonitor scans each tx for MEV opportunities
 /// 4. Opportunities are sent to the output channel
 pub struct MempoolSubscriber {
-    /// Configuration (used when starting the WebSocket connection loop)
-    #[allow(dead_code)]
-    config: MempoolSubConfig,
     state: Arc<RwLock<ConnectionState>>,
     stats: Arc<RwLock<SubscriptionStats>>,
     monitor: Arc<MempoolMonitor>,
@@ -111,13 +109,9 @@ impl MempoolSubscriber {
     pub fn new(config: MempoolSubConfig) -> Self {
         let (opp_tx, opp_rx) = mpsc::channel(config.channel_buffer);
         let (swap_tx, swap_rx) = mpsc::channel(config.channel_buffer);
-        let monitor = Arc::new(MempoolMonitor::new(
-            &config.rpc_endpoint,
-            config.monitor_config.clone(),
-        ));
+        let monitor = Arc::new(MempoolMonitor::new(config.monitor_config.clone()));
 
         Self {
-            config,
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             stats: Arc::new(RwLock::new(SubscriptionStats::default())),
             monitor,
@@ -164,56 +158,20 @@ impl MempoolSubscriber {
         .to_string()
     }
 
-    /// Parse a pending transaction from JSON-RPC response
-    pub fn parse_pending_tx(value: &serde_json::Value) -> Option<PendingTx> {
-        let result = value.get("result")?;
-
-        let hash = result.get("hash")?.as_str()?.to_string();
-        let from = result.get("from")?.as_str()?.to_string();
-        let to = result
-            .get("to")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let value_hex = result.get("value")?.as_str().unwrap_or("0x0");
-        let value = U256::from_hex(value_hex).unwrap_or(U256::ZERO);
-
-        let gas_price_hex = result
-            .get("gasPrice")
-            .or_else(|| result.get("maxFeePerGas"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("0x0");
-        let gas_price = U256::from_hex(gas_price_hex).unwrap_or(U256::ZERO);
-
-        let gas_limit_hex = result.get("gas")?.as_str().unwrap_or("0x0");
-        let gas_limit =
-            u64::from_str_radix(gas_limit_hex.trim_start_matches("0x"), 16).unwrap_or(0);
-
-        let input_hex = result.get("input")?.as_str().unwrap_or("0x");
-        let input_clean = input_hex.trim_start_matches("0x");
-        let input = (0..input_clean.len())
-            .step_by(2)
-            .filter_map(|i| {
-                if i + 2 <= input_clean.len() {
-                    u8::from_str_radix(&input_clean[i..i + 2], 16).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let nonce_hex = result.get("nonce")?.as_str().unwrap_or("0x0");
-        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+    /// Parse a pending transaction from JSON-RPC response.
+    pub fn parse_pending_tx(value: PendingTxResponse) -> Option<PendingTx> {
+        let result = value.result?;
+        let gas_price = result.gas_price.or(result.max_fee_per_gas)?;
 
         Some(PendingTx {
-            hash,
-            from,
-            to,
-            value,
+            hash: result.hash,
+            from: result.from,
+            to: result.to,
+            value: result.value?,
             gas_price,
-            gas_limit,
-            input,
-            nonce,
+            gas_limit: result.gas_limit?,
+            input: result.input?,
+            nonce: result.nonce?,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -259,6 +217,71 @@ impl MempoolSubscriber {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PendingTxResponse {
+    #[serde(default)]
+    pub result: Option<PendingTxRpcTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PendingTxRpcTransaction {
+    pub hash: String,
+    pub from: String,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(
+        default,
+        rename = "value",
+        deserialize_with = "deserialize_hex_u256_opt"
+    )]
+    pub value: Option<U256>,
+    #[serde(
+        default,
+        rename = "gasPrice",
+        deserialize_with = "deserialize_hex_u256_opt"
+    )]
+    pub gas_price: Option<U256>,
+    #[serde(
+        default,
+        rename = "maxFeePerGas",
+        deserialize_with = "deserialize_hex_u256_opt"
+    )]
+    pub max_fee_per_gas: Option<U256>,
+    #[serde(default, rename = "gas", deserialize_with = "deserialize_hex_u64_opt")]
+    pub gas_limit: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_hex_bytes_opt")]
+    pub input: Option<Vec<u8>>,
+    #[serde(default, deserialize_with = "deserialize_hex_u64_opt")]
+    pub nonce: Option<u64>,
+}
+
+fn deserialize_hex_u256_opt<'de, D>(deserializer: D) -> Result<Option<U256>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| U256::from_hex(&value).ok()))
+}
+
+fn deserialize_hex_u64_opt<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()))
+}
+
+fn deserialize_hex_bytes_opt<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| {
+        let clean = value.strip_prefix("0x").unwrap_or(&value);
+        hex::decode(clean).ok()
+    }))
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -300,7 +323,8 @@ mod tests {
             }
         });
 
-        let tx = MempoolSubscriber::parse_pending_tx(&json).unwrap();
+        let tx =
+            MempoolSubscriber::parse_pending_tx(serde_json::from_value(json).unwrap()).unwrap();
         assert_eq!(tx.hash, "0xdeadbeef");
         assert_eq!(
             tx.to,
@@ -327,7 +351,8 @@ mod tests {
             }
         });
 
-        let tx = MempoolSubscriber::parse_pending_tx(&json).unwrap();
+        let tx =
+            MempoolSubscriber::parse_pending_tx(serde_json::from_value(json).unwrap()).unwrap();
         assert!(tx.to.is_none());
     }
 
@@ -346,7 +371,8 @@ mod tests {
             }
         });
 
-        let tx = MempoolSubscriber::parse_pending_tx(&json).unwrap();
+        let tx =
+            MempoolSubscriber::parse_pending_tx(serde_json::from_value(json).unwrap()).unwrap();
         assert_eq!(tx.gas_price.low, 0x77359400); // maxFeePerGas used as gas_price
         assert_eq!(tx.nonce, 10); // 0xa
     }
@@ -354,10 +380,29 @@ mod tests {
     #[test]
     fn test_parse_pending_tx_invalid() {
         let json = serde_json::json!({ "result": null });
-        assert!(MempoolSubscriber::parse_pending_tx(&json).is_none());
+        assert!(
+            MempoolSubscriber::parse_pending_tx(serde_json::from_value(json).unwrap()).is_none()
+        );
 
         let json2 = serde_json::json!({ "error": "not found" });
-        assert!(MempoolSubscriber::parse_pending_tx(&json2).is_none());
+        assert!(
+            MempoolSubscriber::parse_pending_tx(serde_json::from_value(json2).unwrap()).is_none()
+        );
+
+        let json3 = serde_json::json!({
+            "result": {
+                "hash": "0xdeadbeef",
+                "from": "0x1234567890abcdef1234567890abcdef12345678",
+                "value": "not-hex",
+                "gasPrice": "0x5d21dba00",
+                "gas": "0x5208",
+                "input": "0x38ed1739",
+                "nonce": "0x5"
+            }
+        });
+        assert!(
+            MempoolSubscriber::parse_pending_tx(serde_json::from_value(json3).unwrap()).is_none()
+        );
     }
 
     #[tokio::test]

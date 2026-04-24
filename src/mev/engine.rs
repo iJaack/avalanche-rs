@@ -96,7 +96,7 @@ pub struct EngineStats {
 impl MevEngine {
     /// Create a new MEV engine
     pub fn new(config: MevEngineConfig) -> Self {
-        let monitor = MempoolMonitor::new(&config.rpc_endpoint, config.mempool.clone());
+        let monitor = MempoolMonitor::new(config.mempool.clone());
         Self {
             v4_scanner: Arc::new(RwLock::new(V4PoolScanner::new())),
             v2_pools: Arc::new(RwLock::new(HashMap::new())),

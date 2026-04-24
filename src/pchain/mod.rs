@@ -201,6 +201,10 @@ pub fn parse_platform_tx_json(bytes: &[u8]) -> Result<Value, String> {
     Ok(tx)
 }
 
+pub(crate) fn platform_tx_len(bytes: &[u8]) -> Result<usize, String> {
+    parse_platform_tx_prefix(bytes).map(|(_, consumed)| consumed)
+}
+
 pub fn extract_platform_tx_bytes_from_block(raw: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     if raw.len() < 6 {
         return Err(format!(

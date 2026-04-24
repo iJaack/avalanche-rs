@@ -9,6 +9,9 @@
 
 extern crate alloc;
 
+#[macro_use]
+mod fixed_bytes;
+
 pub mod block;
 pub mod bloom;
 pub mod codec;

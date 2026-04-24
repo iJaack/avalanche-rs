@@ -1,119 +1,28 @@
-//! Comprehensive indexer test suite covering PostgreSQL pipeline, batch processing, and edge cases.
-//!
-//! **Requires TimescaleDB** running:
-//!   docker run -d --name tsdb-test -p 5433:5432 \
-//!     -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=indexer_test \
-//!     timescale/timescaledb:latest-pg16
-//!
-//! Run: DATABASE_URL=postgres://test:test@localhost:5433/indexer_test cargo test --features indexer --test indexer_comprehensive
+//! Indexer integration tests for the PostgreSQL pipeline.
+//! Requires TimescaleDB on localhost:5433.
 
 #![cfg(feature = "indexer")]
+
+mod common;
 
 use avalanche_rs::indexer::{
     IndexedBlock, IndexedLog, IndexedTransaction, IndexerQuery, IndexerWriter,
 };
 use chrono::{Duration, TimeZone, Utc};
 use serial_test::serial;
-use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::sync::OnceLock;
+use sqlx::PgPool;
 use std::time::Duration as StdDuration;
 
 // ============================================================================
 // SETUP & HELPERS
 // ============================================================================
 
-static TEST_DB_NAME: OnceLock<String> = OnceLock::new();
-
-fn test_database_name() -> String {
-    TEST_DB_NAME
-        .get_or_init(|| format!("indexer_comprehensive_{}", std::process::id()))
-        .clone()
-}
-
-async fn ensure_test_database() -> bool {
-    let db_name = test_database_name();
-    let admin_pool = match PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect("postgresql:///postgres")
-        .await
-    {
-        Ok(pool) => pool,
-        Err(e) => {
-            eprintln!("Skipping DB-backed test: failed to connect to postgres admin db: {e}");
-            return false;
-        }
-    };
-
-    let exists: Option<(i32,)> =
-        match sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(&db_name)
-            .fetch_optional(&admin_pool)
-            .await
-        {
-            Ok(exists) => exists,
-            Err(e) => {
-                eprintln!("Skipping DB-backed test: failed to check test database existence: {e}");
-                admin_pool.close().await;
-                return false;
-            }
-        };
-
-    if exists.is_none() {
-        if let Err(e) = sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
-            .execute(&admin_pool)
-            .await
-        {
-            eprintln!("Skipping DB-backed test: failed to create test database: {e}");
-            admin_pool.close().await;
-            return false;
-        }
-    }
-
-    admin_pool.close().await;
-    true
+async fn setup_pool() -> Option<PgPool> {
+    common::setup_indexer_pool("indexer_comprehensive", false).await
 }
 
 fn test_database_url() -> String {
-    format!("postgresql:///{}", test_database_name())
-}
-
-async fn setup_pool() -> Option<PgPool> {
-    if !ensure_test_database().await {
-        return None;
-    }
-    let url = test_database_url();
-    let pool = match PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(StdDuration::from_secs(5))
-        .connect(&url)
-        .await
-    {
-        Ok(pool) => pool,
-        Err(e) => {
-            eprintln!("Skipping DB-backed test: failed to connect to test DB: {e}");
-            return None;
-        }
-    };
-
-    // Run migrations
-    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
-        eprintln!("Skipping DB-backed test: failed to run migrations: {e}");
-        return None;
-    }
-
-    // Clean tables for fresh test state
-    let _ = sqlx::query("DELETE FROM logs").execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM transactions").execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM blocks").execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM address_balances")
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM indexer_state WHERE key NOT IN ('indexer_version')")
-        .execute(&pool)
-        .await;
-
-    Some(pool)
+    common::test_database_url("indexer_comprehensive")
 }
 
 fn make_test_block(number: i64, tx_count: usize, miner: u8) -> IndexedBlock {
@@ -207,10 +116,6 @@ async fn wait_for_batch_flush(millis: u64) {
     tokio::time::sleep(StdDuration::from_millis(millis)).await;
 }
 
-// ============================================================================
-// TEST: Single block write and query
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_single_block_write_and_query() {
@@ -259,10 +164,6 @@ async fn test_single_block_write_and_query() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Batch processing at scale
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_batch_processing_large_blocks() {
@@ -306,10 +207,6 @@ async fn test_batch_processing_large_blocks() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Balance updates from transactions
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_balance_updates_on_transfer() {
@@ -321,7 +218,6 @@ async fn test_balance_updates_on_transfer() {
         .await
         .expect("writer init");
 
-    // Create a block with a single transaction: sender → receiver
     let block = make_test_block(1, 1, 0x55);
     writer.index_block(block).await;
 
@@ -370,10 +266,6 @@ async fn test_balance_updates_on_transfer() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Logs indexing
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_logs_indexing_and_query() {
@@ -420,10 +312,6 @@ async fn test_logs_indexing_and_query() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Gap detection (catchup)
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_gap_detection_missing_block() {
@@ -435,7 +323,6 @@ async fn test_gap_detection_missing_block() {
         .await
         .expect("writer init");
 
-    // Write blocks 1, 2, 4, 5 (skip 3)
     for i in &[1, 2, 4, 5] {
         let block = make_test_block(*i as i64, 1, 0x99);
         writer.index_block(block).await;
@@ -463,10 +350,6 @@ async fn test_gap_detection_missing_block() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Duplicate block prevention (ON CONFLICT handling)
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_duplicate_block_ignored() {
@@ -478,7 +361,6 @@ async fn test_duplicate_block_ignored() {
         .await
         .expect("writer init");
 
-    // Write the same block twice
     let block = make_test_block(200, 2, 0x88);
     writer.index_block(block.clone()).await;
     writer.index_block(block).await;
@@ -500,10 +382,6 @@ async fn test_duplicate_block_ignored() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Address transaction history
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_address_transaction_history() {
@@ -523,10 +401,6 @@ async fn test_address_transaction_history() {
         a
     };
 
-    // Manual setup: we need to directly insert transactions with the same from_address
-    // For now, just verify the API exists and handles the query gracefully
-    // The real integration would use the constructed blocks above
-
     let query = IndexerQuery::new(pool.clone());
     let txs = query
         .get_transactions_by_address(&sender, 10, 0)
@@ -539,10 +413,6 @@ async fn test_address_transaction_history() {
     writer.close().await;
     pool.close().await;
 }
-
-// ============================================================================
-// TEST: Hourly and daily stats (continuous aggregates)
-// ============================================================================
 
 #[serial]
 #[tokio::test]
@@ -565,11 +435,8 @@ async fn test_continuous_aggregate_stats() {
 
     let query = IndexerQuery::new(pool.clone());
 
-    // Query hourly stats (may be empty if continuous aggregate not yet refreshed)
     let hourly = query.get_hourly_stats(100).await.expect("query");
 
-    // Continuous aggregates may not be available immediately; just verify API works
-    // In production, these would be auto-refreshed by TimescaleDB policies
     assert!(
         hourly.is_empty() || !hourly.is_empty(),
         "hourly stats query completed"
@@ -578,10 +445,6 @@ async fn test_continuous_aggregate_stats() {
     writer.close().await;
     pool.close().await;
 }
-
-// ============================================================================
-// TEST: Block by hash retrieval
-// ============================================================================
 
 #[serial]
 #[tokio::test]
@@ -615,10 +478,6 @@ async fn test_block_by_hash_retrieval() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Timestamp ordering
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_blocks_ordered_by_timestamp() {
@@ -630,7 +489,6 @@ async fn test_blocks_ordered_by_timestamp() {
         .await
         .expect("writer init");
 
-    // Write blocks in random order
     for i in &[5, 2, 8, 1, 9] {
         let block = make_test_block(*i as i64, 1, 0xAA);
         writer.index_block(block).await;
@@ -640,7 +498,6 @@ async fn test_blocks_ordered_by_timestamp() {
 
     let query = IndexerQuery::new(pool.clone());
 
-    // Fetch all and verify ordering (our test blocks use sequential timestamps)
     let block1 = query.get_block_by_number(1).await.expect("query");
     let block5 = query.get_block_by_number(5).await.expect("query");
 
@@ -656,10 +513,6 @@ async fn test_blocks_ordered_by_timestamp() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Large transaction value handling (NUMERIC precision)
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_large_transaction_values() {
@@ -672,9 +525,8 @@ async fn test_large_transaction_values() {
         .expect("writer init");
 
     let mut block = make_test_block(400, 1, 0xEE);
-    // Override the first transaction with a huge value (max wei)
     if let Some(tx) = block.transactions.first_mut() {
-        tx.value = (u128::MAX - 1).to_string(); // Near max u128
+        tx.value = (u128::MAX - 1).to_string();
     }
 
     writer.index_block(block).await;
@@ -701,10 +553,6 @@ async fn test_large_transaction_values() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Shutdown signal handling
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_indexer_writer_graceful_shutdown() {
@@ -716,14 +564,11 @@ async fn test_indexer_writer_graceful_shutdown() {
         .await
         .expect("writer init");
 
-    // Queue a block
     let block = make_test_block(500, 1, 0xFF);
     writer.index_block(block).await;
 
-    // Close immediately (should flush pending batch)
     writer.close().await;
 
-    // Verify the block was flushed
     let query = IndexerQuery::new(pool.clone());
     let fetched = query.get_block_by_number(500).await.expect("query");
     assert!(

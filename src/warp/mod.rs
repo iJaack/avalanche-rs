@@ -15,13 +15,17 @@ use std::time::Instant;
 // BLS Aggregate Signatures
 // ---------------------------------------------------------------------------
 
-/// A BLS public key (compressed, 48 bytes).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BlsPublicKey(pub [u8; 48]);
+// A BLS public key (compressed, 48 bytes).
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct BlsPublicKey(48);
+}
 
-/// A BLS signature (compressed, 96 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlsSignature(pub [u8; 96]);
+// A BLS signature (compressed, 96 bytes).
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BlsSignature(96);
+}
 
 /// An aggregate BLS signature combining multiple validator signatures.
 #[derive(Debug, Clone, PartialEq)]

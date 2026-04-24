@@ -1,17 +1,9 @@
-// ============================================================================
-// Avalanche Rust Client - Integration Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::str::FromStr;
 
     use avalanche_rs::types::*;
-
-    // ========================================================================
-    // TYPES MODULE TESTS
-    // ========================================================================
 
     mod types_tests {
         use super::*;
@@ -243,10 +235,6 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // CONSENSUS TESTS
-    // ========================================================================
-
     #[cfg(feature = "p2p")]
     mod consensus_tests {
         use super::*;
@@ -258,9 +246,8 @@ mod tests {
             let block = BlockId::from_bytes(&[1u8; 32]).unwrap();
             let mut sb = SnowballInstance::new(genesis.clone(), 3);
 
-            // Simulate 3 consecutive alpha-majority polls for `block`
             let mut votes = HashMap::new();
-            votes.insert(block.clone(), 15u64); // alpha threshold met
+            votes.insert(block.clone(), 15u64);
 
             sb.record_poll(&votes, 15);
             assert!(!sb.is_finalized());

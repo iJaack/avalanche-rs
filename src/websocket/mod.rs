@@ -3,8 +3,10 @@
 //! Phase 10: WebSocket upgrade on /ws, eth_subscribe for newHeads,
 //! logs, and newPendingTransactions. Connection management.
 
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -32,7 +34,9 @@ impl SubscriptionType {
             "newHeads" => Some(Self::NewHeads),
             "logs" => {
                 let filter = if let Some(filter_obj) = params.get(1) {
-                    LogFilter::from_json(filter_obj)
+                    serde_json::from_value::<LogFilterInput>(filter_obj.clone())
+                        .map(LogFilter::from_input)
+                        .unwrap_or_default()
                 } else {
                     LogFilter::default()
                 };
@@ -42,8 +46,11 @@ impl SubscriptionType {
             "newAcceptedTransactions" => {
                 let full_tx = params
                     .get(1)
-                    .and_then(|value| value.get("fullTx"))
-                    .and_then(|value| value.as_bool())
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<AcceptedTransactionsInput>(value).ok()
+                    })
+                    .map(|input| input.full_tx)
                     .unwrap_or(false);
                 Some(Self::NewAcceptedTransactions { full_tx })
             }
@@ -60,38 +67,11 @@ pub struct LogFilter {
 }
 
 impl LogFilter {
-    pub fn from_json(value: &serde_json::Value) -> Self {
-        let mut filter = Self::default();
-
-        if let Some(addr) = value.get("address") {
-            if let Some(s) = addr.as_str() {
-                if let Some(bytes) = parse_hex_address(s) {
-                    filter.addresses.push(bytes);
-                }
-            } else if let Some(arr) = addr.as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        if let Some(bytes) = parse_hex_address(s) {
-                            filter.addresses.push(bytes);
-                        }
-                    }
-                }
-            }
+    pub(crate) fn from_input(input: LogFilterInput) -> Self {
+        Self {
+            addresses: input.addresses,
+            topics: input.topics,
         }
-
-        if let Some(topics) = value.get("topics").and_then(|t| t.as_array()) {
-            for t in topics {
-                if t.is_null() {
-                    filter.topics.push(None);
-                } else if let Some(s) = t.as_str() {
-                    filter.topics.push(parse_hex_hash(s));
-                } else {
-                    filter.topics.push(None);
-                }
-            }
-        }
-
-        filter
     }
 
     /// Check if a log entry matches this filter.
@@ -112,6 +92,119 @@ impl LogFilter {
 
         true
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct LogFilterInput {
+    #[serde(
+        default,
+        rename = "address",
+        deserialize_with = "deserialize_log_addresses"
+    )]
+    addresses: Vec<[u8; 20]>,
+    #[serde(default, deserialize_with = "deserialize_log_topics")]
+    topics: Vec<Option<[u8; 32]>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AcceptedTransactionsInput {
+    #[serde(default, rename = "fullTx")]
+    full_tx: bool,
+}
+
+fn deserialize_log_addresses<'de, D>(deserializer: D) -> Result<Vec<[u8; 20]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AddressesVisitor;
+
+    impl<'de> Visitor<'de> for AddressesVisitor {
+        type Value = Vec<[u8; 20]>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a hex address or array of hex addresses")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(parse_hex_address(value).into_iter().collect())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut addresses = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                if let Some(address) = parse_hex_address(&value) {
+                    addresses.push(address);
+                }
+            }
+            Ok(addresses)
+        }
+    }
+
+    deserializer.deserialize_any(AddressesVisitor)
+}
+
+fn deserialize_log_topics<'de, D>(deserializer: D) -> Result<Vec<Option<[u8; 32]>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TopicsVisitor;
+
+    impl<'de> Visitor<'de> for TopicsVisitor {
+        type Value = Vec<Option<[u8; 32]>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an array of topic hashes or null values")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut topics = Vec::new();
+            while let Some(topic) = seq.next_element::<Option<String>>()? {
+                topics.push(topic.as_deref().and_then(parse_hex_hash));
+            }
+            Ok(topics)
+        }
+    }
+
+    deserializer.deserialize_any(TopicsVisitor)
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +697,7 @@ mod tests {
             "topics": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         });
 
-        let filter = LogFilter::from_json(&json);
+        let filter = LogFilter::from_input(serde_json::from_value(json).unwrap());
         assert_eq!(filter.addresses.len(), 1);
         assert_eq!(filter.topics.len(), 1);
         assert!(filter.topics[0].is_some());

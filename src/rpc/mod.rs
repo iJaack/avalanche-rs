@@ -40,6 +40,8 @@ pub enum RpcClientError {
     ConnectionFailed(String),
     /// Invalid parameters
     InvalidParams(String),
+    /// Internal client invariant violated
+    InternalError(String),
 }
 
 impl std::fmt::Display for RpcClientError {
@@ -53,6 +55,7 @@ impl std::fmt::Display for RpcClientError {
             RpcClientError::TimeoutError => write!(f, "Request timeout"),
             RpcClientError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
             RpcClientError::InvalidParams(msg) => write!(f, "Invalid params: {}", msg),
+            RpcClientError::InternalError(msg) => write!(f, "Internal error: {}", msg),
         }
     }
 }
@@ -681,14 +684,13 @@ impl RpcClient {
     }
 
     /// Generate next request ID
-    fn next_id(&self) -> u64 {
-        let mut counter = self
-            .request_id_counter
-            .lock()
-            .expect("request_id_counter mutex poisoned");
+    fn next_id(&self) -> Result<u64> {
+        let mut counter = self.request_id_counter.lock().map_err(|_| {
+            RpcClientError::InternalError("request_id_counter mutex poisoned".to_string())
+        })?;
         let id = *counter;
         *counter = counter.wrapping_add(1);
-        id
+        Ok(id)
     }
 
     /// Core RPC call method with retry logic
@@ -700,13 +702,21 @@ impl RpcClient {
             match self.call_internal(&method, params.clone()).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    last_error = Some(e);
+                    let retryable = matches!(
+                        e,
+                        RpcClientError::NetworkError(_)
+                            | RpcClientError::TimeoutError
+                            | RpcClientError::ConnectionFailed(_)
+                    );
 
-                    if attempt < self.config.max_retries {
-                        // Exponential backoff: 100ms * 2^attempt
-                        let backoff_ms = self.config.retry_backoff_ms * (2u64.pow(attempt));
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    if !retryable || attempt >= self.config.max_retries {
+                        return Err(e);
                     }
+
+                    last_error = Some(e);
+                    // Exponential backoff: 100ms * 2^attempt
+                    let backoff_ms = self.config.retry_backoff_ms * (2u64.pow(attempt));
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 }
             }
         }
@@ -718,7 +728,7 @@ impl RpcClient {
 
     /// Internal call implementation (single attempt)
     async fn call_internal(&self, method: &str, params: Vec<Value>) -> Result<Value> {
-        let id = self.next_id();
+        let id = self.next_id()?;
 
         let request_body = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),

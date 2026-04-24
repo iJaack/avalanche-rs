@@ -9,123 +9,23 @@
 
 #![cfg(feature = "indexer")]
 
+mod common;
+
 use chrono::{TimeZone, Utc};
 use serial_test::serial;
-use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::sync::OnceLock;
+use sqlx::PgPool;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-static TEST_DB_NAME: OnceLock<String> = OnceLock::new();
-
-fn test_database_name() -> String {
-    TEST_DB_NAME
-        .get_or_init(|| format!("indexer_integration_{}", std::process::id()))
-        .clone()
-}
-
-async fn ensure_test_database() -> bool {
-    let db_name = test_database_name();
-    let admin_pool = match PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect("postgresql:///postgres")
-        .await
-    {
-        Ok(pool) => pool,
-        Err(e) => {
-            eprintln!("Skipping DB-backed test: failed to connect to postgres admin db: {e}");
-            return false;
-        }
-    };
-
-    let exists: Option<(i32,)> =
-        match sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(&db_name)
-            .fetch_optional(&admin_pool)
-            .await
-        {
-            Ok(exists) => exists,
-            Err(e) => {
-                eprintln!("Skipping DB-backed test: failed to check test database existence: {e}");
-                admin_pool.close().await;
-                return false;
-            }
-        };
-
-    if exists.is_none() {
-        if let Err(e) = sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
-            .execute(&admin_pool)
-            .await
-        {
-            eprintln!("Skipping DB-backed test: failed to create test database: {e}");
-            admin_pool.close().await;
-            return false;
-        }
-    }
-
-    admin_pool.close().await;
-    true
+async fn setup_pool() -> Option<PgPool> {
+    common::setup_indexer_pool("indexer_integration", false).await
 }
 
 fn test_database_url() -> String {
-    format!("postgresql:///{}", test_database_name())
-}
-
-async fn setup_pool() -> Option<PgPool> {
-    if !ensure_test_database().await {
-        return None;
-    }
-    let url = test_database_url();
-    let pool = match PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(&url)
-        .await
-    {
-        Ok(pool) => pool,
-        Err(e) => {
-            eprintln!("Skipping DB-backed test: failed to connect to test database: {e}");
-            return None;
-        }
-    };
-
-    // Run migrations
-    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
-        eprintln!("Skipping DB-backed test: failed to run migrations: {e}");
-        return None;
-    }
-
-    // Clean all tables for a fresh test
-    sqlx::query("DELETE FROM logs")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM transactions")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM blocks")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM address_balances")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM indexer_state WHERE key NOT IN ('indexer_version')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO indexer_state (key, value_int, updated_at) VALUES ('last_indexed_block', 0, NOW()) ON CONFLICT (key) DO UPDATE SET value_int = 0, updated_at = NOW()")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    Some(pool)
+    common::test_database_url("indexer_integration")
 }
 
 fn make_block(number: i64, tx_count: usize) -> avalanche_rs::indexer::IndexedBlock {

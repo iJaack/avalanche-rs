@@ -13,7 +13,7 @@ use revm::{
     primitives::{db::Database, Address, CreateScheme, U256},
     EvmContext, Inspector,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -119,29 +119,31 @@ impl Default for TraceConfig {
 }
 
 impl TraceConfig {
-    /// Parse from JSON-RPC options.
-    pub fn from_json(opts: &serde_json::Value) -> Self {
-        let mut config = Self::default();
+    pub fn from_input(opts: TraceConfigInput) -> Self {
+        let tracer = match opts.tracer.as_deref() {
+            Some("callTracer") => TracerType::CallTracer,
+            _ => TracerType::StructLogger,
+        };
 
-        if let Some(tracer) = opts.get("tracer").and_then(|v| v.as_str()) {
-            config.tracer = match tracer {
-                "callTracer" => TracerType::CallTracer,
-                _ => TracerType::StructLogger,
-            };
+        Self {
+            tracer,
+            enable_memory: opts.enable_memory.unwrap_or(false),
+            enable_storage: opts.enable_storage.unwrap_or(false),
+            limit: opts.limit.unwrap_or(0) as usize,
         }
-
-        if let Some(mem) = opts.get("enableMemory").and_then(|v| v.as_bool()) {
-            config.enable_memory = mem;
-        }
-        if let Some(storage) = opts.get("enableStorage").and_then(|v| v.as_bool()) {
-            config.enable_storage = storage;
-        }
-        if let Some(limit) = opts.get("limit").and_then(|v| v.as_u64()) {
-            config.limit = limit as usize;
-        }
-
-        config
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TraceConfigInput {
+    #[serde(default)]
+    tracer: Option<String>,
+    #[serde(default, rename = "enableMemory")]
+    enable_memory: Option<bool>,
+    #[serde(default, rename = "enableStorage")]
+    enable_storage: Option<bool>,
+    #[serde(default)]
+    limit: Option<u64>,
 }
 
 /// Tracer type selector.
@@ -736,7 +738,7 @@ mod tests {
             "limit": 100
         });
 
-        let config = TraceConfig::from_json(&opts);
+        let config = TraceConfig::from_input(serde_json::from_value(opts).unwrap());
         assert_eq!(config.tracer, TracerType::CallTracer);
         assert!(config.enable_memory);
         assert!(config.enable_storage);

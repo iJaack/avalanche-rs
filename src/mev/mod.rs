@@ -602,12 +602,6 @@ impl Default for MempoolConfig {
 /// Mempool monitor — watches pending transactions for MEV opportunities
 pub struct MempoolMonitor {
     config: MempoolConfig,
-    /// RPC endpoint for live mempool queries (used by future WebSocket subscription)
-    #[allow(dead_code)]
-    rpc_endpoint: String,
-    /// Pending decoded swaps awaiting evaluation
-    #[allow(dead_code)]
-    pending_swaps: Arc<RwLock<Vec<DecodedSwap>>>,
     opportunities: Arc<Mutex<Vec<MevOpportunity>>>,
     stats: Arc<RwLock<MonitorStats>>,
 }
@@ -625,11 +619,9 @@ pub struct MonitorStats {
 }
 
 impl MempoolMonitor {
-    pub fn new(rpc_endpoint: &str, config: MempoolConfig) -> Self {
+    pub fn new(config: MempoolConfig) -> Self {
         Self {
             config,
-            rpc_endpoint: rpc_endpoint.to_string(),
-            pending_swaps: Arc::new(RwLock::new(Vec::new())),
             opportunities: Arc::new(Mutex::new(Vec::new())),
             stats: Arc::new(RwLock::new(MonitorStats::default())),
         }
@@ -1139,7 +1131,7 @@ mod tests {
 
     #[test]
     fn test_arbitrage_evaluation() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
 
         // 200bps spread between TraderJoe and Pangolin
         let opp = monitor.evaluate_arbitrage(
@@ -1170,7 +1162,7 @@ mod tests {
 
     #[test]
     fn test_no_arbitrage_small_spread() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
 
         // Only 10bps spread — below gas cost threshold
         let opp = monitor.evaluate_arbitrage(
@@ -1711,7 +1703,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_tx_non_swap() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
         let tx = PendingTx {
             hash: "0x123".into(),
             from: "0xsender".into(),
@@ -1728,7 +1720,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_tx_no_calldata() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
         let tx = PendingTx {
             hash: "0x123".into(),
             from: "0x".into(),
@@ -1745,7 +1737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_tx_no_to() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
         let tx = PendingTx {
             hash: "0x123".into(),
             from: "0x".into(),
@@ -1762,7 +1754,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_monitor_stats_increment() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
         // Use a known DEX router with a swap selector to reach the stats update code
         let mut input = vec![0u8; 200];
         input[..4].copy_from_slice(&selectors::SWAP_EXACT_TOKENS_FOR_TOKENS);
@@ -1786,13 +1778,10 @@ mod tests {
 
     #[test]
     fn test_evaluate_sandwich_too_small() {
-        let monitor = MempoolMonitor::new(
-            "http://localhost:9650",
-            MempoolConfig {
-                min_swap_avax: 10.0,
-                ..MempoolConfig::default()
-            },
-        );
+        let monitor = MempoolMonitor::new(MempoolConfig {
+            min_swap_avax: 10.0,
+            ..MempoolConfig::default()
+        });
         let swap = DecodedSwap {
             tx_hash: "0x".into(),
             dex: DexProtocol::TraderJoe,
@@ -1811,7 +1800,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_sandwich_zero_amounts() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
         let swap = DecodedSwap {
             tx_hash: "0x".into(),
             dex: DexProtocol::TraderJoe,
@@ -1832,7 +1821,7 @@ mod tests {
 
     #[test]
     fn test_arbitrage_zero_price() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
         assert!(monitor
             .evaluate_arbitrage(
                 "A",
@@ -1857,7 +1846,7 @@ mod tests {
 
     #[test]
     fn test_arbitrage_negative_price() {
-        let monitor = MempoolMonitor::new("http://localhost:9650", MempoolConfig::default());
+        let monitor = MempoolMonitor::new(MempoolConfig::default());
         assert!(monitor
             .evaluate_arbitrage(
                 "A",
@@ -1872,13 +1861,10 @@ mod tests {
 
     #[test]
     fn test_arbitrage_picks_correct_direction() {
-        let monitor = MempoolMonitor::new(
-            "http://localhost:9650",
-            MempoolConfig {
-                min_profit_avax: 0.001, // low threshold for test
-                ..MempoolConfig::default()
-            },
-        );
+        let monitor = MempoolMonitor::new(MempoolConfig {
+            min_profit_avax: 0.001, // low threshold for test
+            ..MempoolConfig::default()
+        });
 
         // B is cheaper on Pangolin — should buy on Pangolin, sell on TraderJoe
         let opp = monitor.evaluate_arbitrage(

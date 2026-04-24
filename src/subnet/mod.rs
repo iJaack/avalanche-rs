@@ -17,25 +17,22 @@ use std::collections::HashMap;
 // Subnet Identifiers
 // ---------------------------------------------------------------------------
 
-/// A subnet identifier (32 bytes, same as a ChainId).
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct SubnetId(pub [u8; 32]);
+// A subnet identifier (32 bytes, same as a ChainId).
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+    pub struct SubnetId(32);
+}
 
 impl SubnetId {
     /// The Primary Network subnet ID (all zeros).
     pub fn primary_network() -> Self {
-        Self([0u8; 32])
+        Self::ZERO
     }
 
     /// Parse from hex string.
     pub fn from_hex(hex_str: &str) -> Option<Self> {
         let bytes = hex::decode(hex_str).ok()?;
-        if bytes.len() != 32 {
-            return None;
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Some(Self(arr))
+        Self::from_bytes(&bytes)
     }
 
     /// Parse from either a 64-char hex string or CB58 subnet ID.

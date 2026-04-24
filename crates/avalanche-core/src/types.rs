@@ -6,27 +6,13 @@
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
-/// A 32-byte identifier used throughout Avalanche.
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Id(pub [u8; 32]);
+// A 32-byte identifier used throughout Avalanche.
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Id(32);
+}
 
 impl Id {
-    pub const ZERO: Self = Self([0u8; 32]);
-
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(bytes);
-            Some(Self(arr))
-        } else {
-            None
-        }
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.0 == [0u8; 32]
-    }
-
     /// Compute the SHA-256 hash of the given data and return as an ID.
     pub fn from_sha256(data: &[u8]) -> Self {
         use sha2::{Digest, Sha256};
@@ -37,38 +23,10 @@ impl Id {
     }
 }
 
-impl Default for Id {
-    fn default() -> Self {
-        Self::ZERO
-    }
-}
-
-/// A 20-byte node identifier.
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeId(pub [u8; 20]);
-
-impl NodeId {
-    pub const ZERO: Self = Self([0u8; 20]);
-
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() == 20 {
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(bytes);
-            Some(Self(arr))
-        } else {
-            None
-        }
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.0 == [0u8; 20]
-    }
-}
-
-impl Default for NodeId {
-    fn default() -> Self {
-        Self::ZERO
-    }
+// A 20-byte node identifier.
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct NodeId(20);
 }
 
 /// Type-safe block ID.

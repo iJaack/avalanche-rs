@@ -1,0 +1,361 @@
+2026-04-15T08:34:06.605995Z  INFO avalanche-rs v0.1.0 starting (network_id=5, chain_id=43114)
+2026-04-15T08:34:06.606152Z  INFO Generating ephemeral TLS identity
+2026-04-15T08:34:06.606600Z  INFO NodeID: NodeID-1d2cec9a79b4..., cert_size=359 bytes
+2026-04-15T08:34:06.616460Z  INFO Database opened at "/tmp/bench-rs/db", last accepted height: 0
+2026-04-15T08:34:06.616521Z  INFO Block integrity check: 0 blocks verified, 0 mismatches
+2026-04-15T08:34:06.616551Z  INFO P-Chain genesis block not found in DB (need more sync rounds)
+2026-04-15T08:34:06.616560Z  INFO C-Chain stateRoot mapping: 0 entries
+2026-04-15T08:34:06.616621Z  INFO EVM executor initialized (chain_id=43114)
+2026-04-15T08:34:06.616647Z  INFO Validator set initialized with 2 known Fuji validators
+2026-04-15T08:34:06.617003Z  INFO State pruning enabled: depth=256
+2026-04-15T08:34:06.617014Z  INFO Node started: p2p=:29651, http=:29650, node_id=NodeID-1d2cec9a79b4...
+2026-04-15T08:34:06.617091Z  INFO Starting consensus loop
+2026-04-15T08:34:06.617122Z  INFO P2P listener bound to 0.0.0.0:29651
+2026-04-15T08:34:06.617130Z  INFO JSON-RPC server listening on 0.0.0.0:29650
+2026-04-15T08:34:06.617162Z  INFO Connecting to 1 startup peers (pool_size=8)
+2026-04-15T08:34:06.617205Z  INFO Connecting to bootstrap node 52.29.72.46:9651
+2026-04-15T08:34:06.717422Z  INFO TCP connected to 52.29.72.46:9651
+2026-04-15T08:34:06.826592Z  INFO TLS handshake complete with 52.29.72.46:9651 → peer NodeID: NodeID-470b55cf45b1...
+2026-04-15T08:34:06.828346Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=264 bytes
+2026-04-15T08:34:06.828565Z  INFO Sent Handshake to 52.29.72.46:9651 (264 bytes)
+2026-04-15T08:34:06.928348Z  INFO Received Version from 52.29.72.46:9651 (msg #1)
+2026-04-15T08:34:06.928439Z  INFO Peer 52.29.72.46:9651 handshake: network_id=5, version=avalanche/1.14.2, node_id=NodeID-341d482e0000...
+2026-04-15T08:34:06.928516Z  INFO Sent empty PeerList to 52.29.72.46:9651 (handshake completion)
+2026-04-15T08:34:07.028440Z  INFO Received PeerList from 52.29.72.46:9651 (msg #2)
+2026-04-15T08:34:07.028487Z  INFO Got PeerList with 15 peers from 52.29.72.46:9651
+2026-04-15T08:34:07.028538Z  INFO Discovered 15 new peers via 52.29.72.46:9651
+2026-04-15T08:34:07.028587Z  INFO Handshake complete with 52.29.72.46:9651
+2026-04-15T08:34:07.028605Z  INFO Dialing discovered peer 18.192.93.241:9651
+2026-04-15T08:34:07.028618Z  INFO Dialing discovered peer 18.182.4.86:9689
+2026-04-15T08:34:07.028648Z  INFO Connecting to bootstrap node 18.182.4.86:9689
+2026-04-15T08:34:07.028631Z  INFO Connecting to bootstrap node 18.192.93.241:9651
+2026-04-15T08:34:07.028635Z  INFO Peer 52.29.72.46:9651 registered (NodeID: NodeID-470b55cf45b1...)
+2026-04-15T08:34:07.028588Z  INFO Dialing discovered peer 16.163.84.252:9651
+2026-04-15T08:34:07.028738Z  INFO Connecting to bootstrap node 16.163.84.252:9651
+2026-04-15T08:34:07.028648Z  INFO Dialing discovered peer 20.237.185.191:9651
+2026-04-15T08:34:07.028837Z  INFO Connecting to bootstrap node 20.237.185.191:9651
+2026-04-15T08:34:07.028656Z  INFO Dialing discovered peer 88.198.12.184:9651
+2026-04-15T08:34:07.028942Z  INFO Connecting to bootstrap node 88.198.12.184:9651
+2026-04-15T08:34:07.029013Z  INFO Dialing discovered peer 176.9.125.100:9651
+2026-04-15T08:34:07.028666Z  INFO Dialing discovered peer 128.140.57.46:9651
+2026-04-15T08:34:07.029049Z  INFO Connecting to bootstrap node 128.140.57.46:9651
+2026-04-15T08:34:07.028930Z  INFO Entering message loop with 52.29.72.46:9651
+2026-04-15T08:34:07.029089Z  INFO Dialing discovered peer 18.182.4.86:9673
+2026-04-15T08:34:07.029102Z  INFO Connecting to bootstrap node 18.182.4.86:9673
+2026-04-15T08:34:07.029034Z  INFO Connecting to bootstrap node 176.9.125.100:9651
+2026-04-15T08:34:07.028625Z  INFO Dialing discovered peer 18.182.4.86:9661
+2026-04-15T08:34:07.029191Z  INFO Connecting to bootstrap node 18.182.4.86:9661
+2026-04-15T08:34:07.029019Z  INFO Dialing discovered peer 104.42.155.78:9651
+2026-04-15T08:34:07.029252Z  INFO Connecting to bootstrap node 104.42.155.78:9651
+2026-04-15T08:34:07.031511Z  INFO C-Chain ID for network_id=5: 0x7fc93d85...
+2026-04-15T08:34:07.126013Z  INFO TCP connected to 18.192.93.241:9651
+2026-04-15T08:34:07.129854Z  INFO TCP connected to 176.9.125.100:9651
+2026-04-15T08:34:07.136336Z  INFO TCP connected to 88.198.12.184:9651
+2026-04-15T08:34:07.136533Z  INFO TCP connected to 128.140.57.46:9651
+2026-04-15T08:34:07.233618Z  INFO TLS handshake complete with 18.192.93.241:9651 → peer NodeID: NodeID-7f6ac9c6e1a1...
+2026-04-15T08:34:07.234912Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=266 bytes
+2026-04-15T08:34:07.235032Z  INFO Sent Handshake to 18.192.93.241:9651 (266 bytes)
+2026-04-15T08:34:07.239817Z  INFO TLS handshake complete with 128.140.57.46:9651 → peer NodeID: NodeID-5c6974c69e04...
+2026-04-15T08:34:07.240831Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=266 bytes
+2026-04-15T08:34:07.240908Z  INFO Sent Handshake to 128.140.57.46:9651 (266 bytes)
+2026-04-15T08:34:07.249034Z  INFO TLS handshake complete with 88.198.12.184:9651 → peer NodeID: NodeID-cd65da9a4c50...
+2026-04-15T08:34:07.250048Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=264 bytes
+2026-04-15T08:34:07.250149Z  INFO Sent Handshake to 88.198.12.184:9651 (264 bytes)
+2026-04-15T08:34:07.263361Z  INFO TLS handshake complete with 176.9.125.100:9651 → peer NodeID: NodeID-8cc57258634f...
+2026-04-15T08:34:07.265703Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=265 bytes
+2026-04-15T08:34:07.265797Z  INFO Sent Handshake to 176.9.125.100:9651 (265 bytes)
+2026-04-15T08:34:07.283796Z  INFO TCP connected to 16.163.84.252:9651
+2026-04-15T08:34:07.291006Z  INFO TCP connected to 104.42.155.78:9651
+2026-04-15T08:34:07.295061Z  INFO TCP connected to 20.237.185.191:9651
+2026-04-15T08:34:07.317075Z  INFO TCP connected to 18.182.4.86:9689
+2026-04-15T08:34:07.317250Z  INFO TCP connected to 18.182.4.86:9661
+2026-04-15T08:34:07.318386Z  INFO TCP connected to 18.182.4.86:9673
+2026-04-15T08:34:07.333166Z  INFO Received Version from 18.192.93.241:9651 (msg #1)
+2026-04-15T08:34:07.333202Z  INFO Peer 18.192.93.241:9651 handshake: network_id=5, version=avalanche/1.14.2, node_id=NodeID-12c05df10000...
+2026-04-15T08:34:07.333232Z  INFO Sent empty PeerList to 18.192.93.241:9651 (handshake completion)
+2026-04-15T08:34:07.344253Z  INFO Received Version from 128.140.57.46:9651 (msg #1)
+2026-04-15T08:34:07.344322Z  INFO Peer 128.140.57.46:9651 handshake: network_id=5, version=avalanche/1.14.0, node_id=NodeID-808c392e0000...
+2026-04-15T08:34:07.344383Z  INFO Sent empty PeerList to 128.140.57.46:9651 (handshake completion)
+2026-04-15T08:34:07.352763Z  INFO Received Version from 88.198.12.184:9651 (msg #1)
+2026-04-15T08:34:07.352796Z  INFO Peer 88.198.12.184:9651 handshake: network_id=5, version=avalanche/1.14.1, node_id=NodeID-58c60cb80000...
+2026-04-15T08:34:07.352830Z  INFO Sent empty PeerList to 88.198.12.184:9651 (handshake completion)
+2026-04-15T08:34:07.363277Z  INFO Received Version from 176.9.125.100:9651 (msg #1)
+2026-04-15T08:34:07.363319Z  INFO Peer 176.9.125.100:9651 handshake: network_id=5, version=avalanche/1.14.2, node_id=NodeID-b0097d640000...
+2026-04-15T08:34:07.363348Z  INFO Sent empty PeerList to 176.9.125.100:9651 (handshake completion)
+2026-04-15T08:34:07.363408Z  INFO Received PeerList from 176.9.125.100:9651 (msg #2)
+2026-04-15T08:34:07.363416Z  INFO Got PeerList with 15 peers from 176.9.125.100:9651
+2026-04-15T08:34:07.427901Z  INFO Received PeerList from 18.192.93.241:9651 (msg #2)
+2026-04-15T08:34:07.427948Z  INFO Got PeerList with 15 peers from 18.192.93.241:9651
+2026-04-15T08:34:07.443653Z  INFO Received PeerList from 128.140.57.46:9651 (msg #2)
+2026-04-15T08:34:07.443808Z  INFO Got PeerList with 15 peers from 128.140.57.46:9651
+2026-04-15T08:34:07.452423Z  INFO Received PeerList from 88.198.12.184:9651 (msg #2)
+2026-04-15T08:34:07.452505Z  INFO Got PeerList with 15 peers from 88.198.12.184:9651
+2026-04-15T08:34:07.546942Z  INFO TLS handshake complete with 16.163.84.252:9651 → peer NodeID: NodeID-d4069b60a3e0...
+2026-04-15T08:34:07.547560Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=265 bytes
+2026-04-15T08:34:07.547585Z  INFO Sent Handshake to 16.163.84.252:9651 (265 bytes)
+2026-04-15T08:34:07.561267Z  INFO TLS handshake complete with 104.42.155.78:9651 → peer NodeID: NodeID-f114ca6b49c6...
+2026-04-15T08:34:07.561827Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=265 bytes
+2026-04-15T08:34:07.561859Z  INFO Sent Handshake to 104.42.155.78:9651 (265 bytes)
+2026-04-15T08:34:07.568406Z  INFO TLS handshake complete with 20.237.185.191:9651 → peer NodeID: NodeID-f0e25756dea2...
+2026-04-15T08:34:07.569012Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=264 bytes
+2026-04-15T08:34:07.569042Z  INFO Sent Handshake to 20.237.185.191:9651 (264 bytes)
+2026-04-15T08:34:07.605460Z  INFO TLS handshake complete with 18.182.4.86:9689 → peer NodeID: NodeID-757f361710e7...
+2026-04-15T08:34:07.605460Z  INFO TLS handshake complete with 18.182.4.86:9661 → peer NodeID: NodeID-5eeebbe97785...
+2026-04-15T08:34:07.606153Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=266 bytes
+2026-04-15T08:34:07.606172Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=265 bytes
+2026-04-15T08:34:07.606182Z  INFO Sent Handshake to 18.182.4.86:9689 (266 bytes)
+2026-04-15T08:34:07.606198Z  INFO Sent Handshake to 18.182.4.86:9661 (265 bytes)
+2026-04-15T08:34:07.606685Z  INFO TLS handshake complete with 18.182.4.86:9673 → peer NodeID: NodeID-82563a193c96...
+2026-04-15T08:34:07.607321Z  INFO Handshake: network_id=5, ip=[64, 61, e1, 34], port=29651, raw_msg=265 bytes
+2026-04-15T08:34:07.607344Z  INFO Sent Handshake to 18.182.4.86:9673 (265 bytes)
+2026-04-15T08:34:07.805473Z  INFO Received Version from 16.163.84.252:9651 (msg #1)
+2026-04-15T08:34:07.805540Z  INFO Peer 16.163.84.252:9651 handshake: network_id=5, version=avalanche/1.14.2, node_id=NodeID-10a354fc0000...
+2026-04-15T08:34:07.805592Z  INFO Sent empty PeerList to 16.163.84.252:9651 (handshake completion)
+2026-04-15T08:34:07.836298Z  INFO Received Version from 104.42.155.78:9651 (msg #1)
+2026-04-15T08:34:07.836351Z  INFO Peer 104.42.155.78:9651 handshake: network_id=5, version=avalanche/1.14.0, node_id=NodeID-682a9b4e0000...
+2026-04-15T08:34:07.836410Z  INFO Sent empty PeerList to 104.42.155.78:9651 (handshake completion)
+2026-04-15T08:34:07.836498Z  INFO Received PeerList from 104.42.155.78:9651 (msg #2)
+2026-04-15T08:34:07.836510Z  INFO Got PeerList with 15 peers from 104.42.155.78:9651
+2026-04-15T08:34:07.871745Z  INFO Received Version from 20.237.185.191:9651 (msg #1)
+2026-04-15T08:34:07.871781Z  INFO Peer 20.237.185.191:9651 handshake: network_id=5, version=avalanche/1.14.0, node_id=NodeID-14edb9bf0000...
+2026-04-15T08:34:07.871832Z  INFO Sent empty PeerList to 20.237.185.191:9651 (handshake completion)
+2026-04-15T08:34:07.871889Z  INFO Received PeerList from 20.237.185.191:9651 (msg #2)
+2026-04-15T08:34:07.871897Z  INFO Got PeerList with 15 peers from 20.237.185.191:9651
+2026-04-15T08:34:07.895941Z  INFO Received Version from 18.182.4.86:9661 (msg #1)
+2026-04-15T08:34:07.895989Z  INFO Peer 18.182.4.86:9661 handshake: network_id=5, version=avalanche/1.14.0, node_id=NodeID-12b604560000...
+2026-04-15T08:34:07.896023Z  INFO Sent empty PeerList to 18.182.4.86:9661 (handshake completion)
+2026-04-15T08:34:07.896449Z  INFO Received Version from 18.182.4.86:9689 (msg #1)
+2026-04-15T08:34:07.896459Z  INFO Peer 18.182.4.86:9689 handshake: network_id=5, version=avalanche/1.14.0, node_id=NodeID-12b604560000...
+2026-04-15T08:34:07.896477Z  INFO Sent empty PeerList to 18.182.4.86:9689 (handshake completion)
+2026-04-15T08:34:07.896547Z  INFO Received PeerList from 18.182.4.86:9661 (msg #2)
+2026-04-15T08:34:07.896556Z  INFO Got PeerList with 15 peers from 18.182.4.86:9661
+2026-04-15T08:34:07.896633Z  INFO Received PeerList from 18.182.4.86:9689 (msg #2)
+2026-04-15T08:34:07.896641Z  INFO Got PeerList with 15 peers from 18.182.4.86:9689
+2026-04-15T08:34:07.903846Z  INFO Received Version from 18.182.4.86:9673 (msg #1)
+2026-04-15T08:34:07.903892Z  INFO Peer 18.182.4.86:9673 handshake: network_id=5, version=avalanche/1.14.0, node_id=NodeID-12b604560000...
+2026-04-15T08:34:07.903928Z  INFO Sent empty PeerList to 18.182.4.86:9673 (handshake completion)
+2026-04-15T08:34:08.062242Z  INFO Received PeerList from 16.163.84.252:9651 (msg #2)
+2026-04-15T08:34:08.062290Z  INFO Got PeerList with 15 peers from 16.163.84.252:9651
+2026-04-15T08:34:08.195072Z  INFO Received PeerList from 18.182.4.86:9673 (msg #2)
+2026-04-15T08:34:08.195119Z  INFO Got PeerList with 15 peers from 18.182.4.86:9673
+2026-04-15T08:34:16.619236Z  INFO P-Chain: 0 blocks synced, height 0→0, chain length 0
+2026-04-15T08:34:16.619502Z  INFO C-Chain: 0 blocks synced, 0 stateRoot mappings
+2026-04-15T08:34:17.032400Z  INFO Bootstrap: sent GetAcceptedFrontier (req=17270) to 52.29.72.46:9651
+2026-04-15T08:34:17.032445Z  INFO Bootstrap: sent GetAcceptedFrontier for C-Chain (req=18270)
+2026-04-15T08:34:17.130776Z  INFO AcceptedFrontier from 52.29.72.46:9651 — tip=7ce9361e0a73f8ec...
+2026-04-15T08:34:17.130827Z  INFO Bootstrap: P-Chain tip from AcceptedFrontier = 7ce9361e…532ac805
+2026-04-15T08:34:17.130871Z  INFO Bootstrap: sent GetAccepted (req=17271) to 52.29.72.46:9651
+2026-04-15T08:34:17.130882Z  INFO AcceptedFrontier from 52.29.72.46:9651 — tip=0d816948af530630...
+2026-04-15T08:34:17.130889Z  INFO C-Chain AcceptedFrontier from 52.29.72.46:9651 — tip=0d816948af530630...
+2026-04-15T08:34:17.230904Z  INFO Accepted from 52.29.72.46:9651 — 1 block IDs
+2026-04-15T08:34:17.230977Z  INFO Bootstrap: sent GetAncestors (req=17272) to 52.29.72.46:9651
+2026-04-15T08:34:17.750234Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 305 containers, 1647171 bytes total
+2026-04-15T08:34:17.753373Z  INFO Stored 305 blocks via parent-chain linking (tip=7ce9361e…, 305 containers)
+2026-04-15T08:34:17.753419Z  INFO Bootstrap: stored 305 blocks (total: 305)
+2026-04-15T08:34:17.753494Z  INFO Bootstrap: recursive GetAncestors depth=1 req=17273 (total blocks so far: 305)
+2026-04-15T08:34:17.897257Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 213 containers, 1676454 bytes total
+2026-04-15T08:34:17.899590Z  INFO Bootstrap: stored 213 blocks (total: 518)
+2026-04-15T08:34:17.899658Z  INFO Bootstrap: recursive GetAncestors depth=2 req=17274 (total blocks so far: 518)
+2026-04-15T08:34:18.058159Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 160 containers, 715764 bytes total
+2026-04-15T08:34:18.059227Z  INFO Bootstrap: stored 160 blocks (total: 678)
+2026-04-15T08:34:18.059261Z  INFO Bootstrap: recursive GetAncestors depth=3 req=17275 (total blocks so far: 678)
+2026-04-15T08:34:18.218790Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 75 containers, 487490 bytes total
+2026-04-15T08:34:18.219871Z  INFO Bootstrap: stored 75 blocks (total: 753)
+2026-04-15T08:34:18.219944Z  INFO Bootstrap: recursive GetAncestors depth=4 req=17276 (total blocks so far: 753)
+2026-04-15T08:34:18.381345Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 74 containers, 330854 bytes total
+2026-04-15T08:34:18.382235Z  INFO Bootstrap: stored 74 blocks (total: 827)
+2026-04-15T08:34:18.382298Z  INFO Bootstrap: recursive GetAncestors depth=5 req=17277 (total blocks so far: 827)
+2026-04-15T08:34:18.542085Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 77 containers, 267241 bytes total
+2026-04-15T08:34:18.543249Z  INFO Bootstrap: stored 77 blocks (total: 904)
+2026-04-15T08:34:18.543360Z  INFO Bootstrap: recursive GetAncestors depth=6 req=17278 (total blocks so far: 904)
+2026-04-15T08:34:18.702575Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 77 containers, 343923 bytes total
+2026-04-15T08:34:18.703157Z  INFO Bootstrap: stored 77 blocks (total: 981)
+2026-04-15T08:34:18.703186Z  INFO Bootstrap: recursive GetAncestors depth=7 req=17279 (total blocks so far: 981)
+2026-04-15T08:34:18.861652Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 82 containers, 238177 bytes total
+2026-04-15T08:34:18.862660Z  INFO Bootstrap: stored 82 blocks (total: 1063)
+2026-04-15T08:34:18.862727Z  INFO Bootstrap: recursive GetAncestors depth=8 req=17280 (total blocks so far: 1063)
+2026-04-15T08:34:19.021030Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 83 containers, 358850 bytes total
+2026-04-15T08:34:19.022046Z  INFO Bootstrap: stored 83 blocks (total: 1146)
+2026-04-15T08:34:19.022100Z  INFO Bootstrap: recursive GetAncestors depth=9 req=17281 (total blocks so far: 1146)
+2026-04-15T08:34:19.180101Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 75 containers, 672651 bytes total
+2026-04-15T08:34:19.181630Z  INFO Bootstrap: stored 75 blocks (total: 1221)
+2026-04-15T08:34:19.181703Z  INFO Bootstrap: recursive GetAncestors depth=10 req=17282 (total blocks so far: 1221)
+2026-04-15T08:34:19.340754Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 86 containers, 684706 bytes total
+2026-04-15T08:34:19.341951Z  INFO Bootstrap: stored 86 blocks (total: 1307)
+2026-04-15T08:34:19.341971Z  INFO Bootstrap: reached max depth (10 rounds, 1307 blocks), stopping fetch
+2026-04-15T08:34:19.341980Z  INFO Bootstrap P-Chain complete with 52.29.72.46:9651 — 1307 total blocks stored
+2026-04-15T08:34:19.341988Z  INFO Sync engine: transitioned to Following (live chain tracking)
+2026-04-15T08:34:19.341995Z  INFO Chain walk: starting from tip 7ce9361e…532ac805
+2026-04-15T08:34:19.342009Z  INFO Found tip in DB: 7ce9361e…
+2026-04-15T08:34:19.342046Z  INFO Chain walk tip block: height=273714, type=ApricotCommit
+2026-04-15T08:34:19.351191Z  INFO Chain walk: parent not in DB after 1307 blocks (chain may be incomplete, may need more fetch rounds)
+2026-04-15T08:34:19.351235Z  INFO P-Chain chain walk: 1307 blocks linked from tip
+2026-04-15T08:34:19.351307Z  INFO C-Chain Bootstrap: sent GetAccepted (req=19270) to 52.29.72.46:9651
+2026-04-15T08:34:19.451352Z  INFO Accepted from 52.29.72.46:9651 — 1 block IDs
+2026-04-15T08:34:19.451474Z  INFO C-Chain Bootstrap: sent GetAncestors (req=19271) to 52.29.72.46:9651
+2026-04-15T08:34:19.685361Z  INFO C-Chain Ancestors from 52.29.72.46:9651 — 592 containers, 1672651 bytes total
+2026-04-15T08:34:19.686820Z  INFO C-Chain block format debug: first 20 bytes = [f9, 03, 65, f9, 02, 6b, a0, 1e, d7, 56, f7, 60, 43, ee, b8, 65, 14, dc, b8, 95] (total 872 bytes)
+2026-04-15T08:34:19.686866Z  INFO C-Chain block: detected raw RLP long list (0xf9 prefix)
+2026-04-15T08:34:21.670143Z  INFO C-Chain Bootstrap: stored 592 blocks (total: 592)
+2026-04-15T08:34:21.670211Z  INFO C-Chain Bootstrap: recursive GetAncestors depth=1 req=19272 (total: 592)
+2026-04-15T08:34:21.769326Z  INFO AcceptedFrontier from 52.29.72.46:9651 — tip=7ce9361e0a73f8ec...
+2026-04-15T08:34:21.769371Z  INFO Continuous sync: new tip detected 7ce9361e0a73f8ec... from 52.29.72.46:9651
+2026-04-15T08:34:21.769416Z  INFO Continuous sync: GetAccepted req=27273 for new tip
+2026-04-15T08:34:22.295236Z  INFO C-Chain Ancestors from 52.29.72.46:9651 — 544 containers, 1674177 bytes total
+2026-04-15T08:34:23.620847Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:34:24.339282Z  INFO C-Chain Bootstrap: stored 544 blocks (total: 1136)
+2026-04-15T08:34:24.339370Z  INFO C-Chain Bootstrap: recursive GetAncestors depth=2 req=19273 (total: 1136)
+2026-04-15T08:34:24.339452Z  INFO AcceptedFrontier from 52.29.72.46:9651 — tip=1721735c3663c93b...
+2026-04-15T08:34:24.339463Z  INFO Accepted from 52.29.72.46:9651 — 1 block IDs
+2026-04-15T08:34:24.339477Z  INFO Bootstrap: sent GetAncestors (req=27274) to 52.29.72.46:9651
+2026-04-15T08:34:24.856458Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 305 containers, 1647171 bytes total
+2026-04-15T08:34:24.864207Z  INFO Stored 305 blocks via parent-chain linking (tip=7ce9361e…, 305 containers)
+2026-04-15T08:34:24.864226Z  INFO Bootstrap: stored 305 blocks (total: 305)
+2026-04-15T08:34:24.864297Z  INFO Bootstrap: recursive GetAncestors depth=1 req=27275 (total blocks so far: 305)
+2026-04-15T08:34:24.972657Z  INFO C-Chain Ancestors from 52.29.72.46:9651 — 499 containers, 1673721 bytes total
+2026-04-15T08:34:26.618306Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:34:26.618782Z  INFO C-Chain: 1136 blocks synced, 1521 stateRoot mappings
+2026-04-15T08:34:27.012990Z  INFO C-Chain Bootstrap: stored 499 blocks (total: 1635)
+2026-04-15T08:34:27.013059Z  INFO C-Chain Bootstrap: recursive GetAncestors depth=3 req=19274 (total: 1635)
+2026-04-15T08:34:27.014018Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 213 containers, 1676454 bytes total
+2026-04-15T08:34:27.015715Z  INFO Bootstrap: stored 213 blocks (total: 518)
+2026-04-15T08:34:27.015755Z  INFO Bootstrap: recursive GetAncestors depth=2 req=27276 (total blocks so far: 518)
+2026-04-15T08:34:27.542989Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 349 containers, 1675570 bytes total
+2026-04-15T08:34:27.546292Z  INFO Bootstrap: stored 349 blocks (total: 867)
+2026-04-15T08:34:27.546363Z  INFO Bootstrap: recursive GetAncestors depth=3 req=27277 (total blocks so far: 867)
+2026-04-15T08:34:27.652592Z  INFO C-Chain Ancestors from 52.29.72.46:9651 — 555 containers, 1674019 bytes total
+2026-04-15T08:34:28.620463Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:34:29.494825Z  INFO C-Chain Bootstrap: stored 555 blocks (total: 2190)
+2026-04-15T08:34:29.495085Z  INFO C-Chain Bootstrap: recursive GetAncestors depth=4 req=19275 (total: 2190)
+2026-04-15T08:34:29.496232Z  INFO P-Chain Ancestors from 52.29.72.46:9651 — 352 containers, 1674046 bytes total
+2026-04-15T08:34:29.499449Z  INFO Bootstrap: stored 352 blocks (total: 1219)
+2026-04-15T08:34:29.499508Z  INFO Bootstrap: recursive GetAncestors depth=4 req=27278 (total blocks so far: 1219)
+2026-04-15T08:34:33.620056Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:34:36.619229Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:34:36.620282Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:34:38.620378Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:34:43.620523Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:34:46.618712Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:34:46.620304Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:34:48.620523Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:34:53.620212Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:34:56.618427Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:34:56.620480Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:34:58.620926Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:03.620407Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:06.618182Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:35:06.619702Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:35:08.621151Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:08.621219Z  INFO P-Chain analysis: 1307 blocks synced, genesis height 0, tip height 273714, chain length 1307, tip hash 0x7ce9361e0a73f8ec9de994893e4d8775a40301a14fba6955af955dc0532ac805
+2026-04-15T08:35:08.621234Z  INFO C-Chain analysis: 2190 blocks synced, tip height 54133686, tip hash 0x9e2b5f7148810ffd26ce70e7fe398b87d02a2bc8bcc9321ecd603bffc830d137
+2026-04-15T08:35:13.620929Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:16.618166Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:35:16.619176Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:35:18.657405Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:23.620350Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:26.618578Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:35:26.619454Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:35:28.620549Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:33.620760Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:36.618470Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:35:36.619336Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:35:38.619537Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:43.620068Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:46.617953Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:35:46.618526Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:35:48.621222Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:53.619834Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:35:56.618690Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:35:56.619660Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:35:58.620097Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:03.620474Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:06.619174Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:36:06.621820Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:36:08.620690Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:13.621023Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:16.618245Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:36:16.619296Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:36:18.620432Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:23.620341Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:26.618312Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:36:26.619171Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:36:28.621243Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:33.620927Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:36.619172Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:36:36.619903Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:36:38.620690Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:43.621101Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:46.618885Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:36:46.620613Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:36:48.620877Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:53.621141Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:36:56.618448Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:36:56.619952Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:36:58.620567Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:03.620822Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:06.617799Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:37:06.619670Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:37:08.620731Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:13.620735Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:16.618160Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:37:16.619702Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:37:18.621032Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:23.619535Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:26.618438Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:37:26.619113Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:37:28.620393Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:33.620963Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:36.618398Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:37:36.618909Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:37:38.620482Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:43.620401Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:46.617862Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:37:46.619407Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:37:48.620563Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:53.620743Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:37:56.618499Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:37:56.622601Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:37:58.621106Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:03.620628Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:06.619200Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:38:06.620018Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:38:08.621990Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:13.620755Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:16.618897Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:38:16.619592Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:38:18.620631Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:23.620697Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:26.619247Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:38:26.620413Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:38:28.620500Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:33.620596Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:36.618361Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:38:36.619398Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:38:38.619533Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:43.621175Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:46.618814Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:38:46.619422Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:38:48.620492Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:53.620581Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:38:56.618984Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:38:56.620617Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:38:58.620651Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:03.620830Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:06.617642Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:39:06.619364Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:39:08.619887Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:13.620690Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:16.618378Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:39:16.619486Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:39:18.619960Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:23.620795Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:26.619211Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:39:26.620724Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:39:28.620842Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:33.620611Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:36.619148Z  INFO P-Chain: 1307 blocks synced, height 0→273714, chain length 1307
+2026-04-15T08:39:36.619942Z  INFO C-Chain: 2190 blocks synced, 2190 stateRoot mappings
+2026-04-15T08:39:38.620532Z  INFO Sync: phase=following, blocks=0, 0.0%
+2026-04-15T08:39:42.592187Z  INFO Received SIGTERM, shutting down gracefully...
+2026-04-15T08:39:42.593473Z  INFO Shutting down after 336.0s uptime
+2026-04-15T08:39:42.593506Z  INFO avalanche-rs stopped.

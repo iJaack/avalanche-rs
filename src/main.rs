@@ -47,13 +47,12 @@ use avalanche_rs::archive::ArchiveStore;
 use avalanche_rs::block::{
     cchain_block_id, extract_cchain_atomic_transactions, extract_cchain_block_fields,
     extract_cchain_transactions, parse_cchain_network_block, parse_raw_cchain_transaction,
-    BlockHeader, BlockMetadata, CChainRawTx, Chain, ChainGraph,
+    BlockHeader, BlockMetadata, CChainRawTx, Chain,
 };
-use avalanche_rs::consensus::SnowmanConsensus;
 use avalanche_rs::db::{
     AccountState, Database, CF_ARCHIVE_STATE, CF_ARCHIVE_STORAGE, CF_BLOCKS, CF_STATE_ROOTS,
 };
-use avalanche_rs::debug::{EvmTracer, TraceConfig, TracerType};
+use avalanche_rs::debug::{EvmTracer, TraceConfig, TraceConfigInput, TracerType};
 use avalanche_rs::evm::{
     ArchivedAccountDiff, BlockContext, EvmExecutor, EvmTransaction, TxReceipt,
 };
@@ -1785,17 +1784,6 @@ fn dial_new_peers(new_peers: Vec<PeerInfo>, node: Arc<NodeState>) {
     }
 }
 
-/// Read one length-prefixed protobuf message from a TLS stream.
-async fn read_one_message<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    stream: &mut S,
-    addr: SocketAddr,
-    timeout_secs: u64,
-) -> Result<NetworkMessage, Box<dyn std::error::Error + Send + Sync>> {
-    read_one_decoded_message(stream, addr, timeout_secs)
-        .await
-        .map(|decoded| decoded.message)
-}
-
 #[derive(Debug, Clone, Default)]
 struct HandshakeMetadata {
     public_ip: Option<SocketAddr>,
@@ -3020,209 +3008,9 @@ async fn connect_and_handshake_with_timeouts(
     Ok(())
 }
 
-// bootstrap_p_chain removed — bootstrap logic now lives inside the message loop as a state machine.
-// Keeping this dead code block here as a tombstone to avoid merge confusion.
-#[allow(dead_code)]
-async fn bootstrap_p_chain<S>(stream: &mut S, addr: std::net::SocketAddr, request_id_base: u32)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let p_chain_id = ChainId([0u8; 32]);
-    let deadline_ns = 5_000_000_000u64; // 5 seconds in nanoseconds
-
-    // Step 1: GetAcceptedFrontier
-    let req = NetworkMessage::GetAcceptedFrontier {
-        chain_id: p_chain_id.clone(),
-        request_id: request_id_base,
-        deadline: deadline_ns,
-    };
-    if let Ok(encoded) = req.encode_proto() {
-        if let Err(e) = stream.write_all(&encoded).await {
-            warn!(
-                "bootstrap: failed to send GetAcceptedFrontier to {}: {}",
-                addr, e
-            );
-            return;
-        }
-        let _ = stream.flush().await;
-        info!(
-            "bootstrap: sent GetAcceptedFrontier (req={}) to {}",
-            request_id_base, addr
-        );
-    }
-
-    // Step 2: Wait for AcceptedFrontier
-    let frontier_block_id = loop {
-        match read_one_message(stream, addr, 30).await {
-            Ok(NetworkMessage::AcceptedFrontier {
-                request_id,
-                container_id,
-                ..
-            }) if request_id == request_id_base => {
-                info!(
-                    "bootstrap: AcceptedFrontier from {} — tip={}",
-                    addr, container_id
-                );
-                break container_id;
-            }
-            Ok(NetworkMessage::Ping { uptime }) => {
-                // Respond to pings while waiting
-                let pong = NetworkMessage::Pong { uptime };
-                if let Ok(enc) = pong.encode_proto() {
-                    let _ = stream.write_all(&enc).await;
-                    let _ = stream.flush().await;
-                }
-            }
-            Ok(other) => {
-                debug!(
-                    "bootstrap: ignoring {} while waiting for AcceptedFrontier",
-                    other.name()
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "bootstrap: error waiting for AcceptedFrontier from {}: {}",
-                    addr, e
-                );
-                return;
-            }
-        }
-    };
-
-    if frontier_block_id.0 == [0u8; 32] {
-        info!(
-            "bootstrap: peer {} has empty frontier — nothing to bootstrap",
-            addr
-        );
-        return;
-    }
-
-    // Step 3: GetAccepted
-    let req = NetworkMessage::GetAccepted {
-        chain_id: p_chain_id.clone(),
-        request_id: request_id_base + 1,
-        deadline: deadline_ns,
-        container_ids: vec![frontier_block_id.clone()],
-    };
-    if let Ok(encoded) = req.encode_proto() {
-        if let Err(e) = stream.write_all(&encoded).await {
-            warn!("bootstrap: failed to send GetAccepted to {}: {}", addr, e);
-            return;
-        }
-        let _ = stream.flush().await;
-        info!(
-            "bootstrap: sent GetAccepted (req={}) to {}",
-            request_id_base + 1,
-            addr
-        );
-    }
-
-    // Step 4: Wait for Accepted
-    let accepted_ids = loop {
-        match read_one_message(stream, addr, 30).await {
-            Ok(NetworkMessage::Accepted {
-                request_id,
-                container_ids,
-                ..
-            }) if request_id == request_id_base + 1 => {
-                info!(
-                    "bootstrap: Accepted from {} — {} block IDs",
-                    addr,
-                    container_ids.len()
-                );
-                break container_ids;
-            }
-            Ok(NetworkMessage::Ping { uptime }) => {
-                let pong = NetworkMessage::Pong { uptime };
-                if let Ok(enc) = pong.encode_proto() {
-                    let _ = stream.write_all(&enc).await;
-                    let _ = stream.flush().await;
-                }
-            }
-            Ok(other) => {
-                debug!(
-                    "bootstrap: ignoring {} while waiting for Accepted",
-                    other.name()
-                );
-            }
-            Err(e) => {
-                warn!("bootstrap: error waiting for Accepted from {}: {}", addr, e);
-                return;
-            }
-        }
-    };
-
-    if accepted_ids.is_empty() {
-        info!("bootstrap: peer {} accepted no blocks from our set", addr);
-        return;
-    }
-
-    // Step 5: GetAncestors for the first accepted block
-    let target = &accepted_ids[0];
-    let req = NetworkMessage::GetAncestors {
-        chain_id: p_chain_id.clone(),
-        request_id: request_id_base + 2,
-        deadline: deadline_ns,
-        container_id: target.clone(),
-        max_containers_size: 2_000_000,
-    };
-    if let Ok(encoded) = req.encode_proto() {
-        if let Err(e) = stream.write_all(&encoded).await {
-            warn!("bootstrap: failed to send GetAncestors to {}: {}", addr, e);
-            return;
-        }
-        let _ = stream.flush().await;
-        info!(
-            "bootstrap: sent GetAncestors (req={}) for block {} to {}",
-            request_id_base + 2,
-            target,
-            addr
-        );
-    }
-
-    // Step 6: Wait for Ancestors
-    loop {
-        match read_one_message(stream, addr, 30).await {
-            Ok(NetworkMessage::Ancestors {
-                request_id,
-                containers,
-                ..
-            }) if request_id == request_id_base + 2 => {
-                info!(
-                    "bootstrap: Ancestors from {} — {} containers, total {} bytes",
-                    addr,
-                    containers.len(),
-                    containers.iter().map(|c| c.len()).sum::<usize>()
-                );
-                for (i, c) in containers.iter().enumerate() {
-                    debug!("  container[{}]: {} bytes", i, c.len());
-                }
-                break;
-            }
-            Ok(NetworkMessage::Ping { uptime }) => {
-                let pong = NetworkMessage::Pong { uptime };
-                if let Ok(enc) = pong.encode_proto() {
-                    let _ = stream.write_all(&enc).await;
-                    let _ = stream.flush().await;
-                }
-            }
-            Ok(other) => {
-                debug!(
-                    "bootstrap: ignoring {} while waiting for Ancestors",
-                    other.name()
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "bootstrap: error waiting for Ancestors from {}: {}",
-                    addr, e
-                );
-                break;
-            }
-        }
-    }
-}
-
+// ---------------------------------------------------------------------------
+// Validator: Block builder
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Validator: Block builder
 // ---------------------------------------------------------------------------
@@ -4372,15 +4160,36 @@ async fn ws_disconnect(node: &NodeState, connection_id: u64) {
         .disconnect(connection_id);
 }
 
+fn cchain_rpc_block_bytes(block_data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if let Some(network_block) = parse_cchain_network_block(block_data) {
+        std::borrow::Cow::Owned(network_block.inner_block)
+    } else {
+        std::borrow::Cow::Borrowed(block_data)
+    }
+}
+
+fn cchain_rpc_block_header(block_data: &[u8]) -> Option<BlockHeader> {
+    BlockHeader::parse(block_data, Chain::CChain)
+        .ok()
+        .or_else(|| {
+            if block_data.len() >= 6 && block_data[0] == 0x00 && block_data[1] == 0x00 {
+                BlockHeader::parse(&block_data[6..], Chain::CChain).ok()
+            } else {
+                None
+            }
+        })
+}
+
 fn websocket_block_header_from_cchain(block_data: &[u8]) -> Option<WsBlockHeader> {
-    let header = BlockHeader::parse(block_data, Chain::CChain).ok()?;
-    let fields = extract_cchain_block_fields(block_data)?;
+    let block_data = cchain_rpc_block_bytes(block_data);
+    let header = cchain_rpc_block_header(&block_data)?;
+    let fields = extract_cchain_block_fields(&block_data)?;
     Some(WsBlockHeader {
         number: fields.number,
         hash: header.id,
         parent_hash: header.parent_id,
         timestamp: fields.timestamp,
-        state_root: BlockHeader::extract_state_root(block_data).unwrap_or([0u8; 32]),
+        state_root: BlockHeader::extract_state_root(&block_data).unwrap_or([0u8; 32]),
         gas_limit: fields.gas_limit,
         gas_used: fields.gas_used,
     })
@@ -11499,11 +11308,12 @@ fn rpc_block_from_cchain_data(
     block_data: &[u8],
     include_full_txs: bool,
 ) -> Option<serde_json::Value> {
-    let header = BlockHeader::parse(block_data, Chain::CChain).ok()?;
-    let fields = extract_cchain_block_fields(block_data)?;
-    let block_hash = cchain_block_hash(block_data);
-    let state_root = BlockHeader::extract_state_root(block_data).unwrap_or([0u8; 32]);
-    let txs = extract_cchain_transactions(block_data);
+    let block_data = cchain_rpc_block_bytes(block_data);
+    let header = cchain_rpc_block_header(&block_data)?;
+    let fields = extract_cchain_block_fields(&block_data)?;
+    let block_hash = cchain_block_hash(&block_data);
+    let state_root = BlockHeader::extract_state_root(&block_data).unwrap_or([0u8; 32]);
+    let txs = extract_cchain_transactions(&block_data);
     let transactions: Vec<serde_json::Value> = txs
         .iter()
         .enumerate()
@@ -13958,7 +13768,12 @@ async fn handle_rpc_request_for_path_with_access(
         // -----------------------------------------------------------------
         "debug_traceTransaction" => {
             let hash_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0");
-            let config = TraceConfig::from_json(params.get(1).unwrap_or(&serde_json::Value::Null));
+            let config = params
+                .get(1)
+                .cloned()
+                .and_then(|value| serde_json::from_value::<TraceConfigInput>(value).ok())
+                .map(TraceConfig::from_input)
+                .unwrap_or_default();
             match parse_hex_hash(hash_str) {
                 Some(hash) => {
                     if let Some(tx) = node.txpool.read().await.get(&hash).cloned() {
@@ -13993,7 +13808,12 @@ async fn handle_rpc_request_for_path_with_access(
         "debug_traceBlockByNumber" => {
             let block_num =
                 parse_block_number(params.get(0).unwrap_or(&serde_json::Value::Null), node);
-            let config = TraceConfig::from_json(params.get(1).unwrap_or(&serde_json::Value::Null));
+            let config = params
+                .get(1)
+                .cloned()
+                .and_then(|value| serde_json::from_value::<TraceConfigInput>(value).ok())
+                .map(TraceConfig::from_input)
+                .unwrap_or_default();
             if load_canonical_cchain_block_by_number(
                 &node.db,
                 block_num,
@@ -14525,150 +14345,6 @@ async fn run_consensus_loop(node: Arc<NodeState>) {
             log_chain_metrics(&node).await;
         }
     }
-}
-
-/// Read all blocks from RocksDB, parse headers, build chain graphs, run Snowman.
-/// Tasks 2, 3, and 4 are all executed here.
-#[allow(dead_code)]
-fn analyze_chain_graphs(node: &NodeState) {
-    info!("Starting chain graph analysis...");
-
-    // -------------------------------------------------------------------------
-    // Task 2 + 4: Scan CF_BLOCKS, partition into P-Chain and C-Chain
-    // -------------------------------------------------------------------------
-    let all_blocks = node.db.iter_cf_owned(CF_BLOCKS);
-    info!("Loaded {} raw block entries from DB", all_blocks.len());
-
-    let mut p_headers: Vec<BlockHeader> = Vec::new();
-    let mut c_headers: Vec<BlockHeader> = Vec::new();
-    let mut parse_errors = 0usize;
-
-    // C-Chain blocks are stored with b"c:" (2-byte) prefix on the key
-    let c_prefix = b"c:";
-
-    for (key, value) in &all_blocks {
-        let is_cchain = key.len() == 34 && &key[..2] == c_prefix;
-        let chain = if is_cchain {
-            Chain::CChain
-        } else {
-            Chain::PChain
-        };
-
-        match BlockHeader::parse(value, chain) {
-            Ok(header) => {
-                if is_cchain {
-                    c_headers.push(header);
-                } else {
-                    p_headers.push(header);
-                }
-            }
-            Err(e) => {
-                parse_errors += 1;
-                if parse_errors <= 5 {
-                    debug!("Block parse error ({:?}): {}", chain, e);
-                }
-            }
-        }
-    }
-
-    info!(
-        "Parsed {} P-Chain blocks, {} C-Chain blocks ({} errors)",
-        p_headers.len(),
-        c_headers.len(),
-        parse_errors
-    );
-
-    // -------------------------------------------------------------------------
-    // Task 2: Build P-Chain graph + log summary
-    // -------------------------------------------------------------------------
-    if !p_headers.is_empty() {
-        let p_graph = ChainGraph::build(p_headers.iter().cloned());
-        let genesis_height = p_graph
-            .genesis_id
-            .and_then(|id| p_graph.headers.get(&id))
-            .map(|h| h.height)
-            .unwrap_or(0);
-        let fork_msg = if p_graph.fork_count == 0 {
-            "no forks".to_string()
-        } else {
-            format!("{} fork(s)", p_graph.fork_count)
-        };
-        info!(
-            "P-Chain: genesis at height {}, tip at height {}, {} total blocks, {}",
-            genesis_height,
-            p_graph.tip_height,
-            p_graph.headers.len(),
-            fork_msg
-        );
-
-        // -------------------------------------------------------------------------
-        // Task 3: Run Snowman consensus — accept blocks from genesis to tip
-        // -------------------------------------------------------------------------
-        let mut sc = SnowmanConsensus::new();
-        // Walk from genesis toward tip in height order
-        let mut ordered: Vec<&BlockHeader> = p_graph.headers.values().collect();
-        ordered.sort_by_key(|h| h.height);
-        for header in &ordered {
-            sc.accept_block(header);
-        }
-        info!(
-            "P-Chain Snowman: accepted {} blocks, tip at height {}",
-            sc.accepted_count(),
-            sc.last_accepted_height
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Task 4: C-Chain EVM analysis
-    // -------------------------------------------------------------------------
-    if !c_headers.is_empty() {
-        let c_graph = ChainGraph::build(c_headers.iter().cloned());
-        let fork_msg = if c_graph.fork_count == 0 {
-            "no forks".to_string()
-        } else {
-            format!("{} fork(s)", c_graph.fork_count)
-        };
-        info!(
-            "C-Chain: tip at height {}, {} total blocks, {}",
-            c_graph.tip_height,
-            c_graph.headers.len(),
-            fork_msg
-        );
-
-        // Log per-block stats (limit to avoid log flood)
-        let mut ordered: Vec<&BlockHeader> = c_graph.headers.values().collect();
-        ordered.sort_by_key(|h| h.height);
-        let logged = ordered.len().min(10);
-        for header in &ordered[..logged] {
-            // We don't have tx count from header alone, but log what we have
-            info!(
-                "C-Chain block #{}: size={} bytes, ts={}",
-                header.height, header.raw_size, header.timestamp
-            );
-        }
-        if ordered.len() > 10 {
-            info!("  ... and {} more C-Chain blocks", ordered.len() - 10);
-        }
-
-        // Run Snowman on C-Chain too
-        let mut sc = SnowmanConsensus::new();
-        for header in &ordered {
-            sc.accept_block(header);
-        }
-        info!(
-            "C-Chain Snowman: accepted {} blocks, tip at height {}",
-            sc.accepted_count(),
-            sc.last_accepted_height
-        );
-
-        // Validate chain_id via EVM executor (Task 4 — at least check chain_id)
-        info!(
-            "C-Chain EVM: chain_id={} (configured for this node)",
-            node.config.chain_id
-        );
-    }
-
-    info!("Chain graph analysis complete.");
 }
 
 fn init_logging(level: &str, format: &str) {

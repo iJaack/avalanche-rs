@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::routes::AppState;
+use super::AppState;
 
 // ---------------------------------------------------------------------------
 // Response types (hex-encoded for JSON)

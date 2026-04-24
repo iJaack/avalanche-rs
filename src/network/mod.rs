@@ -21,21 +21,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-/// Unique identifier for a node in the Avalanche network (20-byte NodeID).
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeId(pub [u8; 20]);
+// Unique identifier for a node in the Avalanche network (20-byte NodeID).
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct NodeId(20);
+}
 
 impl NodeId {
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() == 20 {
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(bytes);
-            Some(Self(arr))
-        } else {
-            None
-        }
-    }
-
     pub fn random_for_test() -> Self {
         let mut arr = [0u8; 20];
         let now = SystemTime::now()
@@ -62,23 +54,15 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// Block hash (32 bytes, like ids.ID in Go).
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BlockId(pub [u8; 32]);
+// Block hash (32 bytes, like ids.ID in Go).
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct BlockId(32);
+}
 
 impl BlockId {
     pub fn zero() -> Self {
-        Self([0u8; 32])
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(bytes);
-            Some(Self(arr))
-        } else {
-            None
-        }
+        Self::ZERO
     }
 }
 
@@ -91,9 +75,11 @@ impl fmt::Display for BlockId {
     }
 }
 
-/// Chain identifier.
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ChainId(pub [u8; 32]);
+// Chain identifier.
+fixed_bytes_type! {
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct ChainId(32);
+}
 
 /// All message types exchanged over the Avalanche P2P protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,6 +23,15 @@ impl BloomFilter {
         }
     }
 
+    /// Reconstruct a bloom filter from raw bytes.
+    pub fn from_bytes(bytes: &[u8], num_hashes: u8) -> Self {
+        Self {
+            bits: bytes.to_vec(),
+            num_bits: bytes.len() * 8,
+            num_hashes,
+        }
+    }
+
     /// Create with optimal parameters for expected elements and false positive rate.
     /// Uses integer approximation to avoid requiring std's f64::ln().
     pub fn with_capacity(expected_elements: usize, _fp_rate: f64) -> Self {

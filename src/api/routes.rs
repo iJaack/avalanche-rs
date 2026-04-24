@@ -4,10 +4,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::indexer::IndexerQuery;
 
-use super::handlers;
-
-/// Shared state for API handlers.
-pub type AppState = Arc<IndexerQuery>;
+use super::{handlers, AppState};
 
 /// Build the Axum router with all REST endpoints.
 pub fn router(query: IndexerQuery) -> Router {

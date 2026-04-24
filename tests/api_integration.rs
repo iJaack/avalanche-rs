@@ -4,6 +4,8 @@
 
 #![cfg(feature = "indexer")]
 
+mod common;
+
 use avalanche_rs::{
     api::routes,
     indexer::{IndexedBlock, IndexedLog, IndexedTransaction, IndexerQuery, IndexerWriter},
@@ -11,8 +13,7 @@ use avalanche_rs::{
 use axum::http::StatusCode;
 use chrono::{Duration, TimeZone, Utc};
 use serial_test::serial;
-use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::sync::OnceLock;
+use sqlx::PgPool;
 use std::time::Duration as StdDuration;
 use tower::ServiceExt;
 
@@ -20,91 +21,12 @@ use tower::ServiceExt;
 // SETUP
 // ============================================================================
 
-static TEST_DB_NAME: OnceLock<String> = OnceLock::new();
-
-fn test_database_name() -> String {
-    TEST_DB_NAME
-        .get_or_init(|| format!("api_integration_{}", std::process::id()))
-        .clone()
-}
-
-async fn ensure_test_database() -> bool {
-    let db_name = test_database_name();
-    let admin_pool = match PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect("postgresql:///postgres")
-        .await
-    {
-        Ok(pool) => pool,
-        Err(e) => {
-            eprintln!("Skipping DB-backed test: failed to connect to postgres admin db: {e}");
-            return false;
-        }
-    };
-
-    let exists: Option<(i32,)> =
-        match sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(&db_name)
-            .fetch_optional(&admin_pool)
-            .await
-        {
-            Ok(exists) => exists,
-            Err(e) => {
-                eprintln!("Skipping DB-backed test: failed to check test database existence: {e}");
-                admin_pool.close().await;
-                return false;
-            }
-        };
-
-    if exists.is_none() {
-        if let Err(e) = sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
-            .execute(&admin_pool)
-            .await
-        {
-            eprintln!("Skipping DB-backed test: failed to create test database: {e}");
-            admin_pool.close().await;
-            return false;
-        }
-    }
-
-    admin_pool.close().await;
-    true
+async fn setup_pool() -> Option<PgPool> {
+    common::setup_indexer_pool("api_integration", true).await
 }
 
 fn test_database_url() -> String {
-    format!("postgresql:///{}", test_database_name())
-}
-
-async fn setup_pool() -> Option<PgPool> {
-    if !ensure_test_database().await {
-        return None;
-    }
-    let url = test_database_url();
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(StdDuration::from_secs(5))
-        .connect(&url)
-        .await
-        .expect("Failed to connect to test DB");
-
-    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
-        eprintln!("Skipping DB-backed test: failed to run migrations: {e}");
-        return None;
-    }
-
-    let _ = sqlx::query("DELETE FROM logs").execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM transactions").execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM blocks").execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM address_balances")
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM indexer_state WHERE key NOT IN ('indexer_version')")
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("INSERT INTO indexer_state (key, value_int, updated_at) VALUES ('last_indexed_block', 0, NOW()) ON CONFLICT (key) DO UPDATE SET value_int = 0, updated_at = NOW()").execute(&pool).await;
-
-    Some(pool)
+    common::test_database_url("api_integration")
 }
 
 fn make_block(number: i64, tx_count: usize) -> IndexedBlock {
@@ -189,10 +111,6 @@ fn make_block(number: i64, tx_count: usize) -> IndexedBlock {
     }
 }
 
-// ============================================================================
-// TEST: Health endpoint
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_health_endpoint() {
@@ -217,10 +135,6 @@ async fn test_health_endpoint() {
 
     pool.close().await;
 }
-
-// ============================================================================
-// TEST: Get block by number
-// ============================================================================
 
 #[serial]
 #[tokio::test]
@@ -264,10 +178,6 @@ async fn test_get_block_by_number() {
     writer.close().await;
     pool.close().await;
 }
-
-// ============================================================================
-// TEST: Get block by hash
-// ============================================================================
 
 #[serial]
 #[tokio::test]
@@ -313,10 +223,6 @@ async fn test_get_block_by_hash() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Get block by invalid hash (400)
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_get_block_invalid_hash_format() {
@@ -341,10 +247,6 @@ async fn test_get_block_invalid_hash_format() {
 
     pool.close().await;
 }
-
-// ============================================================================
-// TEST: Get transaction by hash
-// ============================================================================
 
 #[serial]
 #[tokio::test]
@@ -391,10 +293,6 @@ async fn test_get_transaction_by_hash() {
     writer.close().await;
     pool.close().await;
 }
-
-// ============================================================================
-// TEST: Get address transactions
-// ============================================================================
 
 #[serial]
 #[tokio::test]
@@ -444,10 +342,6 @@ async fn test_get_address_transactions() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Get logs with filters
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_get_logs_with_address_filter() {
@@ -495,10 +389,6 @@ async fn test_get_logs_with_address_filter() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Pagination parameters
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_pagination_limit_and_offset() {
@@ -508,7 +398,6 @@ async fn test_pagination_limit_and_offset() {
 
     let writer = IndexerWriter::new(&test_database_url()).await.unwrap();
 
-    // Create blocks with same sender
     for i in 1..=5 {
         let block = make_block(i, 1);
         writer.index_block(block).await;
@@ -557,10 +446,6 @@ async fn test_pagination_limit_and_offset() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Metrics endpoint
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_metrics_endpoint() {
@@ -589,7 +474,6 @@ async fn test_metrics_endpoint() {
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
 
-    // Prometheus format: should contain HELP and TYPE lines
     assert!(text.contains("indexer_blocks_indexed_total"));
     assert!(text.contains("indexer_queue_depth"));
     assert!(text.contains("indexer_lag_blocks"));
@@ -597,10 +481,6 @@ async fn test_metrics_endpoint() {
 
     pool.close().await;
 }
-
-// ============================================================================
-// TEST: 404 Not Found
-// ============================================================================
 
 #[serial]
 #[tokio::test]
@@ -627,10 +507,6 @@ async fn test_nonexistent_block_returns_404() {
     pool.close().await;
 }
 
-// ============================================================================
-// TEST: Hex encoding round-trip
-// ============================================================================
-
 #[serial]
 #[tokio::test]
 async fn test_hex_encoding_preserves_data() {
@@ -648,7 +524,6 @@ async fn test_hex_encoding_preserves_data() {
     let query = IndexerQuery::new(pool.clone());
     let fetched = query.get_block_by_number(500).await.unwrap().unwrap();
 
-    // Verify hex encoding didn't truncate or corrupt the data
     assert!(fetched.hash.len() == 32);
     assert!(fetched.parent_hash.len() == 32);
 

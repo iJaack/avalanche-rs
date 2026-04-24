@@ -87,9 +87,8 @@ impl BlockHeader {
     /// - Bytes `[0..2]`: codec version
     /// - Bytes `[2..6]`: typeID (uint32 BE = 29)
     /// - Bytes `[6..14]`: timestamp/Time (uint64 BE)
-    /// - Bytes `[14..18]`: Transactions slice length (uint32 BE, usually 0)
-    /// - Bytes `[18..50]`: parentID (32 bytes)
-    /// - Bytes `[50..58]`: height (uint64 BE)
+    /// - Bytes `[14..18]`: decision transactions slice length (uint32 BE)
+    /// - Bytes `[18..]`: decision transactions, then parentID (32 bytes), height (uint64 BE), proposal tx
     ///
     /// **C-Chain block layout:** RLP-encoded Ethereum block (possibly with Avalanche wrapper).
     pub fn parse(raw: &[u8], chain: Chain) -> Result<Self, String> {
@@ -188,9 +187,8 @@ impl BlockHeader {
         let type_id = u32::from_be_bytes(raw[2..6].try_into().ok()?);
         match type_id {
             29 => {
-                // BanffProposal: ts(8) + txs_len(4) + parent(32) @ [18..50]
-                if raw.len() >= 50 {
-                    raw[18..50].try_into().ok()
+                if let Ok(offset) = banff_proposal_common_block_offset(raw) {
+                    raw[offset..offset + 32].try_into().ok()
                 } else {
                     None
                 }
@@ -284,17 +282,24 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
 
     let (parent_id, height, timestamp) = match type_id {
         29 => {
-            // BanffProposalBlock: [6..14]=Time, [14..18]=Txs_len, [18..50]=PrntID, [50..58]=Hght
+            // BanffProposalBlock:
+            // [6..14]=Time, [14..18]=decision tx count, [18..]=decision txs,
+            // followed by CommonBlock [parent(32), height(8)] and the proposal tx.
             if raw.len() < 58 {
                 return Err(format!(
                     "BanffProposalBlock too short: {} bytes (need ≥58)",
                     raw.len()
                 ));
             }
+            let common_offset = banff_proposal_common_block_offset(raw)?;
             let ts = u64::from_be_bytes(raw[6..14].try_into().unwrap());
             let mut pid = [0u8; 32];
-            pid.copy_from_slice(&raw[18..50]);
-            let h = u64::from_be_bytes(raw[50..58].try_into().unwrap());
+            pid.copy_from_slice(&raw[common_offset..common_offset + 32]);
+            let h = u64::from_be_bytes(
+                raw[common_offset + 32..common_offset + 40]
+                    .try_into()
+                    .unwrap(),
+            );
             (pid, h, ts)
         }
         30..=32 => {
@@ -314,9 +319,8 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
             (pid, h, ts)
         }
         _ => {
-            // All P-Chain blocks from Ancestors use the same wire format:
-            // [6..38]=PrntID(32), [38..46]=Timestamp(u64), [46..54]=Height(u64)
-            // This applies even to blocks with Apricot type IDs (0-4).
+            // Apricot blocks serialize CommonBlock first: [6..38]=parent, [38..46]=height.
+            // They do not include a timestamp field.
             if raw.len() < 46 {
                 return Err(format!(
                     "P-Chain block too short: {} bytes (need ≥46)",
@@ -325,15 +329,8 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
             }
             let mut pid = [0u8; 32];
             pid.copy_from_slice(&raw[6..38]);
-            if raw.len() >= 54 {
-                let ts = u64::from_be_bytes(raw[38..46].try_into().unwrap());
-                let h = u64::from_be_bytes(raw[46..54].try_into().unwrap());
-                (pid, h, ts)
-            } else {
-                // Short block: just parent + height, no timestamp
-                let h = u64::from_be_bytes(raw[38..46].try_into().unwrap());
-                (pid, h, 0)
-            }
+            let h = u64::from_be_bytes(raw[38..46].try_into().unwrap());
+            (pid, h, 0)
         }
     };
 
@@ -359,6 +356,33 @@ fn parse_pchain_block(raw: &[u8], id: BlockId) -> Result<BlockHeader, String> {
         raw_size: raw.len(),
         raw_bytes: raw.to_vec(),
     })
+}
+
+fn banff_proposal_common_block_offset(raw: &[u8]) -> Result<usize, String> {
+    if raw.len() < 18 {
+        return Err(format!(
+            "BanffProposalBlock too short: {} bytes (need ≥18)",
+            raw.len()
+        ));
+    }
+
+    let decision_count = u32::from_be_bytes(raw[14..18].try_into().unwrap()) as usize;
+    let mut offset = 18usize;
+    for _ in 0..decision_count {
+        let consumed = crate::pchain::platform_tx_len(&raw[offset..])
+            .map_err(|e| format!("BanffProposalBlock decision tx at offset {offset}: {e}"))?;
+        offset = offset
+            .checked_add(consumed)
+            .ok_or_else(|| "BanffProposalBlock decision tx offset overflow".to_string())?;
+    }
+
+    if raw.len() < offset + 40 {
+        return Err(format!(
+            "BanffProposalBlock missing CommonBlock at offset {}",
+            offset
+        ));
+    }
+    Ok(offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -726,8 +750,8 @@ pub struct CChainAtomicTx {
 /// Avalanche-wrapped and raw RLP formats).
 ///
 /// Supports legacy (type-0), EIP-2930 (type-1), and EIP-1559 (type-2)
-/// transactions. The `from` field is not recovered here — callers should
-/// pre-fund a placeholder sender or perform ECDSA recovery separately.
+/// transactions. The `from` field is not recovered here; callers should
+/// recover it separately if they need it.
 pub fn extract_cchain_transactions(raw: &[u8]) -> Vec<CChainRawTx> {
     let rlp = strip_avalanche_wrapper(raw);
     if rlp.is_empty() || rlp[0] < 0xc0 {
@@ -1799,35 +1823,13 @@ mod tests {
 
     /// Build a minimal Apricot P-Chain block for testing (type_id 0-4).
     /// Layout: [0..2]=version=0, [2..6]=type_id, [6..38]=parent_id,
-    ///         [38..46]=height, [46..54]=extra_data (readable as timestamp for test purposes).
-    fn make_apricot_block(
-        type_id: u32,
-        parent_id: [u8; 32],
-        height: u64,
-        timestamp: u64,
-    ) -> Vec<u8> {
-        let mut raw = vec![0u8; 54];
-        // Wire format (observed on Fuji v1.14.x):
-        // [0..2] codec version = 0
-        // [2..6] type ID
-        // [6..38] parent ID (32 bytes)
-        // [38..46] timestamp (uint64 BE)
-        // [46..54] height (uint64 BE)
+    ///         [38..46]=height.
+    fn make_apricot_block(type_id: u32, parent_id: [u8; 32], height: u64) -> Vec<u8> {
+        let mut raw = vec![0u8; 46];
         raw[2..6].copy_from_slice(&type_id.to_be_bytes());
         raw[6..38].copy_from_slice(&parent_id);
-        raw[38..46].copy_from_slice(&timestamp.to_be_bytes());
-        raw[46..54].copy_from_slice(&height.to_be_bytes());
+        raw[38..46].copy_from_slice(&height.to_be_bytes());
         raw
-    }
-
-    /// Alias for backward compat in tests that used make_pchain_block.
-    fn make_pchain_block(
-        type_id: u32,
-        parent_id: [u8; 32],
-        height: u64,
-        timestamp: u64,
-    ) -> Vec<u8> {
-        make_apricot_block(type_id, parent_id, height, timestamp)
     }
 
     /// Build a minimal Banff block (typeID 30/31/32).
@@ -1859,17 +1861,30 @@ mod tests {
         raw
     }
 
+    fn minimal_signed_base_tx_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&34u32.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes
+    }
+
     // -----------------------------------------------------------------------
-    // Apricot P-Chain tests (backward-compatible)
+    // Apricot P-Chain tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_parse_pchain_genesis() {
-        let raw = make_pchain_block(0, [0u8; 32], 0, 1_000_000);
+        let raw = make_apricot_block(0, [0u8; 32], 0);
         let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
         assert!(h.is_genesis());
         assert_eq!(h.height, 0);
-        assert_eq!(h.timestamp, 1_000_000);
+        assert_eq!(h.timestamp, 0);
         assert_eq!(h.block_type, BlockType::ApricotProposal);
     }
 
@@ -1883,11 +1898,11 @@ mod tests {
             (99, BlockType::Unknown(99)),
         ];
         for (type_id, expected) in cases {
-            let raw = make_pchain_block(type_id, [1u8; 32], 100, 9_999);
+            let raw = make_apricot_block(type_id, [1u8; 32], 100);
             let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
             assert_eq!(h.block_type, expected);
             assert_eq!(h.height, 100);
-            assert_eq!(h.timestamp, 9_999);
+            assert_eq!(h.timestamp, 0);
         }
     }
 
@@ -1899,7 +1914,7 @@ mod tests {
 
     #[test]
     fn test_parse_pchain_id_is_sha256() {
-        let raw = make_pchain_block(3, [2u8; 32], 7, 12345);
+        let raw = make_apricot_block(3, [2u8; 32], 7);
         let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
         assert_eq!(h.id, sha256(&raw));
         assert_eq!(h.raw_size, raw.len());
@@ -1908,15 +1923,22 @@ mod tests {
     #[test]
     fn test_parse_pchain_parent_id() {
         let parent = [0xABu8; 32];
-        let raw = make_pchain_block(1, parent, 42, 0);
+        let raw = make_apricot_block(1, parent, 42);
         let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
         assert_eq!(h.parent_id, parent);
         assert!(!h.is_genesis());
     }
 
-    // -----------------------------------------------------------------------
-    // Banff P-Chain tests — fixes the height extraction bug
-    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_apricot_abort_height_ignores_trailing_bytes() {
+        let mut raw = make_apricot_block(1, [0xABu8; 32], 27_103);
+        raw.extend_from_slice(&[0x00, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x69, 0xdf]);
+
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+        assert_eq!(h.block_type, BlockType::ApricotAbort);
+        assert_eq!(h.height, 27_103);
+        assert_ne!(h.height, 8_444_249_301_346_783);
+    }
 
     #[test]
     fn test_parse_banff_standard_block() {
@@ -1960,8 +1982,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_banff_proposal_block_with_decision_txs() {
+        let parent = [0xDDu8; 32];
+        let decision_tx = minimal_signed_base_tx_bytes();
+        let proposal_tx = minimal_signed_base_tx_bytes();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0u16.to_be_bytes());
+        raw.extend_from_slice(&29u32.to_be_bytes());
+        raw.extend_from_slice(&1_699_999_999u64.to_be_bytes());
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        raw.extend_from_slice(&decision_tx);
+        raw.extend_from_slice(&parent);
+        raw.extend_from_slice(&42_000u64.to_be_bytes());
+        raw.extend_from_slice(&proposal_tx);
+
+        let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
+        assert_eq!(h.block_type, BlockType::BanffProposal);
+        assert_eq!(h.parent_id, parent);
+        assert_eq!(h.height, 42_000);
+        assert_eq!(h.timestamp, 1_699_999_999);
+        assert_eq!(BlockHeader::extract_parent_id(&raw), Some(parent));
+    }
+
+    #[test]
     fn test_banff_heights_sequential() {
-        // Simulate a chain: genesis -> block1 -> block2
         let g_raw = make_banff_block(32, [0u8; 32], 0, 1_000_000);
         let g = BlockHeader::parse(&g_raw, Chain::PChain).unwrap();
         assert_eq!(g.height, 0);
@@ -1980,22 +2024,17 @@ mod tests {
         assert_eq!(graph.fork_count, 0);
     }
 
-    // -----------------------------------------------------------------------
-    // Chain graph tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chain_graph_linear() {
-        // genesis → A → B
-        let g_raw = make_pchain_block(3, [0u8; 32], 0, 1000);
+        let g_raw = make_apricot_block(3, [0u8; 32], 0);
         let g = BlockHeader::parse(&g_raw, Chain::PChain).unwrap();
         let g_id = g.id;
 
-        let a_raw = make_pchain_block(3, g_id, 1, 2000);
+        let a_raw = make_apricot_block(3, g_id, 1);
         let a = BlockHeader::parse(&a_raw, Chain::PChain).unwrap();
         let a_id = a.id;
 
-        let b_raw = make_pchain_block(3, a_id, 2, 3000);
+        let b_raw = make_apricot_block(3, a_id, 2);
         let b = BlockHeader::parse(&b_raw, Chain::PChain).unwrap();
 
         let graph = ChainGraph::build([g, a, b]);
@@ -2007,27 +2046,22 @@ mod tests {
 
     #[test]
     fn test_chain_graph_detects_fork() {
-        // genesis → A (height 1, ts 2000)
-        // genesis → B (height 1, ts 3000)  ← fork!
-        let g_raw = make_pchain_block(3, [0u8; 32], 0, 1000);
+        let g_raw = make_apricot_block(3, [0u8; 32], 0);
         let g = BlockHeader::parse(&g_raw, Chain::PChain).unwrap();
         let g_id = g.id;
 
-        let a_raw = make_pchain_block(3, g_id, 1, 2000);
+        let mut a_raw = make_apricot_block(3, g_id, 1);
+        a_raw.extend_from_slice(&0u32.to_be_bytes());
         let a = BlockHeader::parse(&a_raw, Chain::PChain).unwrap();
 
-        let b_raw = make_pchain_block(3, g_id, 1, 3000); // same parent, different ts → different hash
+        let mut b_raw = make_apricot_block(3, g_id, 1);
+        b_raw.extend_from_slice(&1u32.to_be_bytes());
         let b = BlockHeader::parse(&b_raw, Chain::PChain).unwrap();
-        // Ensure distinct blocks
         assert_ne!(a.id, b.id);
 
         let graph = ChainGraph::build([g, a, b]);
         assert_eq!(graph.fork_count, 1);
     }
-
-    // -----------------------------------------------------------------------
-    // RLP helper tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_rlp_skip_single_byte() {
@@ -2037,22 +2071,18 @@ mod tests {
 
     #[test]
     fn test_rlp_skip_short_string() {
-        // 0x83 = 0x80 + 3 → 3-byte string
         let data = [0x83u8, 0x01, 0x02, 0x03, 0xff];
         assert_eq!(rlp_skip(&data, 0).unwrap(), 4);
     }
 
     #[test]
     fn test_rlp_read_u64() {
-        // 0x83 0x00 0x01 0x00 = 256
         let data = [0x82u8, 0x01, 0x00];
         assert_eq!(rlp_read_u64(&data, 0).unwrap(), 256);
 
-        // single byte
         let data2 = [0x0fu8];
         assert_eq!(rlp_read_u64(&data2, 0).unwrap(), 15);
 
-        // empty string = 0
         let data3 = [0x80u8];
         assert_eq!(rlp_read_u64(&data3, 0).unwrap(), 0);
     }
@@ -2074,40 +2104,29 @@ mod tests {
         // 2: miner (20 bytes, 0x94 prefix = 0x80+20)
         header_payload.push(0x94);
         header_payload.extend_from_slice(&[0u8; 20]);
-        // 3: stateRoot (32 bytes)
         header_payload.push(0xa0);
         header_payload.extend_from_slice(&[0u8; 32]);
-        // 4: txRoot (32 bytes)
         header_payload.push(0xa0);
         header_payload.extend_from_slice(&[0u8; 32]);
-        // 5: receiptRoot (32 bytes)
         header_payload.push(0xa0);
         header_payload.extend_from_slice(&[0u8; 32]);
-        // 6: bloom (256 bytes, 0xb9 0x01 0x00 = long string of 256 bytes)
         header_payload.push(0xb9);
         header_payload.push(0x01);
         header_payload.push(0x00);
         header_payload.extend_from_slice(&[0u8; 256]);
-        // 7: difficulty (0x80 = 0)
         header_payload.push(0x80);
-        // 8: number
         encode_rlp_u64(&mut header_payload, number);
-        // 9: gasLimit
         encode_rlp_u64(&mut header_payload, 8_000_000);
-        // 10: gasUsed
-        header_payload.push(0x80); // 0
-                                   // 11: timestamp
+        header_payload.push(0x80);
         encode_rlp_u64(&mut header_payload, timestamp);
 
-        // Wrap header in a list
         let header_list = rlp_list(header_payload);
-        // Empty uncles and txs
         let empty = 0xc0u8;
 
         let mut outer_payload: Vec<u8> = Vec::new();
         outer_payload.extend_from_slice(&header_list);
-        outer_payload.push(empty); // uncles
-        outer_payload.push(empty); // txs
+        outer_payload.push(empty);
+        outer_payload.push(empty);
 
         rlp_list(outer_payload)
     }
@@ -2116,26 +2135,26 @@ mod tests {
     fn make_cchain_block_wrapped(parent: [u8; 32], number: u64, timestamp: u64) -> Vec<u8> {
         let rlp = make_cchain_block(parent, number, timestamp);
         let mut wrapped = Vec::with_capacity(6 + rlp.len());
-        wrapped.extend_from_slice(&[0x00, 0x00]); // codec version
-        wrapped.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // typeID = 1 (placeholder)
+        wrapped.extend_from_slice(&[0x00, 0x00]);
+        wrapped.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         wrapped.extend_from_slice(&rlp);
         wrapped
     }
 
     fn make_cchain_proposervm_granite_block(parent: [u8; 32], inner_block: &[u8]) -> Vec<u8> {
         let mut wrapped = Vec::new();
-        wrapped.extend_from_slice(&[0x00, 0x00]); // codec version
-        wrapped.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // typeID = granite block
+        wrapped.extend_from_slice(&[0x00, 0x00]);
+        wrapped.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]);
         wrapped.extend_from_slice(&parent);
         wrapped.extend_from_slice(&1_700_000_000i64.to_be_bytes());
         wrapped.extend_from_slice(&123u64.to_be_bytes());
-        wrapped.extend_from_slice(&0u32.to_be_bytes()); // certificate len
+        wrapped.extend_from_slice(&0u32.to_be_bytes());
         wrapped.extend_from_slice(&(inner_block.len() as u32).to_be_bytes());
         wrapped.extend_from_slice(inner_block);
-        wrapped.extend_from_slice(&456u64.to_be_bytes()); // epoch p-chain height
-        wrapped.extend_from_slice(&7u64.to_be_bytes()); // epoch number
-        wrapped.extend_from_slice(&1_700_000_111i64.to_be_bytes()); // epoch start time
-        wrapped.extend_from_slice(&0u32.to_be_bytes()); // signature len
+        wrapped.extend_from_slice(&456u64.to_be_bytes());
+        wrapped.extend_from_slice(&7u64.to_be_bytes());
+        wrapped.extend_from_slice(&1_700_000_111i64.to_be_bytes());
+        wrapped.extend_from_slice(&0u32.to_be_bytes());
         wrapped
     }
 
@@ -2345,21 +2364,19 @@ mod tests {
 
     #[test]
     fn test_block_signature_invalid_key() {
-        // Test that an invalid public key fails verification
         let parent = [0xAAu8; 32];
         let mut raw = make_banff_block(32, parent, 100, 1_700_000_000);
         // Pad with 96 bytes of zeros to simulate a signature
         raw.extend_from_slice(&[0u8; 96]);
 
         let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
-        let invalid_pk = [0xFFu8; 48]; // Invalid public key
+        let invalid_pk = [0xFFu8; 48];
 
         assert!(h.verify_signature(&invalid_pk).is_err());
     }
 
     #[test]
     fn test_block_raw_bytes_stored() {
-        // Test that raw_bytes are correctly stored in BlockHeader
         let parent = [0xBBu8; 32];
         let raw = make_banff_block(32, parent, 100, 1_700_000_000);
         let h = BlockHeader::parse(&raw, Chain::PChain).unwrap();
@@ -2367,10 +2384,6 @@ mod tests {
         assert_eq!(h.raw_bytes, raw);
         assert_eq!(h.raw_size, raw.len());
     }
-
-    // -----------------------------------------------------------------------
-    // C-Chain transaction extraction tests
-    // -----------------------------------------------------------------------
 
     /// Build a minimal legacy Ethereum transaction RLP item.
     /// Format: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
@@ -2384,7 +2397,6 @@ mod tests {
     ) -> Vec<u8> {
         let mut fields: Vec<u8> = Vec::new();
         encode_rlp_u64(&mut fields, nonce);
-        // gasPrice as u128
         if gas_price == 0 {
             fields.push(0x80);
         } else {
@@ -2395,15 +2407,13 @@ mod tests {
             fields.extend_from_slice(slice);
         }
         encode_rlp_u64(&mut fields, gas_limit);
-        // to
         match to {
-            None => fields.push(0x80), // empty = contract creation
+            None => fields.push(0x80),
             Some(addr) => {
-                fields.push(0x94); // 0x80 + 20
+                fields.push(0x94);
                 fields.extend_from_slice(&addr);
             }
         }
-        // value as u128
         if value == 0 {
             fields.push(0x80);
         } else {
@@ -2413,17 +2423,15 @@ mod tests {
             fields.push(0x80 + slice.len() as u8);
             fields.extend_from_slice(slice);
         }
-        // data
         if data.is_empty() {
             fields.push(0x80);
         } else {
             fields.push(0x80 + data.len() as u8);
             fields.extend_from_slice(data);
         }
-        // v, r, s (stub values)
-        fields.push(0x80); // v = 0
-        fields.push(0x80); // r = 0
-        fields.push(0x80); // s = 0
+        fields.push(0x80);
+        fields.push(0x80);
+        fields.push(0x80);
         rlp_list(fields)
     }
 

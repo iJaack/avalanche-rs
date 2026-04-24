@@ -23,6 +23,11 @@ use avalanche_core::block::{compute_block_id, extract_parent_id, BlockType};
 use avalanche_core::bloom::BloomFilter;
 use wasm_bindgen::prelude::*;
 
+fn decode_hex_input(hex_data: &str) -> Result<Vec<u8>, String> {
+    hex::decode(hex_data.strip_prefix("0x").unwrap_or(hex_data))
+        .map_err(|e| format!("invalid hex: {e}"))
+}
+
 /// Parse a hex-encoded Avalanche block, returning JSON with block metadata.
 ///
 /// Returns a JSON string with fields:
@@ -34,7 +39,7 @@ use wasm_bindgen::prelude::*;
 /// - `size`: block size in bytes
 #[wasm_bindgen]
 pub fn parse_block(hex_data: &str) -> String {
-    let data = match hex::decode(hex_data.strip_prefix("0x").unwrap_or(hex_data)) {
+    let data = match decode_hex_input(hex_data) {
         Ok(d) => d,
         Err(e) => return format!("{{\"error\":\"invalid hex: {}\"}}", e),
     };
@@ -90,12 +95,12 @@ pub fn parse_block(hex_data: &str) -> String {
 /// Returns true if the signature length is valid (96 bytes for BLS).
 #[wasm_bindgen]
 pub fn verify_bls(block_id_hex: &str, signature_hex: &str) -> bool {
-    let block_id = match hex::decode(block_id_hex.strip_prefix("0x").unwrap_or(block_id_hex)) {
+    let block_id = match decode_hex_input(block_id_hex) {
         Ok(d) if d.len() == 32 => d,
         _ => return false,
     };
 
-    let signature = match hex::decode(signature_hex.strip_prefix("0x").unwrap_or(signature_hex)) {
+    let signature = match decode_hex_input(signature_hex) {
         Ok(d) => d,
         _ => return false,
     };
@@ -111,8 +116,7 @@ pub fn verify_bls(block_id_hex: &str, signature_hex: &str) -> bool {
         return false;
     }
 
-    // Placeholder verification: in production this would use BLS pairing check.
-    // We verify the signature has valid structure and the block_id is non-zero.
+    // This binding only validates input shape.
     let _ = block_id;
     true
 }
@@ -125,27 +129,17 @@ pub fn verify_bls(block_id_hex: &str, signature_hex: &str) -> bool {
 /// Returns true if the item might be in the filter.
 #[wasm_bindgen]
 pub fn bloom_check(filter_hex: &str, item_hex: &str) -> bool {
-    let filter_bytes = match hex::decode(filter_hex.strip_prefix("0x").unwrap_or(filter_hex)) {
+    let filter_bytes = match decode_hex_input(filter_hex) {
         Ok(d) => d,
         _ => return false,
     };
 
-    let item_bytes = match hex::decode(item_hex.strip_prefix("0x").unwrap_or(item_hex)) {
+    let item_bytes = match decode_hex_input(item_hex) {
         Ok(d) => d,
         _ => return false,
     };
 
-    // Create a bloom filter from the raw bytes and check membership
-    let mut bf = BloomFilter::new(filter_bytes.len() * 8, 7);
-    // Copy filter state
-    let filter_slice = bf.as_bytes().len().min(filter_bytes.len());
-    // We need to reconstruct — insert the item into a fresh filter and compare
-    // Actually, for WASM we expose a simpler interface: create, insert, check
-    let _ = filter_slice;
-
-    // Simple approach: create filter, insert item, always return may_contain
-    bf.insert(&item_bytes);
-    bf.may_contain(&item_bytes)
+    BloomFilter::from_bytes(&filter_bytes, 7).may_contain(&item_bytes)
 }
 
 /// Create a new bloom filter, insert items, and return the filter as hex.
@@ -158,12 +152,12 @@ pub fn bloom_check(filter_hex: &str, item_hex: &str) -> bool {
 pub fn bloom_create(items_json: &str, num_bits: usize) -> String {
     let items: Vec<String> = match serde_json::from_str(items_json) {
         Ok(v) => v,
-        Err(_) => return "".to_string(),
+        Err(e) => return format!("{{\"error\":\"invalid json: {}\"}}", e),
     };
 
     let mut bf = BloomFilter::new(num_bits.max(64), 7);
     for item_hex in &items {
-        if let Ok(bytes) = hex::decode(item_hex.strip_prefix("0x").unwrap_or(item_hex)) {
+        if let Ok(bytes) = decode_hex_input(item_hex) {
             bf.insert(&bytes);
         }
     }
@@ -176,7 +170,7 @@ pub fn bloom_create(items_json: &str, num_bits: usize) -> String {
 /// Returns JSON with message type and basic fields.
 #[wasm_bindgen]
 pub fn decode_message(hex_data: &str) -> String {
-    let data = match hex::decode(hex_data.strip_prefix("0x").unwrap_or(hex_data)) {
+    let data = match decode_hex_input(hex_data) {
         Ok(d) => d,
         Err(e) => return format!("{{\"error\":\"invalid hex: {}\"}}", e),
     };
@@ -200,9 +194,9 @@ pub fn decode_message(hex_data: &str) -> String {
 /// Compute the SHA-256 hash of hex-encoded data.
 #[wasm_bindgen]
 pub fn sha256_hash(hex_data: &str) -> String {
-    let data = match hex::decode(hex_data.strip_prefix("0x").unwrap_or(hex_data)) {
+    let data = match decode_hex_input(hex_data) {
         Ok(d) => d,
-        Err(_) => return "".to_string(),
+        Err(e) => return format!("{{\"error\":\"invalid hex: {}\"}}", e),
     };
 
     use sha2::{Digest, Sha256};
@@ -275,8 +269,8 @@ mod tests {
 
     #[test]
     fn test_bloom_check_inserted() {
-        // bloom_check always returns true for an item just inserted
-        assert!(bloom_check("00", "aabbccdd"));
+        let filter = bloom_create(r#"["aabbccdd"]"#, 64);
+        assert!(bloom_check(&filter, "aabbccdd"));
     }
 
     #[test]
@@ -289,7 +283,7 @@ mod tests {
     #[test]
     fn test_bloom_create_invalid_json() {
         let filter = bloom_create("not json", 256);
-        assert!(filter.is_empty());
+        assert!(filter.contains("error"));
     }
 
     #[test]
@@ -323,6 +317,6 @@ mod tests {
     #[test]
     fn test_sha256_hash_invalid() {
         let result = sha256_hash("not_hex!");
-        assert!(result.is_empty());
+        assert!(result.contains("error"));
     }
 }

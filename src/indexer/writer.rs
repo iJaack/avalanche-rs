@@ -120,7 +120,9 @@ impl IndexerWriter {
 
     pub async fn close(self) {
         drop(self.tx); // signal shutdown to batch processor
-        let _ = self.handle.await;
+        if let Err(err) = self.handle.await {
+            error!("Indexer batch processor task failed: {}", err);
+        }
         self.pool.close().await;
     }
 }
