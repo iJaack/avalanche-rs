@@ -16,7 +16,8 @@
     clippy::vec_init_then_push,
     clippy::while_let_loop,
     clippy::doc_lazy_continuation,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::clone_on_copy
 )]
 
 use std::net::SocketAddr;
@@ -2580,7 +2581,7 @@ async fn connect_and_handshake_with_timeouts(
                                                         if request_id == req {
                                                             let containers = effective_containers;
                                                             if let Some(target_id) = cchain_ancestors_target {
-                                                                if let Err(e) = SyncEngine::validate_cchain_ancestor_chain(&containers, target_id) {
+                                                                if let Err(e) = SyncEngine::validate_cchain_ancestor_chain(containers, target_id) {
                                                                     warn!("C-Chain Bootstrap: invalid ancestor hash chain: {}", e);
                                                                     cchain_bootstrap_state = CChainBootstrapState::Done;
                                                                     continue;

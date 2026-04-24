@@ -244,10 +244,10 @@ mod tests {
         fn test_snowball_finality() {
             let genesis = BlockId::zero();
             let block = BlockId::from_bytes(&[1u8; 32]).unwrap();
-            let mut sb = SnowballInstance::new(genesis.clone(), 3);
+            let mut sb = SnowballInstance::new(genesis, 3);
 
             let mut votes = HashMap::new();
-            votes.insert(block.clone(), 15u64);
+            votes.insert(block, 15u64);
 
             sb.record_poll(&votes, 15);
             assert!(!sb.is_finalized());
@@ -268,10 +268,10 @@ mod tests {
                 max_outstanding: 10,
                 max_rounds: 500,
             };
-            let mut engine = SnowmanConsensus::new(params, genesis.clone());
+            let mut engine = SnowmanConsensus::new(params, genesis);
 
             let block1_id = BlockId::from_bytes(&[1u8; 32]).unwrap();
-            let block1 = ConsensusBlock::new(block1_id.clone(), genesis.clone(), 1, 100, vec![]);
+            let block1 = ConsensusBlock::new(block1_id, genesis, 1, 100, vec![]);
 
             assert!(engine.add_block(block1).is_ok());
             assert_eq!(engine.processing_count(), 1);
@@ -281,7 +281,7 @@ mod tests {
         fn test_snowman_missing_parent() {
             let genesis = BlockId::from_bytes(&[0u8; 32]).unwrap();
             let params = SnowballParams::default();
-            let mut engine = SnowmanConsensus::new(params, genesis.clone());
+            let mut engine = SnowmanConsensus::new(params, genesis);
 
             let orphan_parent = BlockId::from_bytes(&[99u8; 32]).unwrap();
             let orphan_id = BlockId::from_bytes(&[100u8; 32]).unwrap();

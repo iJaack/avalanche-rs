@@ -16,7 +16,8 @@
     clippy::vec_init_then_push,
     clippy::while_let_loop,
     clippy::doc_lazy_continuation,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::clone_on_copy
 )]
 #![warn(rust_2018_idioms)]
 // We need unsafe for RocksDB FFI bindings and revm's EVM internals
