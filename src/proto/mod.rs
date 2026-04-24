@@ -7,6 +7,9 @@
 use bytes::Bytes;
 use prost::Message as ProstMessage;
 use rand::Rng;
+use std::io::Read;
+
+const MAX_DECOMPRESSED_PROTO_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Generated protobuf types (compiled by build.rs from proto/p2p/p2p.proto).
 pub mod pb {
@@ -48,8 +51,19 @@ pub fn decompress_message(data: &[u8]) -> Result<ProtoOneOf, NetworkError> {
 
     match inner {
         ProtoOneOf::CompressedZstd(zstd_bytes) => {
-            let decompressed = zstd::decode_all(zstd_bytes.as_ref())
+            let decoder = zstd::stream::read::Decoder::new(zstd_bytes.as_ref())
                 .map_err(|e| NetworkError::Serialization(format!("zstd decompress: {e}")))?;
+            let mut limited = decoder.take((MAX_DECOMPRESSED_PROTO_MESSAGE_SIZE + 1) as u64);
+            let mut decompressed = Vec::new();
+            limited
+                .read_to_end(&mut decompressed)
+                .map_err(|e| NetworkError::Serialization(format!("zstd decompress: {e}")))?;
+            if decompressed.len() > MAX_DECOMPRESSED_PROTO_MESSAGE_SIZE {
+                return Err(NetworkError::Serialization(format!(
+                    "decompressed message too large: more than {} bytes",
+                    MAX_DECOMPRESSED_PROTO_MESSAGE_SIZE
+                )));
+            }
             let inner_msg = ProtoMessage::decode(decompressed.as_slice())
                 .map_err(|e| NetworkError::Serialization(e.to_string()))?;
             inner_msg
@@ -839,6 +853,19 @@ mod tests {
             compressed.len(),
             uncompressed_len
         );
+    }
+
+    #[test]
+    fn test_compressed_message_decompressed_size_cap() {
+        let oversized = vec![0u8; MAX_DECOMPRESSED_PROTO_MESSAGE_SIZE + 1];
+        let compressed = zstd::encode_all(oversized.as_slice(), 19).unwrap();
+        let wrapper = ProtoMessage {
+            message: Some(ProtoOneOf::CompressedZstd(Bytes::from(compressed))),
+        };
+        let encoded = wrapper.encode_to_vec();
+
+        let err = decompress_message(&encoded).unwrap_err();
+        assert!(format!("{err}").contains("decompressed message too large"));
     }
 
     #[test]

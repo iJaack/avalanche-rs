@@ -55,9 +55,11 @@ use avalanche_rs::db::{
 };
 use avalanche_rs::debug::{EvmTracer, TraceConfig, TracerType};
 use avalanche_rs::evm::{
-    ArchivedAccountDiff, BlockContext, EvmExecutor, EvmLog, EvmTransaction, TxReceipt,
+    ArchivedAccountDiff, BlockContext, EvmExecutor, EvmTransaction, TxReceipt,
 };
-use avalanche_rs::hardening::get_rss_bytes;
+use avalanche_rs::hardening::{
+    get_rss_bytes, is_near_memory_limit, ConnectionRateLimiter, RequestRateLimiter,
+};
 use avalanche_rs::identity::{self, NodeIdentity};
 use avalanche_rs::mev::engine::{MevEngine, MevEngineConfig};
 use avalanche_rs::network::{
@@ -84,6 +86,10 @@ const PRIORITY_FEE_PERCENTILE: f64 = 60.0;
 const MAX_PLATFORM_GET_STAKE_ADDRS: usize = 256;
 const MAX_PLATFORM_GET_UTXOS_ADDRS: usize = 1024;
 const PLATFORM_GET_UTXOS_MAX_PAGE_SIZE: usize = 1024;
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const RPC_READ_TIMEOUT_SECS: u64 = 10;
+const MAX_RPC_LOG_BLOCK_RANGE: u64 = 2_048;
+const MAX_RPC_LOG_RESULTS: usize = 10_000;
 const PROPOSER_VM_RECENTLY_ACCEPTED_WINDOW_SECS: u64 = 30;
 const PLATFORM_TX_DROPPED_CACHE_SIZE: usize = 64;
 const PLATFORM_VM_ID: &str = "11111111111111111111111111111111LpoYY";
@@ -242,6 +248,10 @@ struct Cli {
     #[arg(long, default_value = "5242880", env = "AVAX_RPC_MAX_BODY_SIZE")]
     rpc_max_body_size: usize,
 
+    /// Allow key-backed and admin RPC methods from non-loopback clients.
+    #[arg(long, default_value = "false", env = "AVAX_RPC_ALLOW_UNSAFE_REMOTE")]
+    rpc_allow_unsafe_remote: bool,
+
     /// Maximum memory usage in MB (0 = unlimited). Rejects new connections when near limit.
     #[arg(long, default_value = "0", env = "AVAX_MAX_MEMORY_MB")]
     max_memory_mb: u64,
@@ -280,6 +290,7 @@ struct Cli {
         value_delimiter = ',',
         env = "AVAX_RPC_PRIVATE_KEYS"
     )]
+    #[serde(skip_serializing)]
     rpc_private_keys: Vec<String>,
 
     /// Enable PostgreSQL indexer for explorer backends.
@@ -817,6 +828,10 @@ struct NodeState {
     txpool: Arc<RwLock<TransactionPool>>,
     /// Managed wallets exposed through account-backed C-Chain RPC methods.
     rpc_wallets: Arc<StdHashMap<[u8; 20], Wallet>>,
+    /// Per-IP/global limiter for inbound RPC connections.
+    rpc_connection_limiter: Arc<ConnectionRateLimiter>,
+    /// Per-IP limiter for accepted RPC requests.
+    rpc_request_limiter: Arc<RequestRateLimiter>,
     /// P-Chain mempool and recently dropped tx cache for Platform RPC lifecycle.
     platform_tx_pool: Arc<RwLock<PlatformTxPool>>,
     /// Light client for headers-only mode
@@ -1203,6 +1218,8 @@ async fn main() {
         mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
         txpool,
         rpc_wallets,
+        rpc_connection_limiter: Arc::new(ConnectionRateLimiter::new(200, 50)),
+        rpc_request_limiter: Arc::new(RequestRateLimiter::new(100)),
         platform_tx_pool,
         light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
         archive_store,
@@ -4056,6 +4073,91 @@ fn parse_http_headers(req: &str) -> StdHashMap<String, String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRequestReadError {
+    Invalid,
+    Timeout,
+    TooLarge,
+}
+
+fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+async fn write_simple_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status_line: &str,
+    content_type: &str,
+    body: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let response = format!(
+        "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+        status_line,
+        content_type,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+    node: &NodeState,
+) -> Result<Vec<u8>, HttpRequestReadError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let n = match tokio::time::timeout(
+            Duration::from_secs(RPC_READ_TIMEOUT_SECS),
+            stream.read(&mut chunk),
+        )
+        .await
+        {
+            Ok(Ok(0)) => return Err(HttpRequestReadError::Invalid),
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return Err(HttpRequestReadError::Invalid),
+            Err(_) => return Err(HttpRequestReadError::Timeout),
+        };
+
+        request.extend_from_slice(&chunk[..n]);
+
+        let Some(header_end) = find_http_header_end(&request) else {
+            if request.len() > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestReadError::TooLarge);
+            }
+            continue;
+        };
+
+        if header_end > MAX_HTTP_HEADER_BYTES {
+            return Err(HttpRequestReadError::TooLarge);
+        }
+
+        let header_text = String::from_utf8_lossy(&request[..header_end + 4]);
+        let headers = parse_http_headers(&header_text);
+        let content_len = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        if content_len > node.config.rpc_max_body_size {
+            return Err(HttpRequestReadError::TooLarge);
+        }
+
+        let expected_len = header_end.saturating_add(4).saturating_add(content_len);
+        if request.len() > expected_len {
+            request.truncate(expected_len);
+        }
+        if request.len() >= expected_len {
+            return Ok(request);
+        }
+    }
+}
+
 fn is_websocket_upgrade(path: &str, headers: &StdHashMap<String, String>) -> bool {
     matches!(path, "/ws" | "/ext/bc/C/ws")
         && headers
@@ -4147,7 +4249,59 @@ where
     writer.write_all(&frame).await
 }
 
-async fn handle_ws_rpc_request(json_str: &str, node: &NodeState, connection_id: u64) -> String {
+#[derive(Debug, Clone, Copy)]
+struct RpcAccess {
+    is_loopback: bool,
+}
+
+impl RpcAccess {
+    fn local() -> Self {
+        Self { is_loopback: true }
+    }
+
+    fn from_peer(peer_addr: SocketAddr) -> Self {
+        Self {
+            is_loopback: peer_addr.ip().is_loopback(),
+        }
+    }
+}
+
+fn rpc_method_requires_local_access(method: &str) -> bool {
+    method.starts_with("admin.")
+        || method.starts_with("admin_")
+        || matches!(
+            method,
+            "eth_accounts"
+                | "eth_sendTransaction"
+                | "eth_fillTransaction"
+                | "eth_sign"
+                | "eth_signTransaction"
+                | "eth_resend"
+        )
+}
+
+fn rpc_access_error_if_denied(
+    method: &str,
+    node: &NodeState,
+    access: RpcAccess,
+    id: &serde_json::Value,
+) -> Option<String> {
+    if rpc_method_requires_local_access(method)
+        && !access.is_loopback
+        && !node.config.rpc_allow_unsafe_remote
+    {
+        Some(rpc_error(-32000, "method requires local RPC access", id))
+    } else {
+        None
+    }
+}
+
+async fn handle_ws_rpc_request(
+    json_str: &str,
+    node: &NodeState,
+    connection_id: u64,
+    access: RpcAccess,
+) -> String {
     let req: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => {
@@ -4159,6 +4313,10 @@ async fn handle_ws_rpc_request(json_str: &str, node: &NodeState, connection_id: 
     let method = req["method"].as_str().unwrap_or("");
     let params = req["params"].as_array().cloned().unwrap_or_default();
     let id = &req["id"];
+
+    if let Some(error) = rpc_access_error_if_denied(method, node, access, id) {
+        return error;
+    }
 
     match method {
         "eth_subscribe" => match WsSubscriptionType::from_params(&params) {
@@ -4187,7 +4345,7 @@ async fn handle_ws_rpc_request(json_str: &str, node: &NodeState, connection_id: 
             };
             rpc_ok(if removed { "true" } else { "false" }, id)
         }
-        _ => handle_rpc_request_for_path(json_str, node, "/ws").await,
+        _ => handle_rpc_request_for_path_with_access(json_str, node, "/ws", access).await,
     }
 }
 
@@ -4378,6 +4536,7 @@ async fn handle_websocket_connection(
     stream: tokio::net::TcpStream,
     headers: &StdHashMap<String, String>,
     node: Arc<NodeState>,
+    access: RpcAccess,
 ) {
     let sec_key = match headers.get("sec-websocket-key") {
         Some(key) => key.clone(),
@@ -4447,7 +4606,7 @@ async fn handle_websocket_connection(
                     Ok(text) => text,
                     Err(_) => continue,
                 };
-                let response = handle_ws_rpc_request(&request, &node, connection_id).await;
+                let response = handle_ws_rpc_request(&request, &node, connection_id, access).await;
                 if tx.send(WsOutboundMessage::Text(response)).is_err() {
                     break;
                 }
@@ -4491,7 +4650,27 @@ async fn run_rpc_server(addr: SocketAddr, node: Arc<NodeState>) {
 async fn run_rpc_server_with_listener(listener: TcpListener, node: Arc<NodeState>) {
     loop {
         match listener.accept().await {
-            Ok((stream, peer_addr)) => {
+            Ok((mut stream, peer_addr)) => {
+                if is_near_memory_limit(node.config.max_memory_mb) {
+                    write_simple_http_response(
+                        &mut stream,
+                        "HTTP/1.1 503 Service Unavailable",
+                        "application/json",
+                        r#"{"error":"server memory limit reached"}"#,
+                    )
+                    .await;
+                    continue;
+                }
+                if !node.rpc_connection_limiter.check_connection(peer_addr.ip()) {
+                    write_simple_http_response(
+                        &mut stream,
+                        "HTTP/1.1 429 Too Many Requests",
+                        "application/json",
+                        r#"{"error":"too many RPC connections"}"#,
+                    )
+                    .await;
+                    continue;
+                }
                 let node = node.clone();
                 tokio::spawn(async move {
                     handle_rpc_connection(stream, peer_addr, node).await;
@@ -4506,18 +4685,57 @@ async fn run_rpc_server_with_listener(listener: TcpListener, node: Arc<NodeState
 
 async fn handle_rpc_connection(
     mut stream: tokio::net::TcpStream,
-    _peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
     node: Arc<NodeState>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
-    let mut buf = vec![0u8; 131072];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    if !node.rpc_request_limiter.check_request(peer_addr.ip()) {
+        write_simple_http_response(
+            &mut stream,
+            "HTTP/1.1 429 Too Many Requests",
+            "application/json",
+            r#"{"error":"too many RPC requests"}"#,
+        )
+        .await;
+        return;
+    }
+
+    let request_bytes = match read_http_request(&mut stream, &node).await {
+        Ok(bytes) => bytes,
+        Err(HttpRequestReadError::TooLarge) => {
+            write_simple_http_response(
+                &mut stream,
+                "HTTP/1.1 413 Payload Too Large",
+                "application/json",
+                r#"{"error":"request body too large"}"#,
+            )
+            .await;
+            return;
+        }
+        Err(HttpRequestReadError::Timeout) => {
+            write_simple_http_response(
+                &mut stream,
+                "HTTP/1.1 408 Request Timeout",
+                "application/json",
+                r#"{"error":"request read timeout"}"#,
+            )
+            .await;
+            return;
+        }
+        Err(HttpRequestReadError::Invalid) => {
+            write_simple_http_response(
+                &mut stream,
+                "HTTP/1.1 400 Bad Request",
+                "application/json",
+                r#"{"error":"invalid request"}"#,
+            )
+            .await;
+            return;
+        }
     };
 
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&request_bytes);
     let mut lines = req.lines();
     let request_line = lines.next().unwrap_or_default();
     let mut request_parts = request_line.split_whitespace();
@@ -4526,9 +4744,10 @@ async fn handle_rpc_connection(
     let (path, query) = split_path_and_query(raw_path);
     let resolved_path = resolve_request_path(&node, path).await;
     let headers = parse_http_headers(&req);
+    let access = RpcAccess::from_peer(peer_addr);
 
     if is_websocket_upgrade(&resolved_path, &headers) {
-        handle_websocket_connection(stream, &headers, node).await;
+        handle_websocket_connection(stream, &headers, node, access).await;
         return;
     }
 
@@ -4603,7 +4822,7 @@ async fn handle_rpc_connection(
             (
                 "HTTP/1.1 200 OK",
                 "application/json",
-                handle_rpc_request_for_path(body, &node, &resolved_path).await,
+                handle_rpc_request_for_path_with_access(body, &node, &resolved_path, access).await,
             )
         }
     };
@@ -10820,9 +11039,17 @@ fn collect_logs_for_range(
     filter: &LogFilter,
     start_block: u64,
     end_block: u64,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, String> {
     if start_block > end_block {
-        return vec![];
+        return Ok(vec![]);
+    }
+
+    let block_count = end_block.saturating_sub(start_block).saturating_add(1);
+    if block_count > MAX_RPC_LOG_BLOCK_RANGE {
+        return Err(format!(
+            "log block range too large: {} blocks (max {})",
+            block_count, MAX_RPC_LOG_BLOCK_RANGE
+        ));
     }
 
     let mut logs = Vec::new();
@@ -10836,8 +11063,14 @@ fn collect_logs_for_range(
                 .into_iter()
                 .filter(|log| log_matches_filter(log, filter)),
         );
+        if logs.len() > MAX_RPC_LOG_RESULTS {
+            return Err(format!(
+                "log result set too large: more than {} entries",
+                MAX_RPC_LOG_RESULTS
+            ));
+        }
     }
-    logs
+    Ok(logs)
 }
 
 /// JSON-RPC error response helper.
@@ -11783,6 +12016,15 @@ async fn handle_rpc_request(json_str: &str, node: &NodeState) -> String {
 }
 
 async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &str) -> String {
+    handle_rpc_request_for_path_with_access(json_str, node, path, RpcAccess::local()).await
+}
+
+async fn handle_rpc_request_for_path_with_access(
+    json_str: &str,
+    node: &NodeState,
+    path: &str,
+    access: RpcAccess,
+) -> String {
     let req: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => {
@@ -11794,6 +12036,10 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
     let method = req["method"].as_str().unwrap_or("");
     let params = &req["params"];
     let id = &req["id"];
+
+    if let Some(error) = rpc_access_error_if_denied(method, node, access, id) {
+        return error;
+    }
 
     match method {
         // -----------------------------------------------------------------
@@ -12552,8 +12798,10 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                 .to_block
                 .unwrap_or(current_height)
                 .min(current_height);
-            let logs = collect_logs_for_range(&node.db, &filter, filter.from_block, end_block);
-            rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
+            match collect_logs_for_range(&node.db, &filter, filter.from_block, end_block) {
+                Ok(logs) => rpc_ok(&serde_json::Value::Array(logs).to_string(), id),
+                Err(message) => rpc_error(-32005, &message, id),
+            }
         }
 
         // -----------------------------------------------------------------
@@ -12645,11 +12893,15 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                     )
                     .map(|block| block.max(filter.from_block))
                     .unwrap_or(end_block.saturating_add(1));
-                    let logs = collect_logs_for_range(&node.db, filter, start_block, end_block);
-                    filter.last_polled_block = current_height;
-                    filter.last_polled_hash =
-                        canonical_cchain_block_hash_at_height(&node.db, current_height);
-                    rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
+                    match collect_logs_for_range(&node.db, filter, start_block, end_block) {
+                        Ok(logs) => {
+                            filter.last_polled_block = current_height;
+                            filter.last_polled_hash =
+                                canonical_cchain_block_hash_at_height(&node.db, current_height);
+                            rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
+                        }
+                        Err(message) => rpc_error(-32005, &message, id),
+                    }
                 }
                 Some(RpcFilter::PendingTransactions(filter)) => {
                     let changes = pending_transaction_filter_changes(filter).await;
@@ -12707,9 +12959,10 @@ async fn handle_rpc_request_for_path(json_str: &str, node: &NodeState, path: &st
                         .to_block
                         .unwrap_or(current_height)
                         .min(current_height);
-                    let logs =
-                        collect_logs_for_range(&node.db, filter, filter.from_block, end_block);
-                    rpc_ok(&serde_json::Value::Array(logs).to_string(), id)
+                    match collect_logs_for_range(&node.db, filter, filter.from_block, end_block) {
+                        Ok(logs) => rpc_ok(&serde_json::Value::Array(logs).to_string(), id),
+                        Err(message) => rpc_error(-32005, &message, id),
+                    }
                 }
                 Some(_) => rpc_error(-32000, "filter is not a log filter", id),
                 None => rpc_error(-32000, "filter not found", id),
@@ -14452,6 +14705,7 @@ fn init_logging(level: &str, format: &str) {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use avalanche_rs::evm::EvmLog;
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -14507,6 +14761,7 @@ mod integration_tests {
                 txpool_size: 4096,
                 block_cache_size: 1024,
                 rpc_max_body_size: 5_242_880,
+                rpc_allow_unsafe_remote: false,
                 max_memory_mb: 0,
                 log_max_size: 100,
                 log_max_files: 10,
@@ -14530,6 +14785,8 @@ mod integration_tests {
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
             rpc_wallets: Arc::new(StdHashMap::new()),
+            rpc_connection_limiter: Arc::new(ConnectionRateLimiter::new(200, 50)),
+            rpc_request_limiter: Arc::new(RequestRateLimiter::new(100)),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(archive)),
@@ -14550,6 +14807,49 @@ mod integration_tests {
     fn make_test_node(network_id: u32) -> Arc<NodeState> {
         let (db, _dir) = Database::open_temp().expect("open temp db");
         make_test_node_with_db(network_id, db, false)
+    }
+
+    #[tokio::test]
+    async fn test_remote_protected_rpc_denied_by_default() {
+        let node = make_test_node(1);
+        let req = r#"{"jsonrpc":"2.0","method":"admin.getConfig","params":{},"id":1}"#;
+        let response = handle_rpc_request_for_path_with_access(
+            req,
+            &node,
+            "/",
+            RpcAccess { is_loopback: false },
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["error"]["code"], -32000);
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("local RPC access"));
+    }
+
+    #[tokio::test]
+    async fn test_local_protected_rpc_allowed() {
+        let node = make_test_node(1);
+        let req = r#"{"jsonrpc":"2.0","method":"admin.getConfig","params":{},"id":1}"#;
+        let response = handle_rpc_request(req, &node).await;
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(parsed.get("result").is_some());
+    }
+
+    #[test]
+    fn test_collect_logs_rejects_large_ranges() {
+        let (db, _dir) = Database::open_temp().expect("open temp db");
+        let filter = LogFilter {
+            from_block: 0,
+            to_block: None,
+            addresses: vec![],
+            topics: vec![],
+            last_polled_block: 0,
+            last_polled_hash: None,
+        };
+        let err = collect_logs_for_range(&db, &filter, 0, MAX_RPC_LOG_BLOCK_RANGE).unwrap_err();
+        assert!(err.contains("log block range too large"));
     }
 
     fn reconfigure_test_node(
@@ -14645,6 +14945,7 @@ mod integration_tests {
                 txpool_size: 4096,
                 block_cache_size: 1024,
                 rpc_max_body_size: 5_242_880,
+                rpc_allow_unsafe_remote: false,
                 max_memory_mb: 0,
                 log_max_size: 100,
                 log_max_files: 10,
@@ -14668,6 +14969,8 @@ mod integration_tests {
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
             rpc_wallets: Arc::new(StdHashMap::new()),
+            rpc_connection_limiter: Arc::new(ConnectionRateLimiter::new(200, 50)),
+            rpc_request_limiter: Arc::new(RequestRateLimiter::new(100)),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
@@ -23541,6 +23844,7 @@ mod integration_tests {
                 txpool_size: 4096,
                 block_cache_size: 1024,
                 rpc_max_body_size: 5_242_880,
+                rpc_allow_unsafe_remote: false,
                 max_memory_mb: 0,
                 log_max_size: 100,
                 log_max_files: 10,
@@ -23564,6 +23868,8 @@ mod integration_tests {
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
             rpc_wallets: Arc::new(StdHashMap::new()),
+            rpc_connection_limiter: Arc::new(ConnectionRateLimiter::new(200, 50)),
+            rpc_request_limiter: Arc::new(RequestRateLimiter::new(100)),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
@@ -23698,6 +24004,7 @@ mod integration_tests {
                 txpool_size: 4096,
                 block_cache_size: 1024,
                 rpc_max_body_size: 5_242_880,
+                rpc_allow_unsafe_remote: false,
                 max_memory_mb: 0,
                 log_max_size: 100,
                 log_max_files: 10,
@@ -23721,6 +24028,8 @@ mod integration_tests {
             mev_engine: Arc::new(MevEngine::new(MevEngineConfig::default())),
             txpool: Arc::new(RwLock::new(TransactionPool::new(4096))),
             rpc_wallets: Arc::new(StdHashMap::new()),
+            rpc_connection_limiter: Arc::new(ConnectionRateLimiter::new(200, 50)),
+            rpc_request_limiter: Arc::new(RequestRateLimiter::new(100)),
             platform_tx_pool: Arc::new(RwLock::new(PlatformTxPool::default())),
             light_client: Arc::new(RwLock::new(avalanche_rs::light::LightClient::new())),
             archive_store: Arc::new(ArchiveStore::new(false)),
